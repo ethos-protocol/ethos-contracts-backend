@@ -4,6 +4,8 @@ target/
 **/__snapshots__/
 *.snap
 *.snap.new
+test_snapshots/
+*.proptest-regressions
 
 # Build artifacts
 *.wasm
@@ -13,6 +15,9 @@ target/
 .env
 .env.local
 .env.*.local
+
+# Local Stellar CLI identity/config store
+.soroban/
 
 # Editor / IDE
 .vscode/
