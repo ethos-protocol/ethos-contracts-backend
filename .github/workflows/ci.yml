@@ -14,7 +14,7 @@ jobs:
     name: Test & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned (not @stable): newer rustc releases reject an unsound transmute
       # in ethnum 1.5.2 (a transitive Soroban SDK dependency) with E0512, which
