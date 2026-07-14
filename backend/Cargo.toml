@@ -37,7 +37,7 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # JWT authentication for WebSocket connections
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Distributed cache for multi-node consensus checks
 redis = "0.27"
