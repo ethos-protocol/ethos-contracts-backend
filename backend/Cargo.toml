@@ -47,7 +47,7 @@ async-graphql-axum = "7"
 base64 = "0.22"
 
 # JWT authentication for WebSocket connections
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 
 # Distributed cache for multi-node consensus checks
 redis = "0.27"
