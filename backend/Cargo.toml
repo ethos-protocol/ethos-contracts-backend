@@ -54,7 +54,7 @@ redis = "0.27"
 
 # Two-factor authentication (HMAC-based TOTP implemented directly in two_factor.rs)
 rand = "0.8"
-hmac = "0.12"
+hmac = "0.13"
 sha1 = "0.10"
 sha2 = "0.10"
 once_cell = "1"
