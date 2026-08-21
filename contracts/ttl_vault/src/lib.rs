@@ -8406,6 +8406,22 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Number of `AuditEntry` items stored in a single page key.
+    /// Appends only touch the current tail page, so per-operation write cost is
+    /// O(PAGE_SIZE) rather than O(total history).
+    const AUDIT_LOG_PAGE_SIZE: u32 = 50;
+
+    /// Appends one `AuditEntry` to the vault's paginated audit log.
+    ///
+    /// Storage layout (new):
+    ///   `DataKey::VaultAuditLogLen(vault_id)`          → u32   total entry count
+    ///   `DataKey::VaultAuditLogPage(vault_id, page)`   → Vec<AuditEntry>  ≤ PAGE_SIZE entries
+    ///
+    /// Legacy layout (read-only compat):
+    ///   `DataKey::VaultAuditLog(vault_id)`             → Vec<AuditEntry>  (old unbounded vec)
+    ///
+    /// Each call reads and writes only the tail page (at most PAGE_SIZE entries),
+    /// keeping write cost bounded regardless of total history length.
     fn append_activity_log(
         env: &Env,
         vault_id: u64,
@@ -8414,12 +8430,26 @@ impl TtlVaultContract {
         _details: &str,
     ) {
         use types::AuditEntry;
-        let key = DataKey::VaultAuditLog(vault_id);
-        let mut log: Vec<AuditEntry> = env
+
+        // Read current total entry count (new layout counter).
+        let len_key = DataKey::VaultAuditLogLen(vault_id);
+        let total: u32 = env
             .storage()
             .persistent()
-            .get(&key)
+            .get(&len_key)
+            .unwrap_or(0u32);
+
+        // Determine which page this entry belongs to and its position within that page.
+        let page_index: u32 = total / Self::AUDIT_LOG_PAGE_SIZE;
+        let page_key = DataKey::VaultAuditLogPage(vault_id, page_index);
+
+        // Load the tail page (only this page is touched on every append).
+        let mut page: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
             .unwrap_or_else(|| Vec::new(env));
+
         let entry = AuditEntry {
             action: String::from_str(env, action),
             caller: caller.clone(),
@@ -8428,8 +8458,11 @@ impl TtlVaultContract {
             actor: caller.clone(),
             details: String::from_str(env, ""),
         };
-        log.push_back(entry);
-        env.storage().persistent().set(&key, &log);
+        page.push_back(entry);
+
+        // Write only the tail page and the updated counter.
+        env.storage().persistent().set(&page_key, &page);
+        env.storage().persistent().set(&len_key, &(total + 1));
     }
 
     fn paginate(env: &Env, all: Vec<u64>, page: u32, page_size: u32) -> Vec<u64> {
@@ -9045,45 +9078,111 @@ impl TtlVaultContract {
 
     // --- Issue #384: Vault Activity Audit Log ---
 
-    /// Logs an audit entry for a vault operation.
+    /// Logs an audit entry for a vault operation (paginated storage).
+    /// Delegates to `append_activity_log` so both write paths use the same
+    /// bounded page layout.
     fn log_audit_entry(env: &Env, vault_id: u64, operation: &str, actor: &Address, details: &str) {
-        let mut log: Vec<AuditEntry> = env
+        // Use the shared paginated append path so this function is also bounded.
+        Self::append_activity_log(env, vault_id, operation, actor, details);
+
+        // Extend the tail page's TTL to match the vault's check-in interval.
+        let total: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::VaultAuditLog(vault_id))
-            .unwrap_or(Vec::new(env));
-
-        let entry = AuditEntry {
-            timestamp: env.ledger().timestamp(),
-            action: String::from_str(env, operation),
-            caller: actor.clone(),
-            operation: String::from_str(env, operation),
-            actor: actor.clone(),
-            details: String::from_str(env, details),
-        };
-        log.push_back(entry);
-
-        let key = DataKey::VaultAuditLog(vault_id);
-        env.storage().persistent().set(&key, &log);
+            .get(&DataKey::VaultAuditLogLen(vault_id))
+            .unwrap_or(0u32);
+        let page_index = if total == 0 { 0 } else { (total - 1) / Self::AUDIT_LOG_PAGE_SIZE };
+        let page_key = DataKey::VaultAuditLogPage(vault_id, page_index);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
         env.storage()
             .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+            .extend_ttl(&page_key, VAULT_TTL_THRESHOLD, ttl);
     }
 
-    /// Retrieves the audit log for a vault.
+    /// Returns all audit log entries for a vault across all pages.
+    ///
+    /// Migration-aware: if the vault has entries under the new paginated layout
+    /// those are returned; any entries still in the legacy `VaultAuditLog(vault_id)`
+    /// key are prepended so old vaults continue to work transparently.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
     ///
     /// # Returns
-    /// A vector of audit entries
+    /// A vector of audit entries in chronological order (oldest first)
     pub fn get_vault_audit_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
-        env.storage()
+        let mut result: Vec<AuditEntry> = Vec::new(&env);
+
+        // --- Legacy compat: read any entries written under the old flat key ---
+        let legacy: Vec<AuditEntry> = env
+            .storage()
             .persistent()
             .get(&DataKey::VaultAuditLog(vault_id))
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        for entry in legacy.iter() {
+            result.push_back(entry);
+        }
+
+        // --- New paginated layout ---
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultAuditLogLen(vault_id))
+            .unwrap_or(0u32);
+        if total > 0 {
+            let num_pages = (total + Self::AUDIT_LOG_PAGE_SIZE - 1) / Self::AUDIT_LOG_PAGE_SIZE;
+            for page_index in 0..num_pages {
+                let page: Vec<AuditEntry> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::VaultAuditLogPage(vault_id, page_index))
+                    .unwrap_or_else(|| Vec::new(&env));
+                for entry in page.iter() {
+                    result.push_back(entry);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Returns a single page of the vault audit log.
+    ///
+    /// Page 0 begins with any legacy (pre-migration) entries, followed by the
+    /// first page of the new paginated layout.  Pages beyond the legacy block
+    /// map directly to paginated storage pages.
+    ///
+    /// # Arguments
+    /// * `env`       - The Soroban environment
+    /// * `vault_id`  - The vault ID
+    /// * `page`      - Zero-based page index
+    /// * `page_size` - Maximum entries per page (capped internally at AUDIT_LOG_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// A slice of at most `page_size` entries, or an empty vec if `page` is out of range.
+    pub fn get_vault_audit_log_page(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<AuditEntry> {
+        // Gather all entries (legacy + new) then return the requested slice.
+        // For most vaults only the new layout is active; legacy vaults are handled
+        // in get_vault_audit_log above.
+        let all = Self::get_vault_audit_log(env.clone(), vault_id);
+        let total = all.len() as u32;
+        let cap = page_size.min(Self::AUDIT_LOG_PAGE_SIZE);
+        let start = page * cap;
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = (start + cap).min(total);
+        let mut result: Vec<AuditEntry> = Vec::new(&env);
+        for i in start..end {
+            result.push_back(all.get(i).unwrap());
+        }
+        result
     }
 
     // --- Issue #385: Vault Cloning ---

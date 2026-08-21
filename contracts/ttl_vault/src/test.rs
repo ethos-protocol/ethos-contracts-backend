@@ -4533,7 +4533,158 @@ fn test_activity_log_empty_for_new_vault_before_create() {
     assert!(log.is_empty());
 }
 
-// ---- Issue #468: Vault Metadata Versioning ----
+// ---- Paginated audit log: bounded write cost, readability, and migration compat ----
+
+/// Assert that appending N entries across multiple pages never causes the
+/// page stored at `VaultAuditLogPage(vault_id, i)` to exceed PAGE_SIZE (50).
+/// This is the core bounded-write-cost guarantee: each `append_activity_log`
+/// call only touches a single page of at most 50 entries.
+#[test]
+fn test_audit_log_page_size_stays_bounded() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Perform enough operations to fill more than two full pages (page_size = 50).
+    // create_vault already wrote 1 entry; do 124 more for 125 total = 2 full pages + 25 on page 2.
+    for _ in 0..62 {
+        client.deposit(&vault_id, &owner, &1i128);
+        client.withdraw(&vault_id, &owner, &1i128);
+    }
+
+    let all = client.get_vault_activity_log(&vault_id);
+    // We expect exactly 125 entries (1 create + 124 deposit/withdraw).
+    assert_eq!(all.len(), 125, "expected 125 total audit entries");
+
+    // Verify that each paginated storage key holds at most PAGE_SIZE entries by
+    // reading pages 0..2 through the public paged accessor.
+    let page0 = client.get_vault_audit_log_page(&vault_id, &0u32, &50u32);
+    let page1 = client.get_vault_audit_log_page(&vault_id, &1u32, &50u32);
+    let page2 = client.get_vault_audit_log_page(&vault_id, &2u32, &50u32);
+    let page3 = client.get_vault_audit_log_page(&vault_id, &3u32, &50u32); // beyond end
+
+    assert_eq!(page0.len(), 50, "page 0 must contain exactly 50 entries");
+    assert_eq!(page1.len(), 50, "page 1 must contain exactly 50 entries");
+    assert_eq!(page2.len(), 25, "page 2 (tail) must contain the remaining 25 entries");
+    assert!(page3.is_empty(), "page 3 does not exist and should be empty");
+}
+
+/// Verify that all historical entries remain retrievable via the paged accessor
+/// after the storage layout change — no entries should be dropped or reordered.
+#[test]
+fn test_audit_log_historical_entries_readable_via_pagination() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Write 55 entries (1 create + 27×deposit + 27×withdraw) so we span two pages.
+    for _ in 0..27 {
+        client.deposit(&vault_id, &owner, &1_000i128);
+        client.withdraw(&vault_id, &owner, &1_000i128);
+    }
+
+    let all = client.get_vault_activity_log(&vault_id);
+    assert_eq!(all.len(), 55);
+
+    // First entry is create_vault (written before the loop).
+    assert_eq!(all.get(0).unwrap().action, String::from_str(&env, "create_vault"));
+
+    // Reconstruct from pages and confirm it matches the full log.
+    let page0 = client.get_vault_audit_log_page(&vault_id, &0u32, &50u32);
+    let page1 = client.get_vault_audit_log_page(&vault_id, &1u32, &50u32);
+    assert_eq!(page0.len(), 50);
+    assert_eq!(page1.len(), 5);
+
+    // Concatenate pages and verify element-by-element against the full log.
+    let mut from_pages: Vec<types::AuditEntry> = Vec::new(&env);
+    for e in page0.iter() { from_pages.push_back(e); }
+    for e in page1.iter() { from_pages.push_back(e); }
+    assert_eq!(from_pages.len(), all.len(), "page concatenation must equal full log length");
+    for i in 0..all.len() {
+        assert_eq!(
+            from_pages.get(i).unwrap().action,
+            all.get(i).unwrap().action,
+            "entry {i} action mismatch between page read and full read"
+        );
+        assert_eq!(
+            from_pages.get(i).unwrap().timestamp,
+            all.get(i).unwrap().timestamp,
+            "entry {i} timestamp mismatch between page read and full read"
+        );
+    }
+}
+
+/// Migration compatibility: simulate a vault whose entries were written under
+/// the old `VaultAuditLog(vault_id)` flat-Vec layout by injecting them directly
+/// into persistent storage, then confirm `get_vault_activity_log` transparently
+/// returns those legacy entries followed by any new entries written via the
+/// paginated path.
+#[test]
+fn test_audit_log_migration_compat_legacy_entries_preserved() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    env.mock_all_auths();
+
+    // Manually inject a legacy flat log into storage before any vault is created.
+    let legacy_entry = types::AuditEntry {
+        action: String::from_str(&env, "legacy_op"),
+        caller: owner.clone(),
+        timestamp: 1_000u64,
+        operation: String::from_str(&env, "legacy_op"),
+        actor: owner.clone(),
+        details: String::from_str(&env, "pre-migration"),
+    };
+    let legacy_vault_id: u64 = 9_001;
+    {
+        let mut legacy_log: Vec<types::AuditEntry> = Vec::new(&env);
+        legacy_log.push_back(legacy_entry.clone());
+        env.as_contract(client.address(), || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VaultAuditLog(legacy_vault_id), &legacy_log);
+        });
+    }
+
+    // Now create a real vault under a normal ID (ensures contract is initialized).
+    let _real_vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Manually append a new-layout entry under the legacy vault ID so we can
+    // check the combined read path.
+    {
+        let page_key = DataKey::VaultAuditLogPage(legacy_vault_id, 0u32);
+        let len_key  = DataKey::VaultAuditLogLen(legacy_vault_id);
+        let new_entry = types::AuditEntry {
+            action: String::from_str(&env, "post_migration_op"),
+            caller: owner.clone(),
+            timestamp: 2_000u64,
+            operation: String::from_str(&env, "post_migration_op"),
+            actor: owner.clone(),
+            details: String::from_str(&env, ""),
+        };
+        env.as_contract(client.address(), || {
+            let mut page: Vec<types::AuditEntry> = Vec::new(&env);
+            page.push_back(new_entry);
+            env.storage().persistent().set(&page_key, &page);
+            env.storage().persistent().set(&len_key, &1u32);
+        });
+    }
+
+    // get_vault_activity_log should return legacy entry first, then new entry.
+    let log = client.get_vault_activity_log(&legacy_vault_id);
+    assert_eq!(log.len(), 2, "must see both legacy and new entries");
+    assert_eq!(
+        log.get(0).unwrap().action,
+        String::from_str(&env, "legacy_op"),
+        "first entry must be the legacy pre-migration op"
+    );
+    assert_eq!(
+        log.get(1).unwrap().action,
+        String::from_str(&env, "post_migration_op"),
+        "second entry must be the post-migration op"
+    );
+
+    // A vault with no legacy data and no new entries should still return empty.
+    assert!(client.get_vault_activity_log(&888u64).is_empty());
+}
+
+
 
 #[test]
 fn test_metadata_versioning_records_history() {

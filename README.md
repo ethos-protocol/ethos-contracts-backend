@@ -166,6 +166,7 @@ The script will display the target network and identity, then require you to typ
 
 ### Operations
 - [Withdrawal Features](docs/withdrawal-features.md)
+- [Vault Activity History](docs/vault-activity-history.md)
 - [Deployment Guide](docs/deployment-guide.md)
 - [Monitoring Guide](docs/monitoring-guide.md)
 - [Disaster Recovery Runbook](docs/disaster-recovery-runbook.md)

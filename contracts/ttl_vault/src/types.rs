@@ -389,6 +389,12 @@ pub enum DataKey {
     PendingOwnership(u64),
     PendingBeneficiaryUpdate(u64),
     VaultAuditLog(u64),
+    // Issue #paginated-audit-log: page-keyed audit log storage.
+    // Each page holds up to AUDIT_LOG_PAGE_SIZE entries.
+    // VaultAuditLogPage(vault_id, page_index) stores Vec<AuditEntry> for that page.
+    VaultAuditLogPage(u64, u32),
+    // Total number of audit log entries written for a vault (new layout).
+    VaultAuditLogLen(u64),
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
