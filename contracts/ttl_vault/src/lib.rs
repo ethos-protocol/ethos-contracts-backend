@@ -8433,11 +8433,7 @@ impl TtlVaultContract {
 
         // Read current total entry count (new layout counter).
         let len_key = DataKey::VaultAuditLogLen(vault_id);
-        let total: u32 = env
-            .storage()
-            .persistent()
-            .get(&len_key)
-            .unwrap_or(0u32);
+        let total: u32 = env.storage().persistent().get(&len_key).unwrap_or(0u32);
 
         // Determine which page this entry belongs to and its position within that page.
         let page_index: u32 = total / Self::AUDIT_LOG_PAGE_SIZE;
@@ -9091,7 +9087,11 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::VaultAuditLogLen(vault_id))
             .unwrap_or(0u32);
-        let page_index = if total == 0 { 0 } else { (total - 1) / Self::AUDIT_LOG_PAGE_SIZE };
+        let page_index = if total == 0 {
+            0
+        } else {
+            (total - 1) / Self::AUDIT_LOG_PAGE_SIZE
+        };
         let page_key = DataKey::VaultAuditLogPage(vault_id, page_index);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
         env.storage()
