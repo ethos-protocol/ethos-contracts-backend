@@ -49,7 +49,7 @@ base64 = "0.22"
 jsonwebtoken = "9"
 
 # Distributed cache for multi-node consensus checks
-redis = "0.27"
+redis = "1.6"
 
 # Two-factor authentication (HMAC-based TOTP implemented directly in two_factor.rs)
 rand = "0.8"
