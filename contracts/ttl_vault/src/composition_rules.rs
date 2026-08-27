@@ -19,11 +19,30 @@
 ///
 /// # Conflict detection
 ///
-/// Two rules *conflict* when they share the same priority **and** one passes
-/// while the other fails for the same slice.  In that situation both rule IDs
-/// are recorded in `ValidationResult::conflicts` and `overall_valid` is set to
-/// `false`.
+/// Conflicts are detected at two points:
+///
+/// * **At registration** — [`register_composition_rule`] rejects a new rule that
+///   would conflict with an already-registered enabled rule, returning
+///   [`CompositionRuleError::ConflictingRule`] with the existing rule's ID. Two
+///   rules conflict at registration when they share the same `priority`, their
+///   conditions **overlap** (one rule's `rule_bytes` prefix is a prefix of the
+///   other's — see [`evaluate_rule`]), and their outcomes are **contradictory**
+///   (different `tag`s).
+/// * **At validation** — two rules also *conflict* when they share the same
+///   priority **and** one passes while the other fails for the same slice. In
+///   that situation both rule IDs are recorded in
+///   `ValidationResult::conflicts` and `overall_valid` is set to `false`.
 use soroban_sdk::{contracttype, symbol_short, Bytes, Env, Vec};
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Error raised while registering a composition rule.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompositionRuleError {
+    /// The candidate rule conflicts with an already-registered enabled rule.
+    /// Carries the `rule_id` of the existing conflicting rule.
+    ConflictingRule(u64),
+}
 
 // ── Event topics ─────────────────────────────────────────────────────────────
 
@@ -126,12 +145,22 @@ pub struct SliceValidatedEvent {
 /// - `priority` — lower == higher priority; rules with the same priority are
 ///   checked for conflicts.
 /// - `tag` — numeric tag for categorization (e.g. a hash of a string label).
-pub fn register_composition_rule(env: &Env, rule_bytes: Bytes, priority: u32, tag: u32) -> u64 {
+pub fn register_composition_rule(
+    env: &Env,
+    rule_bytes: Bytes,
+    priority: u32,
+    tag: u32,
+) -> Result<u64, CompositionRuleError> {
     let rule_id: u64 = env
         .storage()
         .persistent()
         .get::<RulesEngineKey, u64>(&RulesEngineKey::RuleCount)
         .unwrap_or(0);
+
+    // Reject rules that contradict an existing enabled rule before persisting.
+    if let Some(conflicting_id) = find_conflicting_rule(env, priority, tag, &rule_bytes) {
+        return Err(CompositionRuleError::ConflictingRule(conflicting_id));
+    }
 
     let rule = CompositionRule {
         rule_id,
@@ -170,7 +199,54 @@ pub fn register_composition_rule(env: &Env, rule_bytes: Bytes, priority: u32, ta
         },
     );
 
-    rule_id
+    Ok(rule_id)
+}
+
+/// Scan every registered rule and return the `rule_id` of one that conflicts
+/// with a candidate rule described by `(priority, tag, rule_bytes)`, if any.
+///
+/// # Conflict semantics
+///
+/// A conflict requires **all three** of:
+/// 1. the same `priority` — the rules are evaluated as peers with no tie-break;
+/// 2. **overlapping conditions** — one payload is a prefix of the other, so by
+///    the prefix-match predicate in [`evaluate_rule`] there exists `slice_data`
+///    that matches both rules;
+/// 3. **contradictory outcomes** — the rules carry different `tag`s, i.e. they
+///    would classify that shared slice into two different categories.
+///
+/// Disabled rules are ignored.
+fn find_conflicting_rule(env: &Env, priority: u32, tag: u32, rule_bytes: &Bytes) -> Option<u64> {
+    let count: u64 = env
+        .storage()
+        .persistent()
+        .get::<RulesEngineKey, u64>(&RulesEngineKey::RuleCount)
+        .unwrap_or(0);
+
+    for id in 0..count {
+        let Some(existing) = get_rule(env, id) else {
+            continue;
+        };
+        if !existing.enabled || existing.priority != priority || existing.tag == tag {
+            continue;
+        }
+        if bytes_overlap(&existing.rule_bytes, rule_bytes) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// `true` when `a` is a prefix of `b` or `b` is a prefix of `a`. An empty
+/// payload (an unconditional rule) overlaps every other payload.
+fn bytes_overlap(a: &Bytes, b: &Bytes) -> bool {
+    let shorter_len = a.len().min(b.len());
+    for i in 0..shorter_len {
+        if a.get(i).unwrap() != b.get(i).unwrap() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Enable or disable an existing rule.

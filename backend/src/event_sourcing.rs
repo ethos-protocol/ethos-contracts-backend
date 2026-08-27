@@ -404,6 +404,12 @@ impl SnapshotStore {
 
 // ── Event replay ──────────────────────────────────────────────────────────────
 
+/// Take a fresh snapshot once this many events have accrued past the last
+/// snapshot (or the start of history). Bounds replay cost for long-lived
+/// vaults: replay never applies more than `SNAPSHOT_INTERVAL` events plus
+/// whatever has arrived since the most recent snapshot.
+pub const SNAPSHOT_INTERVAL: u64 = 100;
+
 /// Replay engine: rebuilds vault state from snapshots + events.
 pub struct EventReplayer<'a> {
     log: &'a EventLog,
@@ -453,6 +459,39 @@ impl<'a> EventReplayer<'a> {
             last_sequence,
             events_applied: event_count,
         })
+    }
+
+    /// Like [`replay`](Self::replay), but also persists a fresh snapshot when at
+    /// least [`SNAPSHOT_INTERVAL`] events have been applied since the last
+    /// snapshot (or the beginning of history).
+    ///
+    /// This is the path callers should use on a read that follows heavy write
+    /// activity: the reconstructed state is written back as a snapshot so the
+    /// *next* replay starts from there instead of re-applying the whole tail.
+    /// The returned state is identical to what [`replay`](Self::replay) would
+    /// return — snapshotting only affects future replay cost.
+    pub fn replay_with_snapshotting(
+        &self,
+        vault_id: &str,
+    ) -> Result<ReplayedState, EventSourcingError> {
+        let baseline_seq = self
+            .snapshots
+            .get(vault_id)?
+            .map(|s| s.snapshot_sequence)
+            .unwrap_or(0);
+
+        let replayed = self.replay(vault_id)?;
+
+        if replayed.last_sequence.saturating_sub(baseline_seq) >= SNAPSHOT_INTERVAL {
+            self.snapshots.save(VaultSnapshot {
+                vault_id: vault_id.to_string(),
+                snapshot_sequence: replayed.last_sequence,
+                taken_at: Utc::now(),
+                state: replayed.state.clone(),
+            })?;
+        }
+
+        Ok(replayed)
     }
 
     /// Replay up to (and including) a specific sequence number — useful for
@@ -815,6 +854,125 @@ mod tests {
         let snap = retrieved.unwrap();
         assert_eq!(snap.snapshot_sequence, 100);
         assert_eq!(snap.state.balance, 5000);
+    }
+
+    /// Append `n` alternating deposit/withdrawal events (net +800 per full
+    /// 3-event cycle: +1000, ttl check-in, −200) to `vault_id`.
+    fn append_many(log: &EventLog, vault_id: &str, n: u64) {
+        for i in 0..n {
+            match i % 3 {
+                0 => log
+                    .append(
+                        vault_id.to_string(),
+                        EventType::Deposit,
+                        serde_json::json!({ "balance_delta": 1000 }),
+                    )
+                    .unwrap(),
+                1 => log
+                    .append(
+                        vault_id.to_string(),
+                        EventType::CheckIn,
+                        serde_json::json!({ "ttl_remaining": 86400 }),
+                    )
+                    .unwrap(),
+                _ => log
+                    .append(
+                        vault_id.to_string(),
+                        EventType::Withdrawal,
+                        serde_json::json!({ "balance_delta": 200 }),
+                    )
+                    .unwrap(),
+            };
+        }
+    }
+
+    #[test]
+    fn snapshotting_replay_matches_full_replay() {
+        let log = EventLog::new();
+        append_many(&log, "vault-1", 250);
+
+        // Full replay from the beginning — the reference result.
+        let full = {
+            let snaps = SnapshotStore::new();
+            EventReplayer::new(&log, &snaps).replay("vault-1").unwrap()
+        };
+        assert_eq!(full.events_applied, 250);
+
+        // Snapshotting replay writes a snapshot as a side effect...
+        let snaps = SnapshotStore::new();
+        let replayer = EventReplayer::new(&log, &snaps);
+        let first = replayer.replay_with_snapshotting("vault-1").unwrap();
+        assert_eq!(first.state.balance, full.state.balance);
+        assert_eq!(first.state.status, full.state.status);
+
+        // ...so a subsequent replay resumes from the snapshot and applies far
+        // fewer events, yet reconstructs the identical state.
+        let snap = snaps.get("vault-1").unwrap().expect("snapshot persisted");
+        assert_eq!(snap.snapshot_sequence, 250);
+
+        let second = replayer.replay("vault-1").unwrap();
+        assert_eq!(second.events_applied, 0);
+        assert_eq!(second.state.balance, full.state.balance);
+
+        // And new events after the snapshot still apply on top of it.
+        append_many(&log, "vault-1", 10);
+        let third = replayer.replay("vault-1").unwrap();
+        assert_eq!(third.events_applied, 10);
+        let expected = EventReplayer::new(&log, &SnapshotStore::new())
+            .replay("vault-1")
+            .unwrap();
+        assert_eq!(third.state.balance, expected.state.balance);
+    }
+
+    #[test]
+    fn snapshotting_is_skipped_below_the_interval() {
+        let log = EventLog::new();
+        append_many(&log, "vault-1", SNAPSHOT_INTERVAL - 1);
+        let snaps = SnapshotStore::new();
+        EventReplayer::new(&log, &snaps)
+            .replay_with_snapshotting("vault-1")
+            .unwrap();
+        assert!(snaps.get("vault-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn bench_replay_with_and_without_snapshots() {
+        use std::time::Instant;
+
+        let log = EventLog::new();
+        append_many(&log, "vault-1", 5_000);
+
+        // Cold: full replay from sequence 0 every time.
+        let cold_snaps = SnapshotStore::new();
+        let cold_replayer = EventReplayer::new(&log, &cold_snaps);
+        let cold_start = Instant::now();
+        let mut cold_applied = 0usize;
+        for _ in 0..20 {
+            cold_applied = cold_replayer.replay("vault-1").unwrap().events_applied;
+        }
+        let cold = cold_start.elapsed();
+
+        // Warm: take a snapshot once, then replay only the tail.
+        let warm_snaps = SnapshotStore::new();
+        let warm_replayer = EventReplayer::new(&log, &warm_snaps);
+        warm_replayer
+            .replay_with_snapshotting("vault-1")
+            .unwrap();
+        let warm_start = Instant::now();
+        let mut warm_applied = 0usize;
+        for _ in 0..20 {
+            warm_applied = warm_replayer.replay("vault-1").unwrap().events_applied;
+        }
+        let warm = warm_start.elapsed();
+
+        println!(
+            "replay x20 — without snapshot: {cold:?} ({cold_applied} events/replay), \
+             with snapshot: {warm:?} ({warm_applied} events/replay)"
+        );
+
+        // The snapshot must eliminate essentially all replay work here.
+        assert_eq!(cold_applied, 5_000);
+        assert_eq!(warm_applied, 0);
     }
 
     #[test]

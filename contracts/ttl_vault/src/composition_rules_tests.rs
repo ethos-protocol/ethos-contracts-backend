@@ -63,6 +63,69 @@ fn test_register_rule_rejects_non_admin() {
     assert!(result.is_err());
 }
 
+// ── conflict detection at registration ───────────────────────────────────────
+
+#[test]
+fn test_register_conflicting_rule_is_rejected() {
+    let (env, _owner, admin, client, _vault_id) = setup();
+    let base = Bytes::from_slice(&env, b"region:eu");
+    let overlap = Bytes::from_slice(&env, b"region:eu-west");
+
+    // Same priority, overlapping prefixes, contradictory tags → conflict.
+    let _r0 = client.register_composition_rule(&admin, &base, &5u32, &1u32);
+    let result = client.try_register_composition_rule(&admin, &overlap, &5u32, &2u32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_register_non_overlapping_rule_is_accepted() {
+    let (env, _owner, admin, client, _vault_id) = setup();
+    let a = Bytes::from_slice(&env, b"region:eu");
+    let b = Bytes::from_slice(&env, b"tier:gold");
+
+    let r0 = client.register_composition_rule(&admin, &a, &5u32, &1u32);
+    // Non-overlapping condition, same priority, different tag → no conflict.
+    let r1 = client.register_composition_rule(&admin, &b, &5u32, &2u32);
+    assert_eq!(r1, r0 + 1);
+}
+
+#[test]
+fn test_overlapping_rule_with_same_tag_is_not_conflict() {
+    let (env, _owner, admin, client, _vault_id) = setup();
+    let a = Bytes::from_slice(&env, b"region:eu");
+    let b = Bytes::from_slice(&env, b"region:eu-west");
+
+    let r0 = client.register_composition_rule(&admin, &a, &5u32, &7u32);
+    // Overlapping conditions but the *same* outcome (tag) → consistent.
+    let r1 = client.register_composition_rule(&admin, &b, &5u32, &7u32);
+    assert_eq!(r1, r0 + 1);
+}
+
+#[test]
+fn test_overlapping_rule_at_different_priority_is_not_conflict() {
+    let (env, _owner, admin, client, _vault_id) = setup();
+    let a = Bytes::from_slice(&env, b"region:eu");
+    let b = Bytes::from_slice(&env, b"region:eu-west");
+
+    let r0 = client.register_composition_rule(&admin, &a, &5u32, &1u32);
+    // Contradictory tag + overlap but a different priority resolves the order.
+    let r1 = client.register_composition_rule(&admin, &b, &6u32, &2u32);
+    assert_eq!(r1, r0 + 1);
+}
+
+#[test]
+fn test_conflict_check_ignores_disabled_rules() {
+    let (env, _owner, admin, client, _vault_id) = setup();
+    let a = Bytes::from_slice(&env, b"region:eu");
+    let b = Bytes::from_slice(&env, b"region:eu-west");
+
+    let r0 = client.register_composition_rule(&admin, &a, &5u32, &1u32);
+    client.set_rule_enabled(&admin, &r0, &false);
+    // The would-be conflicting peer is disabled, so registration succeeds.
+    let r1 = client.register_composition_rule(&admin, &b, &5u32, &2u32);
+    assert_eq!(r1, r0 + 1);
+}
+
 #[test]
 fn test_get_composition_rule_returns_correct_fields() {
     let (env, _owner, admin, client, _vault_id) = setup();

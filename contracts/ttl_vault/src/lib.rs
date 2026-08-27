@@ -384,6 +384,8 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 124,
     InheritanceCycleDetected = 125,
+    // Issue #344: composition rule registered with a contradictory peer rule
+    ConflictingRule = 126,
 }
 
 #[contract]
@@ -14750,9 +14752,13 @@ impl TtlVaultContract {
         if caller != admin {
             return Err(ContractError::NotAdmin);
         }
-        Ok(composition_rules::register_composition_rule(
-            &env, rule_bytes, priority, tag,
-        ))
+        composition_rules::register_composition_rule(&env, rule_bytes, priority, tag).map_err(|e| {
+            match e {
+                composition_rules::CompositionRuleError::ConflictingRule(_) => {
+                    ContractError::ConflictingRule
+                }
+            }
+        })
     }
 
     /// Enable or disable an existing composition rule.
