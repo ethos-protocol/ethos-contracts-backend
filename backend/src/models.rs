@@ -8,6 +8,12 @@ pub struct AuthClaims {
     pub sub: String,
     pub vault_ids: Vec<String>,
     pub exp: usize,
+    /// Unique token id (JWT `jti`). Used by the revocation list (#350) to
+    /// invalidate a specific compromised token before its natural expiry.
+    /// Optional for backwards compatibility with tokens minted before jti
+    /// was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 // ── Locale support ──────────────────────────────────────────────────────────

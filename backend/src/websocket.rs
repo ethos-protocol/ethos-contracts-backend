@@ -276,6 +276,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string(), "v2".to_string()],
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, &secret);
@@ -292,6 +293,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string()],
             exp: 1000, // long expired
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, &secret);
@@ -306,6 +308,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string()],
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, b"wrong-secret");
