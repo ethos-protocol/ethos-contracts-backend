@@ -11,12 +11,19 @@
 //  - Consumer API (`MessageConsumer`) with offset-based acknowledgement.
 //  - Partitioning strategies: RoundRobin, HashKey, Manual.
 //  - Dead-letter queue (DLQ) for messages that exceed max retries.
+//  - Poison-message handling: a per-message delivery-attempt counter, automatic
+//    routing to the topic DLQ (and, when configured, to `dlq::DlqStore`) once
+//    the attempt limit is hit, and a `PoisonEvent` log for observability.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Message header carrying the ingress correlation id (issue #349), matching
+/// `error_context::REQUEST_ID_HEADER`.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 // ── Message envelope ──────────────────────────────────────────────────────────
 
@@ -59,6 +66,12 @@ impl QueueMessage {
             published_at: Utc::now(),
             delivery_attempts: 0,
         }
+    }
+
+    /// The ingress correlation id propagated with this message, if any
+    /// (issue #349).
+    pub fn request_id(&self) -> Option<&str> {
+        self.headers.get(REQUEST_ID_HEADER).map(String::as_str)
     }
 }
 
@@ -178,6 +191,49 @@ struct TopicStore {
     round_robin_counter: u32,
     /// Dead-letter queue for this topic.
     dlq: Vec<QueueMessage>,
+    /// Audit log of every message that was poison-routed to the DLQ.
+    poison_events: Vec<PoisonEvent>,
+}
+
+// ── Poison-message handling ───────────────────────────────────────────────────
+
+/// Outcome of recording a failed delivery attempt against a stored message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The message is still within its delivery budget and will be retried.
+    Retry { attempts: u32 },
+    /// The message exceeded `max_retries` and was routed to the DLQ.
+    Poisoned { attempts: u32 },
+}
+
+/// Emitted (and logged) whenever a message is automatically routed to the DLQ
+/// because it exhausted its delivery-attempt budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoisonEvent {
+    pub message_id: String,
+    pub topic: String,
+    pub partition: u32,
+    /// Delivery attempts recorded at the point of poison-routing.
+    pub attempts: u32,
+    /// The last processing error reported by the consumer.
+    pub error: String,
+    pub routed_at: DateTime<Utc>,
+}
+
+/// Convert a queue message into a `dlq::DlqEntry` for the shared DLQ store.
+pub fn poison_to_dlq_entry(msg: &QueueMessage, error: &str, attempts: u32) -> crate::dlq::DlqEntry {
+    let now = Utc::now();
+    crate::dlq::DlqEntry {
+        id: Uuid::new_v4().to_string(),
+        source: format!("message_queue:{}:{}", msg.topic, msg.partition),
+        target: None,
+        payload: msg.payload.clone(),
+        error: error.to_string(),
+        attempts,
+        status: crate::dlq::DlqStatus::Pending,
+        created_at: now,
+        last_attempt_at: now,
+    }
 }
 
 // ── Message broker ────────────────────────────────────────────────────────────
@@ -186,11 +242,21 @@ struct TopicStore {
 #[derive(Debug, Clone, Default)]
 pub struct MessageBroker {
     topics: Arc<Mutex<HashMap<String, TopicStore>>>,
+    /// Optional shared dead-letter store (`dlq.rs`). When set, poison messages
+    /// are mirrored into it automatically in addition to the per-topic DLQ.
+    dlq_store: Option<crate::dlq::DlqStore>,
 }
 
 impl MessageBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a shared `dlq::DlqStore` so poison messages are also captured in
+    /// the operator-facing dead-letter queue.
+    pub fn with_dlq_store(mut self, store: crate::dlq::DlqStore) -> Self {
+        self.dlq_store = Some(store);
+        self
     }
 
     /// Register a topic with the given configuration.  Idempotent.
@@ -334,6 +400,106 @@ impl MessageBroker {
         Ok(store.dlq.clone())
     }
 
+    /// Record a failed processing attempt for a stored message.
+    ///
+    /// Increments the message's persistent `delivery_attempts` counter. Once the
+    /// counter reaches the topic's `max_retries`, the message is routed to the
+    /// per-topic DLQ (and to the shared `dlq::DlqStore` when one is attached), a
+    /// [`PoisonEvent`] is logged and recorded, and [`DeliveryOutcome::Poisoned`]
+    /// is returned. Otherwise [`DeliveryOutcome::Retry`] is returned so the
+    /// caller knows the message should be redelivered.
+    pub fn record_failed_delivery(
+        &self,
+        topic: &str,
+        partition: u32,
+        message_id: &str,
+        error: &str,
+    ) -> Result<DeliveryOutcome, MessageQueueError> {
+        let mut topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
+        let store = topics
+            .get_mut(topic)
+            .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
+
+        if partition as usize >= store.partitions.len() {
+            return Err(MessageQueueError::InvalidPartition(
+                partition,
+                topic.to_string(),
+            ));
+        }
+
+        let max_retries = store.config.as_ref().map(|c| c.max_retries).unwrap_or(3);
+
+        let idx = store.partitions[partition as usize]
+            .messages
+            .iter()
+            .position(|m| m.id == message_id)
+            .ok_or_else(|| {
+                MessageQueueError::TopicNotFound(format!(
+                    "{topic}: message {message_id} not found in partition {partition}"
+                ))
+            })?;
+
+        let attempts = {
+            let m = &mut store.partitions[partition as usize].messages[idx];
+            m.delivery_attempts += 1;
+            m.delivery_attempts
+        };
+
+        if attempts < max_retries {
+            return Ok(DeliveryOutcome::Retry { attempts });
+        }
+
+        // ── Poison: route to the DLQ ─────────────────────────────────────────
+        let mut msg = store.partitions[partition as usize].messages[idx].clone();
+        msg.headers
+            .insert("dlq_reason".into(), "max_delivery_attempts_exceeded".into());
+        msg.headers.insert("dlq_error".into(), error.to_string());
+        store.dlq.push(msg.clone());
+
+        let event = PoisonEvent {
+            message_id: message_id.to_string(),
+            topic: topic.to_string(),
+            partition,
+            attempts,
+            error: error.to_string(),
+            routed_at: Utc::now(),
+        };
+        tracing::warn!(
+            message_id = %event.message_id,
+            topic = %event.topic,
+            partition = event.partition,
+            attempts = event.attempts,
+            error = %event.error,
+            "poison message routed to dead-letter queue"
+        );
+        store.poison_events.push(event);
+
+        if let Some(ref dlq_store) = self.dlq_store {
+            let entry = poison_to_dlq_entry(&msg, error, attempts);
+            dlq_store
+                .lock()
+                .map_err(|_| MessageQueueError::LockPoisoned)?
+                .insert(entry.id.clone(), entry);
+        }
+
+        Ok(DeliveryOutcome::Poisoned { attempts })
+    }
+
+    /// Return the poison-routing audit log for a topic.
+    pub fn list_poison_events(&self, topic: &str) -> Result<Vec<PoisonEvent>, MessageQueueError> {
+        let topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
+        let store = topics
+            .get(topic)
+            .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
+        Ok(store.poison_events.clone())
+    }
+
     /// Return the current committed offset for a consumer group / partition.
     pub fn current_offset(
         &self,
@@ -384,6 +550,33 @@ impl MessagePublisher {
         let mut headers = HashMap::new();
         headers.insert("event_type".into(), event_type.into());
         headers.insert("source".into(), "ethos-backend".into());
+        self.broker.publish(
+            &self.default_topic,
+            Some(vault_id.to_string()),
+            headers,
+            payload,
+            None,
+        )
+    }
+
+    /// Publish a vault event tagged with the originating request's correlation
+    /// id (issue #349).
+    ///
+    /// The id is written to the `x-request-id` message header so a consumer
+    /// processing this event asynchronously can join its logs back to the HTTP
+    /// request that produced it. Consumers should call
+    /// [`QueueMessage::request_id`] to read it.
+    pub fn publish_vault_event_correlated(
+        &self,
+        request_id: &str,
+        vault_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, MessageQueueError> {
+        let mut headers = HashMap::new();
+        headers.insert("event_type".into(), event_type.into());
+        headers.insert("source".into(), "ethos-backend".into());
+        headers.insert(REQUEST_ID_HEADER.into(), request_id.to_string());
         self.broker.publish(
             &self.default_topic,
             Some(vault_id.to_string()),
@@ -452,14 +645,18 @@ impl MessageConsumer {
             .commit_offset(topic, partition, &self.consumer_group, offset)
     }
 
-    /// Process messages with a handler, auto-acking on success and sending to
-    /// DLQ after `max_retries` failures.
+    /// Process messages with a handler, auto-acking on success and routing a
+    /// message to the DLQ once its persistent delivery-attempt counter reaches
+    /// the topic's `max_retries` (see [`MessageBroker::record_failed_delivery`]).
+    ///
+    /// `_max_retries` is retained for call-site compatibility; the authoritative
+    /// limit is the topic configuration.
     pub fn process<F>(
         &self,
         topic: &str,
         partition: u32,
         max_messages: usize,
-        max_retries: u32,
+        _max_retries: u32,
         mut handler: F,
     ) -> Result<ProcessSummary, MessageQueueError>
     where
@@ -483,15 +680,22 @@ impl MessageConsumer {
                     last_good_offset = start_offset + i + 1;
                     processed += 1;
                 }
-                Err(_) => {
+                Err(e) => {
                     failed += 1;
-                    if msg.delivery_attempts >= max_retries {
-                        self.broker.send_to_dlq(topic, msg.clone())?;
-                        dlq_count += 1;
-                        last_good_offset = start_offset + i + 1;
-                    } else {
-                        // Stop processing; message will be retried next poll.
-                        break;
+                    match self
+                        .broker
+                        .record_failed_delivery(topic, partition, &msg.id, &e)?
+                    {
+                        DeliveryOutcome::Poisoned { .. } => {
+                            // Skip past the poison message so it is not
+                            // redelivered forever.
+                            dlq_count += 1;
+                            last_good_offset = start_offset + i + 1;
+                        }
+                        DeliveryOutcome::Retry { .. } => {
+                            // Stop processing; message will be retried next poll.
+                            break;
+                        }
                     }
                 }
             }
@@ -738,6 +942,188 @@ mod tests {
             }
         }
         assert!(found_header);
+    }
+
+    #[test]
+    fn delivery_attempts_counter_increments_per_failure() {
+        let broker = Arc::new(MessageBroker::new());
+        broker
+            .create_topic(
+                TopicConfig::new("poison.topic")
+                    .with_partitions(1)
+                    .with_max_retries(3),
+            )
+            .unwrap();
+        let id = broker
+            .publish(
+                "poison.topic",
+                None,
+                HashMap::new(),
+                serde_json::json!({}),
+                Some(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .record_failed_delivery("poison.topic", 0, &id, "boom")
+                .unwrap(),
+            DeliveryOutcome::Retry { attempts: 1 }
+        );
+        assert_eq!(
+            broker
+                .record_failed_delivery("poison.topic", 0, &id, "boom")
+                .unwrap(),
+            DeliveryOutcome::Retry { attempts: 2 }
+        );
+        assert_eq!(
+            broker
+                .record_failed_delivery("poison.topic", 0, &id, "boom")
+                .unwrap(),
+            DeliveryOutcome::Poisoned { attempts: 3 }
+        );
+
+        let dlq = broker.list_dlq("poison.topic").unwrap();
+        assert_eq!(dlq.len(), 1);
+        assert_eq!(
+            dlq[0].headers["dlq_reason"],
+            "max_delivery_attempts_exceeded"
+        );
+        assert_eq!(dlq[0].headers["dlq_error"], "boom");
+
+        let events = broker.list_poison_events("poison.topic").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attempts, 3);
+        assert_eq!(events[0].message_id, id);
+    }
+
+    #[test]
+    fn consumer_process_auto_routes_poison_message_to_dlq() {
+        let broker = Arc::new(MessageBroker::new());
+        broker
+            .create_topic(
+                TopicConfig::new("proc.poison")
+                    .with_partitions(1)
+                    .with_max_retries(2),
+            )
+            .unwrap();
+        broker
+            .publish(
+                "proc.poison",
+                None,
+                HashMap::new(),
+                serde_json::json!({"n": 1}),
+                Some(0),
+            )
+            .unwrap();
+        broker
+            .publish(
+                "proc.poison",
+                None,
+                HashMap::new(),
+                serde_json::json!({"n": 2}),
+                Some(0),
+            )
+            .unwrap();
+
+        let consumer =
+            MessageConsumer::new(Arc::clone(&broker), "grp", vec![("proc.poison".into(), 0)]);
+
+        // Message 1 always fails. First pass: attempt 1 -> retry, processing halts.
+        let s1 = consumer
+            .process("proc.poison", 0, 10, 2, |m| {
+                if m.payload["n"] == 1 {
+                    Err("always fails".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(s1.dlq_count, 0);
+        assert_eq!(broker.list_dlq("proc.poison").unwrap().len(), 0);
+
+        // Second pass: attempt 2 == max_retries -> poison-routed, offset advances
+        // past it so message 2 is then processed.
+        let s2 = consumer
+            .process("proc.poison", 0, 10, 2, |m| {
+                if m.payload["n"] == 1 {
+                    Err("always fails".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(s2.dlq_count, 1);
+        assert_eq!(s2.processed, 1);
+
+        assert_eq!(broker.list_dlq("proc.poison").unwrap().len(), 1);
+        assert_eq!(broker.list_poison_events("proc.poison").unwrap().len(), 1);
+        // Nothing left to redeliver.
+        assert_eq!(broker.poll("proc.poison", 0, "grp", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn poison_message_is_mirrored_into_shared_dlq_store() {
+        let dlq_store = crate::dlq::create_dlq_store();
+        let broker = Arc::new(MessageBroker::new().with_dlq_store(Arc::clone(&dlq_store)));
+        broker
+            .create_topic(
+                TopicConfig::new("mirror.topic")
+                    .with_partitions(1)
+                    .with_max_retries(1),
+            )
+            .unwrap();
+        let id = broker
+            .publish(
+                "mirror.topic",
+                None,
+                HashMap::new(),
+                serde_json::json!({"k": "v"}),
+                Some(0),
+            )
+            .unwrap();
+
+        let outcome = broker
+            .record_failed_delivery("mirror.topic", 0, &id, "downstream 500")
+            .unwrap();
+        assert_eq!(outcome, DeliveryOutcome::Poisoned { attempts: 1 });
+
+        let store = dlq_store.lock().unwrap();
+        assert_eq!(store.len(), 1);
+        let entry = store.values().next().unwrap();
+        assert_eq!(entry.error, "downstream 500");
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.payload, serde_json::json!({"k": "v"}));
+        assert!(entry.source.starts_with("message_queue:mirror.topic:"));
+    }
+
+    #[test]
+    fn request_id_propagates_through_queue_message_headers() {
+        let broker = Arc::new(MessageBroker::new());
+        broker
+            .create_topic(
+                TopicConfig::new("vault.events")
+                    .with_partitions(4)
+                    .with_strategy(PartitionStrategy::HashKey),
+            )
+            .unwrap();
+        let publisher = MessagePublisher::new(Arc::clone(&broker), "vault.events");
+        publisher
+            .publish_vault_event_correlated(
+                "req-trace-42",
+                "vault-9",
+                "check_in",
+                serde_json::json!({}),
+            )
+            .unwrap();
+
+        let mut seen = None;
+        for p in 0..4u32 {
+            for m in broker.poll("vault.events", p, "c", 10).unwrap() {
+                seen = Some(m.request_id().unwrap().to_string());
+            }
+        }
+        assert_eq!(seen.as_deref(), Some("req-trace-42"));
     }
 
     #[test]

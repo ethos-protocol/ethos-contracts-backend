@@ -31,9 +31,218 @@
 //! | `DB_SHARD_COUNT` | `1` | Number of shards |
 //! | `DB_SHARD_PATH_PREFIX` | `shard` | File path prefix; shard N is at `{prefix}_{N}.db` |
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+// ── Durable coordinator transaction log (#354) ────────────────────────────────
+
+/// Lifecycle of a distributed transaction as recorded in the coordinator's
+/// durable log. Transitions are written **before** the corresponding
+/// participant RPCs so a coordinator crash can always be resolved on restart.
+///
+/// ```text
+///   Preparing ──▶ Prepared ──▶ Committing ──▶ Committed
+///        │            │
+///        └────────────┴────────▶ Aborting ──▶ Aborted
+/// ```
+///
+/// The commit point is the durable write of `Committing`: once it is on disk
+/// the transaction is presumed-commit on recovery; before it, presumed-abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxState {
+    Preparing,
+    Prepared,
+    Committing,
+    Committed,
+    Aborting,
+    Aborted,
+}
+
+impl TxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TxState::Preparing => "preparing",
+            TxState::Prepared => "prepared",
+            TxState::Committing => "committing",
+            TxState::Committed => "committed",
+            TxState::Aborting => "aborting",
+            TxState::Aborted => "aborted",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "preparing" => TxState::Preparing,
+            "prepared" => TxState::Prepared,
+            "committing" => TxState::Committing,
+            "committed" => TxState::Committed,
+            "aborting" => TxState::Aborting,
+            "aborted" => TxState::Aborted,
+            _ => return None,
+        })
+    }
+
+    /// Whether a transaction in this state still needs recovery work.
+    fn is_in_flight(self) -> bool {
+        !matches!(self, TxState::Committed | TxState::Aborted)
+    }
+}
+
+/// A single recovered transaction record.
+#[derive(Debug, Clone)]
+pub struct TxLogRecord {
+    pub tx_id: String,
+    pub state: TxState,
+    /// Shard indices that participate in this transaction.
+    pub participants: Vec<usize>,
+}
+
+/// Durable write-ahead log of coordinator decisions. Backed by its own SQLite
+/// database so it survives a coordinator process crash independently of the
+/// shards.
+pub struct CoordinatorLog {
+    conn: Mutex<Connection>,
+}
+
+impl CoordinatorLog {
+    /// Open (or create) the log at `path`. Use `":memory:"` only in tests — a
+    /// crash-recoverable deployment must point this at a real file.
+    pub fn open(path: &str) -> Result<Self, DistributedTxError> {
+        let conn = Connection::open(path)
+            .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+        conn.execute_batch(
+            r"
+            CREATE TABLE IF NOT EXISTS coordinator_tx_log (
+                tx_id        TEXT PRIMARY KEY,
+                state        TEXT NOT NULL,
+                participants TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+            ",
+        )
+        .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Record (or move) a transaction to `state`. Called **before** the
+    /// participant RPCs the state authorises. Returns only once the row is
+    /// durably written (SQLite fsync on commit).
+    pub fn record(
+        &self,
+        tx_id: &str,
+        state: TxState,
+        participants: &[usize],
+    ) -> Result<(), DistributedTxError> {
+        let parts = participants
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO coordinator_tx_log (tx_id, state, participants, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(tx_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+                params![tx_id, state.as_str(), parts, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the current state of a transaction, if the log knows about it.
+    pub fn get(&self, tx_id: &str) -> Result<Option<TxLogRecord>, DistributedTxError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT tx_id, state, participants FROM coordinator_tx_log WHERE tx_id = ?1",
+            params![tx_id],
+            |r| {
+                let tx_id: String = r.get(0)?;
+                let state: String = r.get(1)?;
+                let participants: String = r.get(2)?;
+                Ok((tx_id, state, participants))
+            },
+        )
+        .optional()
+        .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?
+        .map(|(tx_id, state, participants)| decode_record(&tx_id, &state, &participants))
+        .transpose()
+    }
+
+    /// Every transaction that has not reached a terminal state.
+    pub fn load_in_flight(&self) -> Result<Vec<TxLogRecord>, DistributedTxError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tx_id, state, participants FROM coordinator_tx_log
+                 WHERE state NOT IN ('committed', 'aborted')
+                 ORDER BY updated_at",
+            )
+            .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let tx_id: String = r.get(0)?;
+                let state: String = r.get(1)?;
+                let participants: String = r.get(2)?;
+                Ok((tx_id, state, participants))
+            })
+            .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (tx_id, state, participants) =
+                row.map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+            out.push(decode_record(&tx_id, &state, &participants)?);
+        }
+        Ok(out)
+    }
+}
+
+fn decode_record(
+    tx_id: &str,
+    state: &str,
+    participants: &str,
+) -> Result<TxLogRecord, DistributedTxError> {
+    let state = TxState::from_str(state)
+        .ok_or_else(|| DistributedTxError::Serialization(format!("bad tx state: {state}")))?;
+    let participants = if participants.is_empty() {
+        Vec::new()
+    } else {
+        participants
+            .split(',')
+            .map(|s| {
+                s.parse::<usize>()
+                    .map_err(|e| DistributedTxError::Serialization(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(TxLogRecord {
+        tx_id: tx_id.to_string(),
+        state,
+        participants,
+    })
+}
+
+/// What the recovery routine did with one in-flight transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// `Committing`/`Committed` was durable → commit was re-driven to all
+    /// participants.
+    ResumedCommit,
+    /// No durable commit decision → participants were rolled back / compensated.
+    Compensated,
+}
+
+/// Outcome of recovering a single transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    pub tx_id: String,
+    pub action: RecoveryAction,
+}
 
 // ── Shard key ─────────────────────────────────────────────────────────────────
 
@@ -56,7 +265,8 @@ impl ShardKey {
             .0
             .bytes()
             .fold(14_695_981_039_346_656_037_u64, |acc, b| {
-                acc.wrapping_mul(1_099_511_628_211_u64).wrapping_add(b as u64)
+                acc.wrapping_mul(1_099_511_628_211_u64)
+                    .wrapping_add(b as u64)
             });
         (hash % total_shards as u64) as usize
     }
@@ -126,16 +336,20 @@ impl ShardNode {
 
         let conn = self.conn.lock().unwrap();
 
-        // Check for duplicate tx_id (idempotency guard).
-        let already_prepared: bool = conn
+        // Check for duplicate tx_id (idempotency guard): refuse a transaction
+        // that is already prepared on this shard, or that has already been
+        // committed here (its prepare-log row is cleared on commit, so we must
+        // consult `committed_transactions` too).
+        let already_seen: bool = conn
             .query_row(
-                "SELECT 1 FROM prepared_transactions WHERE tx_id = ?1",
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM prepared_transactions WHERE tx_id = ?1)
+                             OR EXISTS (SELECT 1 FROM committed_transactions WHERE tx_id = ?1)",
                 params![tx_id],
                 |_| Ok(true),
             )
             .unwrap_or(false);
 
-        if already_prepared {
+        if already_seen {
             return Ok(Vote::Abort); // refuse duplicate
         }
 
@@ -231,25 +445,15 @@ impl ShardNode {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     /// Insert or replace a key-value pair.
-    Put {
-        shard_key: String,
-        value: String,
-    },
+    Put { shard_key: String, value: String },
     /// Delete a key-value pair.
-    Delete {
-        shard_key: String,
-    },
+    Delete { shard_key: String },
     /// Execute arbitrary SQL (must be non-DDL for safety in tests).
-    RawSql {
-        sql: String,
-    },
+    RawSql { sql: String },
 }
 
 /// Applies a single operation to `conn` without transaction management.
-fn apply_operation_inner(
-    conn: &Connection,
-    op: &Operation,
-) -> Result<(), DistributedTxError> {
+fn apply_operation_inner(conn: &Connection, op: &Operation) -> Result<(), DistributedTxError> {
     match op {
         Operation::Put { shard_key, value } => {
             conn.execute(
@@ -320,12 +524,29 @@ pub enum TxOutcome {
 /// Coordinator that runs 2PC across a set of [`ShardNode`]s.
 pub struct DistributedTxCoordinator {
     shards: Vec<Arc<ShardNode>>,
+    /// Durable write-ahead log of coordinator decisions, consulted by
+    /// [`recover`](Self::recover) after a crash.
+    log: Arc<CoordinatorLog>,
 }
 
 impl DistributedTxCoordinator {
-    /// Build a coordinator from explicit shard nodes.
+    /// Build a coordinator from explicit shard nodes with an in-memory decision
+    /// log (tests only — an in-memory log does not survive a real crash).
     pub fn new(shards: Vec<Arc<ShardNode>>) -> Self {
-        Self { shards }
+        Self {
+            shards,
+            log: Arc::new(CoordinatorLog::open(":memory:").expect("in-memory log")),
+        }
+    }
+
+    /// Build a coordinator with an explicit durable decision log.
+    pub fn with_log(shards: Vec<Arc<ShardNode>>, log: Arc<CoordinatorLog>) -> Self {
+        Self { shards, log }
+    }
+
+    /// Access the durable decision log.
+    pub fn log(&self) -> &Arc<CoordinatorLog> {
+        &self.log
     }
 
     /// Build a coordinator from environment variables.
@@ -349,7 +570,13 @@ impl DistributedTxCoordinator {
             shards.push(shard);
         }
 
-        Ok(Self { shards })
+        // The decision log lives alongside the shards; a file path makes it
+        // crash-recoverable, `:memory:` (the default) does not.
+        let log_path =
+            std::env::var("DB_COORDINATOR_LOG_PATH").unwrap_or_else(|_| ":memory:".to_string());
+        let log = Arc::new(CoordinatorLog::open(&log_path)?);
+
+        Ok(Self { shards, log })
     }
 
     /// Route an [`Operation`] to the correct shard based on its key.
@@ -371,10 +598,16 @@ impl DistributedTxCoordinator {
     /// shards that already voted Commit receive a rollback request).
     pub fn execute(&self, tx: &DistributedTransaction) -> Result<TxOutcome, DistributedTxError> {
         let tx_id = &tx.tx_id;
-        let participating_shards: Vec<usize> = tx.shard_ops.keys().cloned().collect();
+        let mut participating_shards: Vec<usize> = tx.shard_ops.keys().copied().collect();
+        participating_shards.sort_unstable();
+
+        // Durably record intent BEFORE contacting any participant, so a crash
+        // here is recoverable as presumed-abort.
+        self.log
+            .record(tx_id, TxState::Preparing, &participating_shards)?;
 
         // ── Phase 1: Prepare ─────────────────────────────────────────────────
-        let mut committed_shards: Vec<usize> = Vec::new();
+        let mut prepared_shards: Vec<usize> = Vec::new();
         for &shard_idx in &participating_shards {
             let shard = self
                 .shards
@@ -384,24 +617,42 @@ impl DistributedTxCoordinator {
                     "index out of range".to_string(),
                 ))?;
 
-            let ops = tx.shard_ops.get(&shard_idx).map(Vec::as_slice).unwrap_or(&[]);
+            let ops = tx
+                .shard_ops
+                .get(&shard_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             match shard.prepare(tx_id, ops)? {
                 Vote::Commit => {
-                    committed_shards.push(shard_idx);
+                    prepared_shards.push(shard_idx);
                 }
                 Vote::Abort => {
-                    // Rollback shards that already voted Commit.
-                    for &already in &committed_shards {
+                    // No commit decision was ever made durable → abort.
+                    self.log
+                        .record(tx_id, TxState::Aborting, &participating_shards)?;
+                    for &already in &prepared_shards {
                         if let Some(s) = self.shards.get(already) {
                             s.rollback(tx_id).ok();
                         }
                     }
+                    self.log
+                        .record(tx_id, TxState::Aborted, &participating_shards)?;
                     return Ok(TxOutcome::RolledBack);
                 }
             }
         }
 
-        // ── Phase 2: Commit ──────────────────────────────────────────────────
+        self.log
+            .record(tx_id, TxState::Prepared, &participating_shards)?;
+
+        // ── Commit point ────────────────────────────────────────────────────
+        // Persisting `Committing` is the atomic commit decision: if the
+        // coordinator crashes after this write, recovery drives the commit
+        // forward on every participant; if it crashes before, recovery aborts.
+        self.log
+            .record(tx_id, TxState::Committing, &participating_shards)?;
+
+        // ── Phase 2: Commit ─────────────────────────────────────────────────
         for &shard_idx in &participating_shards {
             let shard = self
                 .shards
@@ -414,7 +665,70 @@ impl DistributedTxCoordinator {
             shard.commit(tx_id)?;
         }
 
+        self.log
+            .record(tx_id, TxState::Committed, &participating_shards)?;
+
         Ok(TxOutcome::Committed)
+    }
+
+    /// Recovery routine — run once on coordinator startup.
+    ///
+    /// Scans the durable decision log for transactions that never reached a
+    /// terminal state (a crash mid-flight) and resolves each one:
+    ///
+    /// | Durable state on restart | Decision | Recovery action |
+    /// |---|---|---|
+    /// | `Committing` / `Committed` | commit was decided | re-drive `commit` on every participant (idempotent) |
+    /// | `Preparing` / `Prepared` / `Aborting` | no commit decision | `rollback` every participant (presumed abort) |
+    ///
+    /// Participant `commit`/`rollback` are idempotent (the shard's
+    /// `committed_transactions` / `prepared_transactions` tables dedupe), so
+    /// recovery is safe to run repeatedly.
+    pub fn recover(&self) -> Result<Vec<RecoveryOutcome>, DistributedTxError> {
+        let in_flight = self.log.load_in_flight()?;
+        let mut outcomes = Vec::with_capacity(in_flight.len());
+
+        for rec in in_flight {
+            debug_assert!(rec.state.is_in_flight());
+            let presumed_commit = matches!(rec.state, TxState::Committing | TxState::Committed);
+
+            if presumed_commit {
+                self.log
+                    .record(&rec.tx_id, TxState::Committing, &rec.participants)?;
+                for &shard_idx in &rec.participants {
+                    if let Some(shard) = self.shards.get(shard_idx) {
+                        // A participant that already committed pre-crash returns
+                        // TransactionNotFound (prepare log cleared) — treat as done.
+                        match shard.commit(&rec.tx_id) {
+                            Ok(()) | Err(DistributedTxError::TransactionNotFound(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                self.log
+                    .record(&rec.tx_id, TxState::Committed, &rec.participants)?;
+                outcomes.push(RecoveryOutcome {
+                    tx_id: rec.tx_id,
+                    action: RecoveryAction::ResumedCommit,
+                });
+            } else {
+                self.log
+                    .record(&rec.tx_id, TxState::Aborting, &rec.participants)?;
+                for &shard_idx in &rec.participants {
+                    if let Some(shard) = self.shards.get(shard_idx) {
+                        shard.rollback(&rec.tx_id).ok();
+                    }
+                }
+                self.log
+                    .record(&rec.tx_id, TxState::Aborted, &rec.participants)?;
+                outcomes.push(RecoveryOutcome {
+                    tx_id: rec.tx_id,
+                    action: RecoveryAction::Compensated,
+                });
+            }
+        }
+
+        Ok(outcomes)
     }
 
     /// Number of shards managed by this coordinator.
@@ -438,14 +752,13 @@ impl DistributedTxCoordinator {
         target_shard: usize,
         new_total_shards: usize,
     ) -> Result<u64, DistributedTxError> {
-        let source = self
-            .shards
-            .get(source_shard)
-            .ok_or_else(|| DistributedTxError::ShardUnavailable(source_shard, "not found".into()))?;
-        let target = self
-            .shards
-            .get(target_shard)
-            .ok_or_else(|| DistributedTxError::ShardUnavailable(target_shard, "not found".into()))?;
+        let source = self.shards.get(source_shard).ok_or_else(|| {
+            DistributedTxError::ShardUnavailable(source_shard, "not found".into())
+        })?;
+        // Validate the target exists up front (the 2PC below routes to it).
+        let _target = self.shards.get(target_shard).ok_or_else(|| {
+            DistributedTxError::ShardUnavailable(target_shard, "not found".into())
+        })?;
 
         // Collect keys to migrate.
         let rows: Vec<(String, String)> = {
@@ -454,10 +767,12 @@ impl DistributedTxCoordinator {
                 .prepare("SELECT shard_key, value FROM kv_data")
                 .map_err(|e| DistributedTxError::ShardUnavailable(source_shard, e.to_string()))?;
 
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            let collected = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(|e| DistributedTxError::ShardUnavailable(source_shard, e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DistributedTxError::ShardUnavailable(source_shard, e.to_string()))?
+                .map_err(|e| DistributedTxError::ShardUnavailable(source_shard, e.to_string()))?;
+            collected
         };
 
         let to_migrate: Vec<(String, String)> = rows
@@ -475,8 +790,19 @@ impl DistributedTxCoordinator {
         let mut tx = DistributedTransaction::new(&tx_id);
 
         for (key, value) in &to_migrate {
-            tx.add_op(target_shard, Operation::Put { shard_key: key.clone(), value: value.clone() });
-            tx.add_op(source_shard, Operation::Delete { shard_key: key.clone() });
+            tx.add_op(
+                target_shard,
+                Operation::Put {
+                    shard_key: key.clone(),
+                    value: value.clone(),
+                },
+            );
+            tx.add_op(
+                source_shard,
+                Operation::Delete {
+                    shard_key: key.clone(),
+                },
+            );
         }
 
         self.execute(&tx)?;
@@ -496,6 +822,8 @@ pub enum DistributedTxError {
     Serialization(String),
     /// An operation could not be applied.
     ApplyFailed(String),
+    /// The durable coordinator decision log could not be read or written.
+    LogUnavailable(String),
 }
 
 impl std::fmt::Display for DistributedTxError {
@@ -505,6 +833,7 @@ impl std::fmt::Display for DistributedTxError {
             Self::TransactionNotFound(tx_id) => write!(f, "transaction not found: {tx_id}"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
             Self::ApplyFailed(msg) => write!(f, "apply failed: {msg}"),
+            Self::LogUnavailable(msg) => write!(f, "coordinator log unavailable: {msg}"),
         }
     }
 }
@@ -548,7 +877,13 @@ mod tests {
         let coord = make_coordinator(1);
 
         let mut tx = DistributedTransaction::new("tx-001");
-        tx.add_op(0, Operation::Put { shard_key: "k1".into(), value: "v1".into() });
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "k1".into(),
+                value: "v1".into(),
+            },
+        );
 
         let outcome = coord.execute(&tx).expect("execute");
         assert_eq!(outcome, TxOutcome::Committed);
@@ -562,14 +897,32 @@ mod tests {
         let coord = make_coordinator(2);
 
         let mut tx = DistributedTransaction::new("tx-multi");
-        tx.add_op(0, Operation::Put { shard_key: "key0".into(), value: "val0".into() });
-        tx.add_op(1, Operation::Put { shard_key: "key1".into(), value: "val1".into() });
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "key0".into(),
+                value: "val0".into(),
+            },
+        );
+        tx.add_op(
+            1,
+            Operation::Put {
+                shard_key: "key1".into(),
+                value: "val1".into(),
+            },
+        );
 
         let outcome = coord.execute(&tx).expect("execute");
         assert_eq!(outcome, TxOutcome::Committed);
 
-        assert_eq!(coord.shards[0].read("key0").unwrap(), Some("val0".to_string()));
-        assert_eq!(coord.shards[1].read("key1").unwrap(), Some("val1".to_string()));
+        assert_eq!(
+            coord.shards[0].read("key0").unwrap(),
+            Some("val0".to_string())
+        );
+        assert_eq!(
+            coord.shards[1].read("key1").unwrap(),
+            Some("val1".to_string())
+        );
     }
 
     #[test]
@@ -577,7 +930,13 @@ mod tests {
         let coord = make_coordinator(1);
 
         let mut tx = DistributedTransaction::new("tx-dup");
-        tx.add_op(0, Operation::Put { shard_key: "k".into(), value: "v".into() });
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "k".into(),
+                value: "v".into(),
+            },
+        );
 
         coord.execute(&tx).unwrap(); // first commit
 
@@ -593,12 +952,27 @@ mod tests {
 
         // Manually prepare shard-0 with the same tx_id to trigger an abort on
         // the second shard's prepare call.
-        let ops = vec![Operation::Put { shard_key: "x".into(), value: "y".into() }];
+        let ops = vec![Operation::Put {
+            shard_key: "x".into(),
+            value: "y".into(),
+        }];
         coord.shards[0].prepare("tx-force-abort", &ops).unwrap();
 
         let mut tx = DistributedTransaction::new("tx-force-abort");
-        tx.add_op(0, Operation::Put { shard_key: "x".into(), value: "y".into() });
-        tx.add_op(1, Operation::Put { shard_key: "z".into(), value: "w".into() });
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "x".into(),
+                value: "y".into(),
+            },
+        );
+        tx.add_op(
+            1,
+            Operation::Put {
+                shard_key: "z".into(),
+                value: "w".into(),
+            },
+        );
 
         // Shard 0 will abort (duplicate), coordinator should rollback shard 1.
         let outcome = coord.execute(&tx).unwrap();
@@ -613,11 +987,22 @@ mod tests {
         let coord = make_coordinator(1);
 
         let mut tx1 = DistributedTransaction::new("tx-put");
-        tx1.add_op(0, Operation::Put { shard_key: "del-me".into(), value: "some-value".into() });
+        tx1.add_op(
+            0,
+            Operation::Put {
+                shard_key: "del-me".into(),
+                value: "some-value".into(),
+            },
+        );
         coord.execute(&tx1).unwrap();
 
         let mut tx2 = DistributedTransaction::new("tx-del");
-        tx2.add_op(0, Operation::Delete { shard_key: "del-me".into() });
+        tx2.add_op(
+            0,
+            Operation::Delete {
+                shard_key: "del-me".into(),
+            },
+        );
         coord.execute(&tx2).unwrap();
 
         assert_eq!(coord.shards[0].read("del-me").unwrap(), None);
@@ -632,7 +1017,10 @@ mod tests {
     #[test]
     fn test_route_operation_returns_valid_index() {
         let coord = make_coordinator(4);
-        let op = Operation::Put { shard_key: "some-key".into(), value: "v".into() };
+        let op = Operation::Put {
+            shard_key: "some-key".into(),
+            value: "v".into(),
+        };
         let idx = coord.route_operation(&op);
         assert!(idx < 4);
     }
@@ -646,7 +1034,13 @@ mod tests {
         let keys = ["alpha", "beta", "gamma", "delta", "epsilon"];
         for k in &keys {
             let mut tx = DistributedTransaction::new(format!("seed-{k}"));
-            tx.add_op(0, Operation::Put { shard_key: k.to_string(), value: "v".into() });
+            tx.add_op(
+                0,
+                Operation::Put {
+                    shard_key: k.to_string(),
+                    value: "v".into(),
+                },
+            );
             coord.execute(&tx).unwrap();
         }
 
@@ -671,5 +1065,126 @@ mod tests {
         let coord = DistributedTxCoordinator::from_env().unwrap();
         assert_eq!(coord.shard_count(), 1);
         std::env::remove_var("DB_SHARD_COUNT");
+    }
+
+    // ── Crash-recovery tests (#354) ─────────────────────────────────────────
+
+    /// Build `n` shards plus a shared durable log, returning both so a test can
+    /// drop the "crashed" coordinator and reopen a fresh one over the same
+    /// shards and log.
+    fn shards_and_log(n: usize) -> (Vec<Arc<ShardNode>>, Arc<CoordinatorLog>) {
+        let shards: Vec<Arc<ShardNode>> = (0..n)
+            .map(|i| {
+                let shard = Arc::new(ShardNode::open(i, ":memory:").expect("open"));
+                shard.bootstrap().expect("bootstrap");
+                shard
+            })
+            .collect();
+        let log = Arc::new(CoordinatorLog::open(":memory:").expect("log"));
+        (shards, log)
+    }
+
+    #[test]
+    fn execute_records_terminal_state_in_the_log() {
+        let (shards, log) = shards_and_log(2);
+        let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
+
+        let mut tx = DistributedTransaction::new("tx-logged");
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "a".into(),
+                value: "1".into(),
+            },
+        );
+        tx.add_op(
+            1,
+            Operation::Put {
+                shard_key: "b".into(),
+                value: "2".into(),
+            },
+        );
+        coord.execute(&tx).unwrap();
+
+        let rec = log.get("tx-logged").unwrap().unwrap();
+        assert_eq!(rec.state, TxState::Committed);
+        assert_eq!(rec.participants, vec![0, 1]);
+        assert!(log.load_in_flight().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_resumes_commit_when_decision_was_durable() {
+        // Simulate: coordinator persisted `Committing`, committed shard 0, then
+        // crashed before committing shard 1.
+        let (shards, log) = shards_and_log(2);
+        let tx_id = "tx-crash-after-decision";
+        let ops0 = vec![Operation::Put {
+            shard_key: "k0".into(),
+            value: "v0".into(),
+        }];
+        let ops1 = vec![Operation::Put {
+            shard_key: "k1".into(),
+            value: "v1".into(),
+        }];
+        shards[0].prepare(tx_id, &ops0).unwrap();
+        shards[1].prepare(tx_id, &ops1).unwrap();
+        log.record(tx_id, TxState::Committing, &[0, 1]).unwrap();
+        shards[0].commit(tx_id).unwrap(); // partial commit before "crash"
+
+        // Restart: fresh coordinator over the same shards + log.
+        let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
+        let outcomes = coord.recover().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].action, RecoveryAction::ResumedCommit);
+
+        assert_eq!(coord.shards[0].read("k0").unwrap(), Some("v0".into()));
+        assert_eq!(coord.shards[1].read("k1").unwrap(), Some("v1".into()));
+        assert_eq!(log.get(tx_id).unwrap().unwrap().state, TxState::Committed);
+    }
+
+    #[test]
+    fn recovery_aborts_when_no_commit_decision_was_durable() {
+        // Simulate: coordinator prepared both shards, persisted `Prepared`, then
+        // crashed before the commit decision.
+        let (shards, log) = shards_and_log(2);
+        let tx_id = "tx-crash-before-decision";
+        let ops = vec![Operation::Put {
+            shard_key: "z".into(),
+            value: "w".into(),
+        }];
+        shards[0].prepare(tx_id, &ops).unwrap();
+        shards[1].prepare(tx_id, &ops).unwrap();
+        log.record(tx_id, TxState::Prepared, &[0, 1]).unwrap();
+
+        let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
+        let outcomes = coord.recover().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].action, RecoveryAction::Compensated);
+
+        // Nothing was applied, and the prepared entries were discarded so the
+        // shards can accept new work under the same key.
+        assert_eq!(coord.shards[0].read("z").unwrap(), None);
+        assert_eq!(coord.shards[1].read("z").unwrap(), None);
+        assert_eq!(log.get(tx_id).unwrap().unwrap().state, TxState::Aborted);
+    }
+
+    #[test]
+    fn recovery_is_idempotent() {
+        let (shards, log) = shards_and_log(1);
+        let tx_id = "tx-idem";
+        let ops = vec![Operation::Put {
+            shard_key: "i".into(),
+            value: "1".into(),
+        }];
+        shards[0].prepare(tx_id, &ops).unwrap();
+        log.record(tx_id, TxState::Committing, &[0]).unwrap();
+
+        let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
+        let first = coord.recover().unwrap();
+        assert_eq!(first.len(), 1);
+        // Second pass has nothing in flight and must not error.
+        let second = coord.recover().unwrap();
+        assert!(second.is_empty());
+        assert_eq!(coord.shards[0].read("i").unwrap(), Some("1".into()));
     }
 }

@@ -40,6 +40,12 @@ pub struct BatchItemResult<T: Serialize> {
     pub outcome: BatchItemOutcome<T>,
 }
 
+/// Canonical response type for every batch endpoint (issue #356): a per-item
+/// list of `Ok`/`Err` outcomes (`BatchItemResult` → `BatchItemOutcome`) plus
+/// aggregate counts and retry guidance. `BatchResponse` is retained as a
+/// backwards-compatible alias.
+pub type BatchResult<T> = BatchResponse<T>;
+
 /// Aggregate response for a batch operation with per-item error reporting.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchResponse<T: Serialize> {
@@ -72,7 +78,12 @@ impl<T: Serialize> BatchTracker<T> {
         });
     }
 
-    pub fn record_failure(&mut self, key: impl Into<String>, error: impl Into<String>, retryable: bool) {
+    pub fn record_failure(
+        &mut self,
+        key: impl Into<String>,
+        error: impl Into<String>,
+        retryable: bool,
+    ) {
         self.items.push(BatchItemResult {
             key: key.into(),
             outcome: BatchItemOutcome::Failure {
@@ -80,6 +91,22 @@ impl<T: Serialize> BatchTracker<T> {
                 retryable,
             },
         });
+    }
+
+    /// Record a per-item `Result` directly, so a batch endpoint's inner loop
+    /// can funnel its natural `Result<T, E>` into the standardized shape
+    /// without matching by hand. `retryable` classifies the error (e.g.
+    /// transient DB contention `true`, validation error `false`).
+    pub fn record<E: std::fmt::Display>(
+        &mut self,
+        key: impl Into<String>,
+        result: Result<T, E>,
+        retryable: bool,
+    ) {
+        match result {
+            Ok(item) => self.record_success(key, item),
+            Err(e) => self.record_failure(key, e.to_string(), retryable),
+        }
     }
 
     pub fn finish(self) -> BatchResponse<T> {
@@ -182,13 +209,102 @@ pub async fn batch_set_preferences(
             deleted_at: None,
         };
 
-        match db.upsert(&prefs) {
-            Ok(()) => tracker.record_success(key, prefs),
-            // Database errors are transient (lock contention, pool exhaustion)
-            // so they're worth retrying, unlike the validation failures above.
-            Err(e) => tracker.record_failure(key, e.to_string(), true),
-        }
+        // DB errors are transient (lock contention, pool exhaustion) so they're
+        // retryable, unlike the validation failures above.
+        tracker.record(key, db.upsert(&prefs).map(|()| prefs), true);
     }
 
     Json(tracker.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(results: Vec<Result<u64, &'static str>>) -> BatchResult<u64> {
+        let mut tracker: BatchTracker<u64> = BatchTracker::new();
+        for (i, r) in results.into_iter().enumerate() {
+            // Treat the placeholder "transient" error as retryable.
+            let retryable = matches!(&r, Err(e) if *e == "transient");
+            tracker.record(i.to_string(), r, retryable);
+        }
+        tracker.finish()
+    }
+
+    #[test]
+    fn all_success_batch() {
+        let res = run(vec![Ok(10), Ok(20), Ok(30)]);
+        assert_eq!((res.total, res.succeeded, res.failed), (3, 3, 0));
+        assert!((res.success_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(res.retry_guidance, "all items succeeded; no retry needed");
+        assert!(res
+            .items
+            .iter()
+            .all(|i| matches!(i.outcome, BatchItemOutcome::Success { .. })));
+    }
+
+    #[test]
+    fn all_failure_batch() {
+        let res = run(vec![Err("bad input"), Err("bad input")]);
+        assert_eq!((res.total, res.succeeded, res.failed), (2, 0, 2));
+        assert!((res.success_rate - 0.0).abs() < f64::EPSILON);
+        assert!(res.retry_guidance.contains("not retryable"));
+        match &res.items[0].outcome {
+            BatchItemOutcome::Failure { error, retryable } => {
+                assert_eq!(error, "bad input");
+                assert!(!retryable);
+            }
+            BatchItemOutcome::Success { .. } => panic!("expected failure"),
+        }
+    }
+
+    #[test]
+    fn mixed_batch_reports_per_item_ok_and_err() {
+        let res = run(vec![Ok(1), Err("bad input"), Ok(3), Err("transient")]);
+        assert_eq!((res.total, res.succeeded, res.failed), (4, 2, 2));
+        assert!((res.success_rate - 0.5).abs() < f64::EPSILON);
+        // At least one retryable failure → guidance points at retryable items.
+        assert!(res.retry_guidance.contains("retryable=true"));
+
+        let keyed: std::collections::HashMap<_, _> = res
+            .items
+            .iter()
+            .map(|i| (i.key.as_str(), &i.outcome))
+            .collect();
+        assert!(matches!(keyed["0"], BatchItemOutcome::Success { .. }));
+        assert!(matches!(
+            keyed["1"],
+            BatchItemOutcome::Failure {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            keyed["3"],
+            BatchItemOutcome::Failure {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_batch_is_vacuously_successful() {
+        let res = run(vec![]);
+        assert_eq!((res.total, res.succeeded, res.failed), (0, 0, 0));
+        assert!((res.success_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn serialized_shape_matches_documented_schema() {
+        let res = run(vec![Ok(1), Err("bad input")]);
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["items"][0]["status"], "success");
+        assert_eq!(v["items"][0]["item"], 1);
+        assert_eq!(v["items"][1]["status"], "failure");
+        assert_eq!(v["items"][1]["error"], "bad input");
+        assert_eq!(v["items"][1]["retryable"], false);
+        assert!(v["retry_guidance"].is_string());
+    }
 }

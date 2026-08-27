@@ -198,6 +198,12 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             admission_middleware,
         ))
+        // Correlation IDs (#349): assign/propagate `X-Request-Id` for every
+        // request. Sits above admission control so even load-shed rejections
+        // carry the id, and echoes it on every response, including errors.
+        .layer(axum::middleware::from_fn(
+            ethos_protocol_backend::error_context::correlation_id_middleware,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
 }
