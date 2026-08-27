@@ -44,13 +44,17 @@ use ethos_protocol_backend::{
     scheduler,
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
+    token_revocation::{revoke_token, RevocationList},
     tracing_sampling::TraceSampler,
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
         WebAuthnState,
     },
-    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
+    webhook::{
+        delete_webhook, list_webhooks, register_webhook, rotate_webhook_secret, verify_webhook,
+        WebhookState,
+    },
 };
 
 #[cfg(test)]
@@ -186,6 +190,7 @@ pub fn build_router(state: AppState) -> Router {
         // ── Webhook routes (#65) ─────────────────────────────────────────────
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
+        .route("/webhooks/:id/rotate-secret", post(rotate_webhook_secret))
         .route("/webhooks/verify", post(verify_webhook))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
@@ -413,12 +418,19 @@ async fn main() {
         )
         .with_state(webauthn_state);
 
+    // ── Auth token revocation list (#350) ────────────────────────────────
+    let revocation_list = RevocationList::new();
+    let auth_router = Router::new()
+        .route("/auth/revoke", post(revoke_token))
+        .with_state(revocation_list);
+
     let app = build_router(state)
         // .merge(acl_router)
         // .merge(custom_metrics_router)
         // .merge(anomaly_router)
         // .merge(log_router)
-        .merge(webauthn_router);
+        .merge(webauthn_router)
+        .merge(auth_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

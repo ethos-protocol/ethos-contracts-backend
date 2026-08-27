@@ -150,7 +150,10 @@ pub async fn register_webhook(
         url: body.url,
         vault_id: body.vault_id,
         event_types: body.event_types,
-        secret: body.secret,
+        // #351: every registration is given a signing secret so that *every*
+        // outbound payload is HMAC-signed, even when the caller did not supply
+        // one. The generated secret is returned in the response body once.
+        secret: Some(body.secret.filter(|s| !s.is_empty()).unwrap_or_else(generate_secret)),
         algorithm: body.algorithm,
         created_at: Utc::now(),
         active: true,
@@ -286,13 +289,20 @@ async fn attempt_delivery(
             .header("X-Ethos-Delivery", &payload.id)
             .body(body.clone());
 
-        // Add HMAC-SHA256 signature + timestamp headers if a secret is configured.
+        // Add HMAC signature + timestamp headers. Every registration carries a
+        // secret (see `register_webhook`), so this branch is always taken for
+        // registrations created through the API; the `if let` only guards
+        // hand-constructed registrations used in tests.
         if let Some(ref secret) = registration.secret {
             let (signature, timestamp) =
                 build_signature_headers(&body, secret, registration.algorithm);
             req = req
-                .header("X-Ethos-Signature", signature)
-                .header("X-Ethos-Timestamp", timestamp);
+                .header("X-Ethos-Signature", &signature)
+                .header("X-Ethos-Timestamp", timestamp)
+                // #351: standard header carrying the canonical HMAC-SHA256
+                // digest ("sha256=<hex>"), independent of the registration's
+                // configured algorithm, for receivers that expect it.
+                .header("X-Signature-256", standard_signature_256(&body, secret));
         }
 
         match req.send().await {
@@ -639,6 +649,46 @@ pub fn build_signature_headers(
     (signature, timestamp)
 }
 
+/// Canonical value for the standard `X-Signature-256` header: the HMAC-SHA256
+/// digest of `body` under `secret`, formatted as `"sha256=<hex>"`.
+///
+/// Always SHA-256 regardless of the registration's configured algorithm, so
+/// receivers that only understand `X-Signature-256` have a stable contract.
+pub fn standard_signature_256(body: &str, secret: &str) -> String {
+    sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256)
+}
+
+/// Generate an opaque, high-entropy webhook signing secret.
+fn generate_secret() -> String {
+    format!(
+        "whsec_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+/// `POST /webhooks/:id/rotate-secret` — rotate a registration's signing secret.
+///
+/// Subsequent deliveries are signed with the new secret; signatures produced
+/// under the old secret no longer verify. The new secret is returned once.
+pub async fn rotate_webhook_secret(
+    State(state): State<Arc<WebhookState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut store = state.store.lock().unwrap();
+    match store.get_mut(&id) {
+        Some(wh) => {
+            let new_secret = generate_secret();
+            wh.secret = Some(new_secret.clone());
+            Ok(Json(serde_json::json!({
+                "id": id,
+                "secret": new_secret,
+            })))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 // ── Tests (#149) ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -647,6 +697,177 @@ mod tests {
 
     fn ts_now() -> String {
         Utc::now().timestamp().to_string()
+    }
+
+    fn sample_payload(id: &str) -> WebhookPayload {
+        WebhookPayload {
+            id: id.to_string(),
+            event_type: WebhookEventType::VaultReleased,
+            vault_id: "vault-1".to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({ "ok": true }),
+        }
+    }
+
+    // ── #351: outbound signing guarantees ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_every_registration_is_assigned_a_signing_secret() {
+        let state = Arc::new(WebhookState::new());
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+
+        let (status, Json(reg)) = register_webhook(State(state), Json(req)).await.unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        let secret = reg.secret.expect("registration must carry a signing secret");
+        assert!(secret.starts_with("whsec_"), "unexpected secret: {secret}");
+        assert!(secret.len() > 16);
+    }
+
+    #[test]
+    fn test_x_signature_256_is_hmac_sha256_of_body() {
+        let body = r#"{"event":"vault_released","amount":42}"#;
+        let secret = "whsec_deadbeef";
+
+        let header = standard_signature_256(body, secret);
+
+        // Canonical SHA-256 digest, independent of any other configured algorithm.
+        assert_eq!(
+            header,
+            sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256)
+        );
+        assert!(header.starts_with("sha256="));
+
+        let ts = ts_now();
+        let result = verify_webhook_signature(body, secret, Some(&header), Some(&ts));
+        assert!(result.valid, "{:?}", result.reason);
+    }
+
+    #[tokio::test]
+    async fn test_secret_rotation_invalidates_old_signatures() {
+        let state = Arc::new(WebhookState::new());
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: Some("original-secret".to_string()),
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+        let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req)).await.unwrap();
+        let body = r#"{"event":"vault_created"}"#;
+        let old_sig = standard_signature_256(body, reg.secret.as_deref().unwrap());
+
+        let Json(rot) = rotate_webhook_secret(State(state.clone()), Path(reg.id.clone()))
+            .await
+            .unwrap();
+        let new_secret = rot["secret"].as_str().unwrap().to_string();
+        assert_ne!(new_secret, "original-secret");
+
+        let stored = state.store.lock().unwrap().get(&reg.id).unwrap().clone();
+        assert_eq!(stored.secret.as_deref(), Some(new_secret.as_str()));
+
+        let new_sig = standard_signature_256(body, &new_secret);
+        assert_ne!(old_sig, new_sig, "rotation must change the signature");
+
+        let ts = ts_now();
+        assert!(
+            !verify_webhook_signature(body, &new_secret, Some(&old_sig), Some(&ts)).valid,
+            "signature under the retired secret must no longer verify"
+        );
+        assert!(verify_webhook_signature(body, &new_secret, Some(&new_sig), Some(&ts)).valid);
+    }
+
+    #[tokio::test]
+    async fn test_delivery_carries_x_signature_256_header() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/hook")
+            .match_header(
+                "x-signature-256",
+                mockito::Matcher::Regex("^sha256=[0-9a-f]{64}$".to_string()),
+            )
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let state = WebhookState::new();
+        let registration = WebhookRegistration {
+            id: "wh-signed".to_string(),
+            url: format!("{}/hook", server.url()),
+            vault_id: None,
+            event_types: vec![],
+            // A non-256 algorithm configured: X-Signature-256 must still be SHA-256.
+            secret: Some("delivery-secret".to_string()),
+            algorithm: SignatureAlgorithm::Sha512,
+            created_at: Utc::now(),
+            active: true,
+        };
+
+        attempt_delivery(
+            &state.http_client,
+            &registration,
+            &sample_payload("d1"),
+            &state,
+        )
+        .await;
+
+        hook.assert_async().await;
+        assert_eq!(state.dlq_state.store.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_receiver_rejecting_unsigned_retry_fails_delivery() {
+        let mut server = mockito::Server::new_async().await;
+        // Signed requests are accepted…
+        let signed = server
+            .mock("POST", "/hook")
+            .match_header("x-signature-256", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        // …unsigned requests are rejected on every attempt.
+        let unsigned = server
+            .mock("POST", "/hook")
+            .with_status(401)
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let state = WebhookState::new();
+        let registration = WebhookRegistration {
+            id: "wh-unsigned".to_string(),
+            url: format!("{}/hook", server.url()),
+            vault_id: None,
+            event_types: vec![],
+            secret: None, // hand-built registration: payloads go out unsigned
+            algorithm: SignatureAlgorithm::Sha256,
+            created_at: Utc::now(),
+            active: true,
+        };
+
+        attempt_delivery(
+            &state.http_client,
+            &registration,
+            &sample_payload("d2"),
+            &state,
+        )
+        .await;
+
+        signed.assert_async().await; // never hit
+        unsigned.assert_async().await; // hit on every retry
+        assert_eq!(
+            state.dlq_state.store.lock().unwrap().len(),
+            1,
+            "an unsigned delivery the receiver rejects must be dead-lettered"
+        );
     }
 
     #[test]
