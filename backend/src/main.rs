@@ -80,10 +80,7 @@ fn build_cors_layer() -> CorsLayer {
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+    ethos_protocol_backend::health::health_handler().await
 }
 
 /// GET /api/encryption/keys — list all known encryption key versions (#101).

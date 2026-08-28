@@ -131,6 +131,11 @@ async fn health_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "rpc": {
+            "endpoint": "<not configured>",
+            "status": "not_configured",
+            "reachable": true,
+        }
     }))
 }
 
