@@ -10,6 +10,7 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod caps;
 pub mod composition_rules;
 pub mod credential_anchoring;
 #[cfg(test)]
@@ -17,7 +18,9 @@ mod credential_anchoring_tests;
 pub mod credential_lifecycle;
 #[cfg(test)]
 mod credential_lifecycle_tests;
+pub mod floors;
 mod oracle;
+pub mod range_check;
 pub mod ranking;
 pub mod slice_attribute_matching;
 pub mod slice_consensus_voting;
@@ -384,6 +387,8 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 124,
     InheritanceCycleDetected = 125,
+    // Issue #345: floors/caps boundary consistency
+    FloorExceedsCap = 126,
 }
 
 #[contract]

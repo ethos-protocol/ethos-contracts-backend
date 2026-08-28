@@ -20,7 +20,7 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events, Ledger as _},
     token::StellarAssetClient,
     Address, BytesN, Env, IntoVal, TryIntoVal,
 };
@@ -63,9 +63,8 @@ fn do_check_ins(
     for _ in 0..n {
         client.check_in(&vault_id, owner, passkey_hash, &0u64);
         // Advance by 61 s — just over the 60-second default cooldown.
-        env.ledger().with_mut(|li| {
-            li.timestamp = li.timestamp.saturating_add(61);
-        });
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp().saturating_add(61));
     }
 }
 
@@ -135,7 +134,7 @@ fn test_passkey_usage_oldest_entry_pruned() {
 
     // First check-in with hash_a — this will be the entry that gets pruned.
     client.check_in(&vault_id, &owner, &hash_a, &0u64);
-    env.ledger().with_mut(|li| li.timestamp += 61);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 61);
 
     // Fill the rest of the cap with hash_b entries.
     do_check_ins(
@@ -243,9 +242,8 @@ fn do_audit_cycles(
         let hash = BytesN::<32>::from_array(env, &raw);
         client.add_passkey(&vault_id, owner, &hash);
         client.remove_passkey(&vault_id, owner, &hash);
-        env.ledger().with_mut(|li| {
-            li.timestamp = li.timestamp.saturating_add(1);
-        });
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp().saturating_add(1));
     }
 }
 
@@ -296,7 +294,7 @@ fn test_passkey_audit_oldest_entry_pruned() {
     // Insert a single "add" entry with a known hash as the very first operation.
     let sentinel_hash = BytesN::<32>::from_array(&env, &[0xFFu8; 32]);
     client.add_passkey(&vault_id, &owner, &sentinel_hash);
-    env.ledger().with_mut(|li| li.timestamp += 61);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 61);
 
     // Now fill the log with enough entries to push the sentinel off the front.
     // We already have 1 entry; add MAX_PASSKEY_AUDIT_ENTRIES more to guarantee
@@ -364,8 +362,7 @@ fn test_passkey_audit_events_emitted_past_cap() {
     // Each cycle = add + remove = 2 audit events.
     let expected_events = cycles * 2;
     assert_eq!(
-        total_audit_events as u32,
-        expected_events,
+        total_audit_events as u32, expected_events,
         "every lifecycle operation must emit a pk_audit event regardless of on-chain pruning"
     );
 }
