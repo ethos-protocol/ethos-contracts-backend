@@ -39,9 +39,11 @@ use ethos_protocol_backend::{
         self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
     },
     priority::{PriorityConfig, PriorityEnforcer},
+    rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
+    schema_validation::{openapi_validation_middleware, OpenApiSpec},
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
@@ -198,8 +200,34 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             admission_middleware,
         ))
+        // ── OpenAPI schema validation (#347) ────────────────────────────────
+        // Rejects requests/responses that do not conform to docs/openapi.yaml.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(OpenApiSpec::load_bundled()),
+            openapi_validation_middleware,
+        ))
+        // ── API rate limiting (#348) ───────────────────────────────────────
+        // Outermost app layer: wraps *every* route above. Endpoints with no
+        // explicit limit still get the default-deny fallback tier, so no
+        // handler can bypass the limiter. Returns 429 + Retry-After.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(build_rate_limiter()),
+            enforce_rate_limit,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+/// Rate limiter used by [`enforce_rate_limit`] for the whole app (#348).
+///
+/// Per-tier, per-endpoint limits; unauthenticated callers and unregistered
+/// endpoints fall back to [`TierLimit::default_deny`].
+fn build_rate_limiter() -> RateLimiter {
+    use std::time::Duration;
+
+    // Global default for authenticated tiers on endpoints without a specific
+    // entry: 300 requests / minute.
+    RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)))
 }
 
 #[tokio::main]
