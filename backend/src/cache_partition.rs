@@ -558,4 +558,80 @@ mod tests {
         let stats = cache.partition_stats("tenant_a").unwrap();
         assert_eq!(stats.hit_ratio(), None);
     }
+
+    // ── Playground / production isolation (docs/playground.md) ──────────────────
+    //
+    // The Playground (docs/playground.md, backend/simulator.html) shares the
+    // same `PartitionedCache` mechanism used for multi-tenant isolation.
+    // Playground state is namespaced under the "playground" tenant id and
+    // production state under "production" — the same guarantee that keeps
+    // tenant_a's data invisible to tenant_b keeps playground writes from
+    // ever appearing in a production read, and vice versa.
+
+    const PLAYGROUND_TENANT: &str = "playground";
+    const PRODUCTION_TENANT: &str = "production";
+
+    #[test]
+    fn test_playground_writes_never_appear_in_production_reads() {
+        let cache = PartitionedCache::new(Duration::from_secs(60));
+        cache.set(PLAYGROUND_TENANT, "vault:1", "playground_data".to_string());
+
+        // Production has never written "vault:1" itself, so it must read
+        // as a miss even though the playground has a value under that key.
+        assert!(cache.get(PRODUCTION_TENANT, "vault:1").is_none());
+    }
+
+    #[test]
+    fn test_production_writes_never_appear_in_playground_reads() {
+        let cache = PartitionedCache::new(Duration::from_secs(60));
+        cache.set(PRODUCTION_TENANT, "vault:1", "production_data".to_string());
+
+        assert!(cache.get(PLAYGROUND_TENANT, "vault:1").is_none());
+    }
+
+    #[test]
+    fn test_playground_and_production_can_hold_same_key_independently() {
+        let cache = PartitionedCache::new(Duration::from_secs(60));
+        cache.set(PLAYGROUND_TENANT, "vault:1", "playground_data".to_string());
+        cache.set(PRODUCTION_TENANT, "vault:1", "production_data".to_string());
+
+        assert_eq!(
+            cache.get(PLAYGROUND_TENANT, "vault:1"),
+            Some("playground_data".to_string())
+        );
+        assert_eq!(
+            cache.get(PRODUCTION_TENANT, "vault:1"),
+            Some("production_data".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clearing_playground_does_not_affect_production() {
+        let cache = PartitionedCache::new(Duration::from_secs(60));
+        cache.set(PLAYGROUND_TENANT, "vault:1", "playground_data".to_string());
+        cache.set(PRODUCTION_TENANT, "vault:1", "production_data".to_string());
+
+        cache.clear_tenant(PLAYGROUND_TENANT);
+
+        assert!(cache.get(PLAYGROUND_TENANT, "vault:1").is_none());
+        assert_eq!(
+            cache.get(PRODUCTION_TENANT, "vault:1"),
+            Some("production_data".to_string())
+        );
+    }
+
+    #[test]
+    fn test_playground_namespaced_key_cannot_collide_with_production() {
+        // Even at the raw namespaced-key level, "playground:vault:1" and
+        // "production:vault:1" are distinct strings — there is no key a
+        // playground write could use that would be read back as a
+        // production key (or vice versa) via `parse_namespaced_key`.
+        let playground_key = namespaced_key(PLAYGROUND_TENANT, "vault:1");
+        let production_key = namespaced_key(PRODUCTION_TENANT, "vault:1");
+        assert_ne!(playground_key, production_key);
+
+        let (tenant, _) = parse_namespaced_key(&playground_key).unwrap();
+        assert_eq!(tenant, PLAYGROUND_TENANT);
+        assert_ne!(tenant, PRODUCTION_TENANT);
+    }
 }

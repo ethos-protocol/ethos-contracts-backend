@@ -74,6 +74,11 @@ jobs:
             openapi-spec-validator docs/openapi.yaml
           fi
 
+      - name: Check playground/production isolation
+        run: |
+          chmod +x scripts/check_playground_isolation.sh
+          scripts/check_playground_isolation.sh environments.toml
+
       - name: Check version consistency
         run: |
           CHANGELOG_VERSION=$(grep -m 1 "^## \[" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
