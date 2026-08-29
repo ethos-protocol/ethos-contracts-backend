@@ -540,6 +540,9 @@ pub enum DataKey {
     PasskeyEscrow(u64, BytesN<32>),
     // Issue #558: passkey audit trail
     PasskeyAuditLog(u64),
+    // Upgrade safety: recorded interface/storage fingerprint of the
+    // currently running contract, checked by validate_upgrade.
+    UpgradeManifest,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1534,6 +1537,32 @@ pub struct PauseRecord {
     pub paused_by: Address,
     pub reason: Bytes,
     pub paused_at: u64,
+}
+
+/// Fingerprint of the currently-deployed contract's interface, set by the
+/// admin via `set_upgrade_manifest` and checked by `validate_upgrade` before
+/// any `upgrade()` call is allowed to proceed.
+///
+/// This does not (and cannot, from within the contract itself) introspect
+/// the raw WASM bytes of a proposed upgrade. Instead it requires the admin
+/// to declare the new contract's fingerprint out-of-band (e.g. computed by
+/// a build-time tool that inspects the new WASM's export table and error
+/// enum) and compares it against the fingerprint recorded for the running
+/// contract, so an upgrade cannot silently shrink the interface, drop
+/// storage keys, or renumber error codes. See docs/upgrade-safety.md.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeManifest {
+    /// Number of exported contract functions in the currently running WASM.
+    pub exported_fn_count: u32,
+    /// Number of variants in `ContractError` in the currently running WASM.
+    pub error_code_count: u32,
+    /// Hash over the sorted list of storage schema key names/tags in use,
+    /// so a new WASM that stops writing/reading an existing key is caught.
+    pub storage_schema_hash: BytesN<32>,
+    /// Monotonically increasing manifest version, bumped every time the
+    /// admin records a new baseline (i.e. after each successful upgrade).
+    pub version: u32,
 }
 
 /// Stored when an owner commits to an anonymous beneficiary.
