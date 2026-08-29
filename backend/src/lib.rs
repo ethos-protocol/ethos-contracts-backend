@@ -4,6 +4,7 @@ pub mod audit;
 pub mod backup_validation;
 pub mod batching;
 pub mod cache;
+pub mod cache_recovery;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
