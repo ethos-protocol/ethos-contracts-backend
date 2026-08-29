@@ -74,6 +74,11 @@ jobs:
             openapi-spec-validator docs/openapi.yaml
           fi
 
+      - name: Validate docs/use-cases.md examples against OpenAPI schema
+        run: |
+          python3 -m pip install pyyaml 2>/dev/null || true
+          python3 scripts/validate_use_case_examples.py
+
       - name: Check version consistency
         run: |
           CHANGELOG_VERSION=$(grep -m 1 "^## \[" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')

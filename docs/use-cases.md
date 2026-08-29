@@ -199,13 +199,19 @@ let vault_id = contract.create_vault(
 );
 ```
 
-**2. Register a webhook for release events**
+**2. Register for release notifications**
+
+There is no generic `/api/webhooks` URL-callback endpoint in the current
+API (see `docs/openapi.yaml`). To be notified when a vault releases, use
+the documented notification endpoints instead: register a device/channel
+with `POST /api/notifications/register`, then set which events you want to
+be notified about with `PUT /api/notifications/preferences`.
 
 ```bash
-# POST to backend API
-curl -X POST http://localhost:3000/api/webhooks \
+# POST to backend API — matches docs/openapi.yaml #/paths/~1api~1notifications~1register
+curl -X POST http://localhost:3000/api/notifications/register \
   -H "Content-Type: application/json" \
-  -d '{"vault_id": 1, "event": "trigger_release", "url": "https://your-server/release-hook"}'
+  -d '{"owner": "GABC...OWNERADDR", "token": "your-device-push-token", "platform": "web"}'
 ```
 
 **3. Upload encrypted payload linked to vault**
@@ -626,3 +632,27 @@ contract.repay_ttl_borrow(borrower_vault_id, owner_address)?;
 - **Accelerated expiry**: Use `accelerate_ttl_decay()` to voluntarily shorten a vault instead
 
 For full details, see [TTL & State Archival Logic](ttl-logic.md).
+
+## Validating examples against the API schema
+
+Every `curl` example in this document that calls the backend API (as
+opposed to a contract call shown as Rust) must match a path and request
+schema defined in [`docs/openapi.yaml`](openapi.yaml). To keep examples
+from drifting as the API evolves:
+
+1. Run `python3 scripts/validate_use_case_examples.py` locally after editing
+   any `curl` example in this file. It extracts each ` ```bash ` block's
+   `curl -X <METHOD> <path> -d '<json>'` call, matches `<path>` against the
+   templated paths in `docs/openapi.yaml`, and checks the JSON body's keys
+   against that endpoint's request schema (no unknown fields, no missing
+   required fields).
+2. CI runs the same script on every PR (see `.github/workflows/ci.yml`,
+   step "Validate docs/use-cases.md examples against OpenAPI schema") and
+   fails the build if an example references an undefined path or drifts
+   from the schema.
+3. When adding a new example, prefer copying field names directly from the
+   relevant schema in `docs/openapi.yaml` rather than from memory.
+4. If an example illustrates a capability that isn't (yet) a real HTTP
+   endpoint, say so explicitly in the surrounding prose instead of using a
+   `curl` block, so the validator (and readers) don't mistake it for a live
+   endpoint.
