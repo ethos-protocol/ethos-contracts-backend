@@ -12,6 +12,13 @@ pub struct Metrics {
     pub request_errors_total: AtomicU64,
     pub http_requests_total: AtomicU64,
     pub contract_paused: AtomicU64,
+    /// Count of on-chain `upgrade()` events observed by the event indexer.
+    /// Feeds the `EthosContractUpgradeInProgress` alert — see
+    /// docs/monitoring-guide.md and monitoring/alert_rules.yml.
+    pub contract_upgrade_events_total: AtomicU64,
+    /// Count of failed credential lifecycle transitions. Feeds the
+    /// `EthosCredentialLifecycleAnomalies` alert.
+    pub credential_lifecycle_errors_total: AtomicU64,
 }
 
 impl Metrics {
@@ -65,6 +72,18 @@ impl Metrics {
             "1 if contract is paused, 0 otherwise",
             self.contract_paused.load(Ordering::Relaxed),
         );
+        push_counter(
+            &mut out,
+            "ethos_protocol_contract_upgrade_events_total",
+            "Total on-chain upgrade() events observed",
+            self.contract_upgrade_events_total.load(Ordering::Relaxed),
+        );
+        push_counter(
+            &mut out,
+            "ethos_protocol_credential_lifecycle_errors_total",
+            "Total failed credential lifecycle transitions",
+            self.credential_lifecycle_errors_total.load(Ordering::Relaxed),
+        );
 
         out
     }
@@ -115,5 +134,16 @@ mod tests {
         assert!(output.contains("# HELP ethos_protocol_vaults_total"));
         assert!(output.contains("# TYPE ethos_protocol_vaults_total counter"));
         assert!(output.contains("# TYPE ethos_protocol_active_vaults gauge"));
+    }
+
+    #[test]
+    fn test_render_contains_monitoring_metrics() {
+        let m = Metrics::new();
+        m.contract_upgrade_events_total.store(2, Ordering::Relaxed);
+        m.credential_lifecycle_errors_total.store(3, Ordering::Relaxed);
+
+        let output = m.render();
+        assert!(output.contains("ethos_protocol_contract_upgrade_events_total 2"));
+        assert!(output.contains("ethos_protocol_credential_lifecycle_errors_total 3"));
     }
 }

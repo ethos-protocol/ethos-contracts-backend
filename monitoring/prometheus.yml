@@ -1,0 +1,42 @@
+# Prometheus scrape configuration for Ethos-Protocol.
+#
+# Scrapes the backend's Prometheus text-exposition endpoint (rendered by
+# backend/src/metrics.rs and backend/src/custom_metrics.rs) plus, where a
+# sidecar is deployed, on-chain event stream metrics.
+#
+# Usage:
+#   prometheus --config.file=monitoring/prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: ethos-protocol
+
+rule_files:
+  - alert_rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+scrape_configs:
+  - job_name: ethos-backend-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "${BACKEND_HOST:-localhost}:${BACKEND_PORT:-8080}"
+        labels:
+          service: ethos-backend
+          env: "${DEPLOY_ENV:-development}"
+
+  - job_name: ethos-contract-events
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "${EVENT_INDEXER_HOST:-localhost}:${EVENT_INDEXER_PORT:-9100}"
+        labels:
+          service: ethos-event-indexer
+          env: "${DEPLOY_ENV:-development}"
