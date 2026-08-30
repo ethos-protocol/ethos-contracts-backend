@@ -15281,4 +15281,49 @@ impl TtlVaultContract {
             backup_slice_id,
         ))
     }
+
+    // --- Issue #37: Slice Inheritance Chain ---
+
+    /// Create a root template with no parent.
+    pub fn create_template(env: Env, name: Bytes, data: Bytes) -> u64 {
+        template_inheritance::create_template(&env, name, data, 0, Bytes::new(&env))
+    }
+
+    /// Create a template that inherits from `parent_id`, applying `overrides`
+    /// on top of the parent's resolved data.
+    ///
+    /// # Errors
+    /// Panics with `ContractError::TemplateNotFound` if `parent_id` does not
+    /// exist, or `ContractError::InheritanceCycleDetected` if the resulting
+    /// chain would be cyclic or exceed `MAX_INHERITANCE_DEPTH`.
+    pub fn create_inherited_template(env: Env, parent_id: u64, overrides: Bytes) -> u64 {
+        template_inheritance::create_inherited_template(&env, parent_id, overrides)
+    }
+
+    /// Resolve a template's fully-inherited data by walking its ancestor
+    /// chain and applying overrides from root to leaf. Returns `None` if the
+    /// template doesn't exist or its inheritance chain is broken (cyclic or
+    /// too deep).
+    pub fn resolve_template(
+        env: Env,
+        template_id: u64,
+    ) -> Option<template_inheritance::ResolvedTemplate> {
+        template_inheritance::resolve_template(&env, template_id)
+    }
+
+    /// Depth of `template_id` in its inheritance chain (0 for a root
+    /// template).
+    pub fn get_inheritance_depth(env: Env, template_id: u64) -> u32 {
+        template_inheritance::get_inheritance_depth(&env, template_id)
+    }
+
+    /// Check whether making `parent_id` the parent of `child_id` would
+    /// create a cycle in the inheritance graph.
+    pub fn check_inheritance_cycle(
+        env: Env,
+        parent_id: u64,
+        child_id: u64,
+    ) -> template_inheritance::CycleCheckResult {
+        template_inheritance::check_inheritance_cycle(&env, parent_id, child_id)
+    }
 }

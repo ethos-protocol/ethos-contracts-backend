@@ -155,24 +155,33 @@ fn timeline_entry(actor: impl Into<String>, note: impl Into<String>) -> Timeline
     }
 }
 
+fn new_incident(
+    title: String,
+    description: String,
+    severity: IncidentSeverity,
+    assigned_to: Option<String>,
+) -> Incident {
+    let now = Utc::now();
+    Incident {
+        id: Uuid::new_v4().to_string(),
+        title,
+        description,
+        severity,
+        status: IncidentStatus::Open,
+        escalation_level: 0,
+        assigned_to,
+        timeline: vec![timeline_entry("system", "incident opened")],
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// `POST /incidents` — open a new incident with severity classification.
 pub async fn create_incident(
     State(state): State<Arc<IncidentState>>,
     Json(body): Json<CreateIncidentRequest>,
 ) -> (StatusCode, Json<Incident>) {
-    let now = Utc::now();
-    let incident = Incident {
-        id: Uuid::new_v4().to_string(),
-        title: body.title,
-        description: body.description,
-        severity: body.severity,
-        status: IncidentStatus::Open,
-        escalation_level: 0,
-        assigned_to: body.assigned_to,
-        timeline: vec![timeline_entry("system", "incident opened")],
-        created_at: now,
-        updated_at: now,
-    };
+    let incident = new_incident(body.title, body.description, body.severity, body.assigned_to);
 
     tracing::warn!(
         incident_id = %incident.id,
@@ -184,6 +193,29 @@ pub async fn create_incident(
     store.insert(incident.id.clone(), incident.clone());
 
     (StatusCode::CREATED, Json(incident))
+}
+
+/// Open an incident directly against `store`, bypassing the HTTP layer.
+///
+/// For callers outside a request context — background jobs and validation
+/// routines (e.g. backup checksum verification) — that detect a problem and
+/// need to raise an alert without going through `POST /incidents`.
+pub fn open_incident(
+    store: &IncidentStore,
+    title: impl Into<String>,
+    description: impl Into<String>,
+    severity: IncidentSeverity,
+) -> Incident {
+    let incident = new_incident(title.into(), description.into(), severity, None);
+
+    tracing::warn!(
+        incident_id = %incident.id,
+        severity = ?incident.severity,
+        "incident opened"
+    );
+
+    store.lock().unwrap().insert(incident.id.clone(), incident.clone());
+    incident
 }
 
 /// `GET /incidents` — list all tracked incidents.

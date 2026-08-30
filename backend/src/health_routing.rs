@@ -29,9 +29,20 @@ use serde::{Deserialize, Serialize};
 /// reduced weight to full weight.
 const SLOW_START_REQUESTS: u32 = 10;
 
-/// Consecutive failures after which an endpoint is treated as unhealthy and
-/// routed around entirely (weight 0) until it recovers.
+/// Consecutive failures after which a healthy endpoint is marked unhealthy
+/// and routed around entirely (weight 0).
 const UNHEALTHY_THRESHOLD: u32 = 5;
+
+/// Consecutive successes an unhealthy endpoint must post before it is marked
+/// healthy again and re-added to rotation.
+///
+/// This is deliberately lower than `UNHEALTHY_THRESHOLD` and, more
+/// importantly, decoupled from it: without a separate recovery threshold, a
+/// single success right after `UNHEALTHY_THRESHOLD` failures would flip the
+/// endpoint back to healthy immediately (since `consecutive_failures` resets
+/// to 0 on any success), which could then flip back to unhealthy on the very
+/// next failure — flapping in and out of rotation rather than settling.
+const RECOVERY_THRESHOLD: u32 = 3;
 
 /// Exponential moving average smoothing factor applied to each new outcome.
 const EWMA_ALPHA: f64 = 0.3;
@@ -49,6 +60,14 @@ pub struct EndpointHealth {
     pub total_successes: u32,
     pub total_failures: u32,
     pub consecutive_failures: u32,
+    /// Consecutive successes since the last failure; drives recovery out of
+    /// the unhealthy state (see `RECOVERY_THRESHOLD`).
+    pub consecutive_successes: u32,
+    /// Sticky health state, flipped only at the hysteresis thresholds rather
+    /// than being derived fresh from `consecutive_failures` on every read —
+    /// that derivation is what let a single success un-mark an endpoint that
+    /// had just been marked unhealthy.
+    pub healthy: bool,
     /// Requests served so far while ramping up from slow-start.
     pub slow_start_requests_served: u32,
     /// Current effective weight in `[0.0, 1.0]`, combining health + slow-start.
@@ -67,6 +86,8 @@ impl EndpointHealth {
             total_successes: 0,
             total_failures: 0,
             consecutive_failures: 0,
+            consecutive_successes: 0,
+            healthy: true,
             slow_start_requests_served: 0,
             weight: slow_start_weight(0),
             first_seen: now,
@@ -75,7 +96,17 @@ impl EndpointHealth {
     }
 
     fn is_healthy(&self) -> bool {
-        self.consecutive_failures < UNHEALTHY_THRESHOLD
+        self.healthy
+    }
+
+    /// Apply hysteresis: only flip `healthy` at the mark-unhealthy /
+    /// mark-healthy-again thresholds, not on every outcome.
+    fn update_health_state(&mut self) {
+        if self.healthy && self.consecutive_failures >= UNHEALTHY_THRESHOLD {
+            self.healthy = false;
+        } else if !self.healthy && self.consecutive_successes >= RECOVERY_THRESHOLD {
+            self.healthy = true;
+        }
     }
 }
 
@@ -152,10 +183,13 @@ pub fn record_outcome(state: &HealthRoutingState, endpoint: &str, success: bool)
     if success {
         health.total_successes += 1;
         health.consecutive_failures = 0;
+        health.consecutive_successes += 1;
     } else {
         health.total_failures += 1;
         health.consecutive_failures += 1;
+        health.consecutive_successes = 0;
     }
+    health.update_health_state();
 
     let outcome_value = if success { 1.0 } else { 0.0 };
     health.success_rate_ewma =
