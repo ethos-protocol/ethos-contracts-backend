@@ -59,6 +59,18 @@ jobs:
       - name: Run cargo-deny license and advisory check
         run: cargo deny check advisories licenses
 
+  allowlist-expiry-check:
+    name: Allowlist Expiry Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check vulnerability allowlist expiry dates
+        run: |
+          # Fail the build if any allowlisted advisory has passed its review-by date.
+          # See docs/vulnerability-scanning.md for the allowlist policy.
+          python3 scripts/check_allowlist_expiry.py
+
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
