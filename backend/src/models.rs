@@ -770,6 +770,11 @@ pub struct TwoFactorConfig {
     pub email: Option<String>,
     pub created_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
+    /// SHA-256 hex digests of unused backup codes. A code is removed from
+    /// this list the moment it is successfully consumed, so it can never be
+    /// used a second time.
+    #[serde(default)]
+    pub backup_codes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -790,6 +795,9 @@ pub struct Enable2FAResponse {
     pub method: TwoFactorMethod,
     pub secret: Option<String>,
     pub provisioning_uri: Option<String>,
+    /// Plaintext backup codes, returned exactly once at generation time. Only
+    /// their SHA-256 digests are persisted, so they cannot be recovered later.
+    pub backup_codes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1065,6 +1073,11 @@ pub struct SecretRotationPolicy {
     pub rotation_interval_days: u32,
     /// Grace period (in hours) during which both old and new secrets are accepted.
     pub grace_period_hours: u32,
+    /// Maximum lifetime (in hours) of a session or token issued using this
+    /// secret. The grace period must exceed this value, or a session/token
+    /// created just before rotation could be invalidated while still valid.
+    #[serde(default)]
+    pub max_token_lifetime_hours: u32,
     /// Whether automated rotation is enabled.
     pub auto_rotate: bool,
     /// Notification channel(s) to alert when rotation is due / complete.
@@ -1078,6 +1091,7 @@ pub struct SecretRotationPolicy {
 pub struct UpsertSecretRotationPolicyRequest {
     pub rotation_interval_days: u32,
     pub grace_period_hours: Option<u32>,
+    pub max_token_lifetime_hours: Option<u32>,
     pub auto_rotate: Option<bool>,
     pub notify_channels: Option<Vec<String>>,
 }

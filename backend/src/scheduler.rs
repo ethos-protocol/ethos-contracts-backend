@@ -18,6 +18,7 @@ pub async fn run(db: Arc<Db>) {
     // Track when we last ran the daily/hourly tasks.
     let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
     let mut last_rotation_check = chrono::DateTime::<Utc>::MIN_UTC;
+    let mut last_encryption_backfill = chrono::DateTime::<Utc>::MIN_UTC;
 
     loop {
         interval.tick().await;
@@ -108,7 +109,64 @@ pub async fn run(db: Arc<Db>) {
             crate::secret_rotation::run_rotation_scheduler(&db);
             last_rotation_check = now;
         }
+
+        // 5) Encryption key rotation backfill (runs at most once every hour).
+        if now.signed_duration_since(last_encryption_backfill).num_minutes() >= 60 {
+            run_encryption_backfill_job().await;
+            last_encryption_backfill = now;
+        }
     }
+}
+
+// ── #390: Field Encryption Key Rotation Backfill Job ─────────────────────────
+
+/// Run the periodic encryption key rotation backfill.
+///
+/// In a real deployment this would page through the tables listed in
+/// `encryption::SENSITIVE_FIELDS`, decode each stored `EncryptedField`, and
+/// feed them through `encryption::run_backfill`, persisting its cursor
+/// between runs so an interruption resumes instead of rescanning from the
+/// start. Reading and writing those columns as `EncryptedField` JSON is not
+/// wired up yet (see `docs/encrypted-field-storage.md`), so this currently
+/// runs the job over an empty record set purely to exercise the scheduling
+/// path; `encryption::run_backfill_batch` and `encryption::run_backfill`
+/// carry the real batching, rate-limiting, and resumability logic and are
+/// covered directly by tests in `backend/src/encryption.rs`.
+async fn run_encryption_backfill_job() {
+    use crate::encryption::{BackfillCursor, FieldEncryptionEngine};
+
+    let engine = match FieldEncryptionEngine::from_env() {
+        Ok(engine) => engine,
+        Err(e) => {
+            tracing::error!(error = %e, "encryption_backfill: failed to load encryption engine");
+            return;
+        }
+    };
+
+    let placeholder_records: Vec<crate::encryption::BackfillRecord> = vec![];
+    let summary = crate::encryption::run_backfill(
+        &engine,
+        &placeholder_records,
+        BackfillCursor::default(),
+        /* batch_size */ 200,
+        Duration::from_secs(1),
+        |batch| {
+            tracing::debug!(
+                updated = batch.updated.len(),
+                skipped = batch.skipped_already_current,
+                failed = batch.failed.len(),
+                "encryption_backfill: batch processed"
+            );
+        },
+    )
+    .await;
+
+    tracing::info!(
+        updated = summary.total_updated,
+        skipped = summary.total_skipped,
+        failed = summary.total_failed,
+        "encryption_backfill: job completed"
+    );
 }
 
 fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
