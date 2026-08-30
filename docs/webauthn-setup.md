@@ -320,3 +320,24 @@ await fetch('/webauthn/register/complete', {
 > validation for formats like `"packed"` or `"tpm"`) is not performed. The server requests
 > `attestation: "none"`, so only the credential's own public key is cryptographically
 > verified — not the authenticator manufacturer's attestation certificate.
+
+---
+
+## Algorithm allowlist & downgrade protection
+
+The server maintains an explicit allowlist of accepted COSE algorithms
+(`ALLOWED_ALGORITHMS` in `backend/src/webauthn.rs`), currently `ES256`,
+`RS256`, and `EdDSA`. A registration whose credential uses an algorithm
+outside this list is rejected with `400 Bad Request`. Removing an algorithm
+from the allowlist (e.g. if it is later found to be weak or deprecated) is
+enough to reject new registrations using it, without touching the COSE
+parsing or signature-verification code.
+
+Algorithms are also ranked by relative strength (`EdDSA` > `ES256` > `RS256`).
+If a user already has a credential registered with a stronger algorithm,
+attempting to register a new credential with a weaker one is rejected with
+`409 Conflict` — this prevents a **downgrade attack**, where an attacker who
+can influence registration (e.g. via a compromised client) tries to add a
+weaker-algorithm credential to an account that has already moved to a
+stronger algorithm. Registering an algorithm that is the same as or stronger
+than any existing credential is always allowed.
