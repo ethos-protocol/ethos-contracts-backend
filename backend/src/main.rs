@@ -12,6 +12,10 @@ use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
+    captcha::{
+        get_trusted_users_handler, post_add_trusted_user_handler, post_challenge_handler,
+        post_verify_handler,
+    },
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     // cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
@@ -32,6 +36,10 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    ip_reputation::{
+        delete_block_rule_handler, get_block_rules_handler, get_ip_reputation_handler,
+        get_reputation_config_handler, post_block_ip_handler, post_check_handler,
+    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -193,6 +201,26 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── IP Reputation routes (#96, #393) ─────────────────────────────────
+        .route("/admin/ip-reputation", get(get_ip_reputation_handler))
+        .route("/admin/ip-reputation/block", post(post_block_ip_handler))
+        .route("/admin/ip-reputation/rules", get(get_block_rules_handler))
+        .route(
+            "/admin/ip-reputation/rules/:id",
+            delete(delete_block_rule_handler),
+        )
+        .route(
+            "/admin/ip-reputation/config",
+            get(get_reputation_config_handler),
+        )
+        .route("/ip-reputation/check", post(post_check_handler))
+        // ── CAPTCHA routes (#97, #392) ────────────────────────────────────────
+        .route("/captcha/challenge", post(post_challenge_handler))
+        .route("/captcha/verify", post(post_verify_handler))
+        .route(
+            "/admin/captcha/trusted-users",
+            get(get_trusted_users_handler).post(post_add_trusted_user_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
