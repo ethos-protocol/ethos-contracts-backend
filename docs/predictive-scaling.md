@@ -33,6 +33,36 @@ On each evaluation:
 3. Clamp to `[SCALING_MIN_REPLICAS, SCALING_MAX_REPLICAS]`.
 4. If the recommendation changed, apply it via `AutoscalerClient`.
 
+## Backtesting
+
+Before trusting a `ForecastModel` (or a new `alpha`/`beta` tuning) to drive
+live scaling decisions, replay it against historical traffic with
+`ForecastModel::backtest(samples, periods_ahead)` (or `PredictiveScaler::backtest()`
+to backtest against a scaler's own recorded history).
+
+Methodology: walking forward through `samples` (oldest first), at every
+point with at least two samples of history the model forecasts
+`periods_ahead` sampling intervals out, using only the samples available up
+to that point — the actual sample that arrives `periods_ahead` intervals
+later is then compared against that prediction. This is repeated for every
+such point, so the result reflects the model's accuracy across the whole
+history rather than a single lucky/unlucky forecast.
+
+It returns a `BacktestResult`:
+
+- `sample_count` — number of (prediction, actual) pairs evaluated.
+- `mean_absolute_error` — average absolute difference between predicted and
+  actual request volume.
+- `mean_absolute_percentage_error` — average relative error (over periods
+  with nonzero actual traffic).
+- `root_mean_squared_error` — like MAE but penalizes large individual misses
+  more heavily.
+
+A model whose backtest error is too high for a given traffic pattern should
+not be trusted to drive real scaling decisions — tune `alpha`/`beta`, or
+gate `predictive_scaling::run` behind a periodic backtest check, before
+relying on it in production.
+
 ## Autoscaling integration
 
 `AutoscalerClient` is a small trait (`set_desired_replicas(replicas: u32)`)

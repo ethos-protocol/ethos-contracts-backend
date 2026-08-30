@@ -23,6 +23,11 @@ const MIN_PREFETCH_CONFIDENCE: f64 = 0.7;
 /// Maximum number of vaults to prefetch in a single warming operation.
 const MAX_PREFETCH_BATCH: usize = 50;
 
+/// Default cap on how many prefetches execute concurrently within a single
+/// warming pass, so a large candidate set can't spike load on the origin
+/// store all at once.
+const DEFAULT_MAX_CONCURRENT_PREFETCHES: usize = 10;
+
 // ── Access Pattern Tracking ───────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -157,6 +162,9 @@ pub struct CacheWarmer {
     patterns: Arc<Mutex<HashMap<String, VaultAccessPattern>>>,
     /// Statistics for monitoring and debugging.
     stats: Arc<Mutex<WarmerStats>>,
+    /// Caps how many prefetches execute concurrently during a single
+    /// `warm_cache` pass.
+    max_concurrent_prefetches: usize,
 }
 
 #[derive(Debug, Default)]
@@ -168,11 +176,38 @@ pub struct WarmerStats {
     pub avg_confidence: f64,
 }
 
+impl WarmerStats {
+    /// Prefetch hit rate: the share of issued prefetch attempts (the cost —
+    /// each attempt touches the origin store) that actually warmed the
+    /// cache (the benefit).
+    pub fn prefetch_hit_rate(&self) -> f64 {
+        if self.total_prefetches == 0 {
+            0.0
+        } else {
+            self.successful_prefetches as f64 / self.total_prefetches as f64
+        }
+    }
+}
+
+/// Outcome of attempting to prefetch a single vault.
+enum PrefetchOutcome {
+    Skipped,
+    Warmed(String),
+    Failed,
+}
+
 impl CacheWarmer {
     pub fn new() -> Self {
+        Self::with_concurrency_limit(DEFAULT_MAX_CONCURRENT_PREFETCHES)
+    }
+
+    /// Build a `CacheWarmer` with a custom cap on concurrent prefetch
+    /// execution (see `max_concurrent_prefetches`).
+    pub fn with_concurrency_limit(max_concurrent_prefetches: usize) -> Self {
         Self {
             patterns: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(WarmerStats::default())),
+            max_concurrent_prefetches: max_concurrent_prefetches.max(1),
         }
     }
 
@@ -228,6 +263,12 @@ impl CacheWarmer {
     }
 
     /// Execute cache warming for predicted vaults.
+    ///
+    /// Targets are already ordered by predicted access frequency (highest
+    /// confidence first, from `predict_prefetch_targets`); they're executed
+    /// in chunks capped at `max_concurrent_prefetches` so a large candidate
+    /// set can't issue every prefetch to the origin store at once, while
+    /// still prioritizing the highest-confidence candidates when capped.
     pub async fn warm_cache(&self, cache: &VaultCache, vault_store: &VaultStore) -> WarmingResult {
         let targets = self.predict_prefetch_targets();
         let mut result = WarmingResult {
@@ -237,35 +278,86 @@ impl CacheWarmer {
             vault_ids: vec![],
         };
 
-        for vault_id in targets {
-            // Check if already in cache.
-            if cache.get_vault(&vault_id).is_some() {
-                result.skipped_count += 1;
-                continue;
-            }
+        for chunk in targets.chunks(self.max_concurrent_prefetches) {
+            let outcomes = futures::future::join_all(
+                chunk
+                    .iter()
+                    .map(|vault_id| self.prefetch_one(vault_id, cache, vault_store)),
+            )
+            .await;
 
-            // Fetch from store and populate cache.
-            let store = vault_store.lock().unwrap();
-            if let Some(vault) = store.get(&vault_id).cloned() {
-                drop(store); // Release lock before cache operation.
-                cache.set_vault(&vault_id, vault.clone());
-                cache.set_ttl_remaining(&vault_id, vault.ttl_remaining);
-
-                result.warmed_count += 1;
-                result.vault_ids.push(vault_id.clone());
-
-                let mut stats = self.stats.lock().unwrap();
-                stats.total_prefetches += 1;
-                stats.successful_prefetches += 1;
-            } else {
-                result.failed_count += 1;
-
-                let mut stats = self.stats.lock().unwrap();
-                stats.failed_prefetches += 1;
+            for outcome in outcomes {
+                match outcome {
+                    PrefetchOutcome::Skipped => result.skipped_count += 1,
+                    PrefetchOutcome::Warmed(vault_id) => {
+                        result.warmed_count += 1;
+                        result.vault_ids.push(vault_id);
+                    }
+                    PrefetchOutcome::Failed => result.failed_count += 1,
+                }
             }
         }
 
         result
+    }
+
+    /// Attempt to prefetch a single vault into `cache`, updating stats.
+    async fn prefetch_one(
+        &self,
+        vault_id: &str,
+        cache: &VaultCache,
+        vault_store: &VaultStore,
+    ) -> PrefetchOutcome {
+        if cache.get_vault(vault_id).is_some() {
+            return PrefetchOutcome::Skipped;
+        }
+
+        let fetched = {
+            let store = vault_store.lock().unwrap();
+            store.get(vault_id).cloned()
+        };
+
+        let mut stats = self.stats.lock().unwrap();
+        stats.total_prefetches += 1;
+
+        if let Some(vault) = fetched {
+            drop(stats); // Release lock before cache operation.
+            cache.set_vault(vault_id, vault.clone());
+            cache.set_ttl_remaining(vault_id, vault.ttl_remaining);
+
+            self.stats.lock().unwrap().successful_prefetches += 1;
+            PrefetchOutcome::Warmed(vault_id.to_string())
+        } else {
+            stats.failed_prefetches += 1;
+            PrefetchOutcome::Failed
+        }
+    }
+
+    /// Render prefetch hit-rate-vs-cost metrics in Prometheus text format:
+    /// prefetch attempts issued (cost), successful prefetches (hits), and
+    /// the resulting hit rate.
+    pub fn render_prometheus(&self) -> String {
+        let stats = self.get_stats();
+        let mut out = String::new();
+        crate::metrics::push_counter(
+            &mut out,
+            "ethos_protocol_cache_warmer_prefetches_total",
+            "Total prefetch attempts issued by the cache warmer",
+            stats.total_prefetches,
+        );
+        crate::metrics::push_counter(
+            &mut out,
+            "ethos_protocol_cache_warmer_prefetch_hits_total",
+            "Prefetch attempts that successfully warmed the cache",
+            stats.successful_prefetches,
+        );
+        crate::metrics::push_gauge(
+            &mut out,
+            "ethos_protocol_cache_warmer_prefetch_hit_rate_percent",
+            "Prefetch hit rate (successful / total attempts) as a percentage",
+            (stats.prefetch_hit_rate() * 100.0).round() as u64,
+        );
+        out
     }
 
     /// Get current prediction accuracy statistics.

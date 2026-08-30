@@ -65,6 +65,46 @@ proportional to that tag's historical share of recorded cost:
 If no historical entries carry the given `tag_key`, `allocations` is empty
 — record cost entries with that tag before relying on allocation for it.
 
+## Budget alert thresholds
+
+Costs can be capped per category so a threshold breach is caught before it
+runs away, rather than discovered later in a report.
+
+`POST /admin/cost/budget-thresholds` configures (or replaces, by `category`)
+a threshold. `scope` is either an operation name or a tag key/value pair —
+this is what supports per-vault gas budgets (`tag` scope on a `vault_id` tag)
+or per-tenant API cost budgets (`tag` scope on a `tenant` tag) alongside
+plain per-operation budgets:
+
+```json
+{
+  "category": "vaults-gas",
+  "scope": { "tag": { "key": "vault_id", "value": "vault-123" } },
+  "limit": 50.0
+}
+```
+
+```json
+{ "category": "acme-corp-api", "scope": { "operation": "api.call" }, "limit": 500.0 }
+```
+
+`GET /admin/cost/budget-breaches` evaluates every configured threshold
+against currently recorded cost and returns the ones at or over their limit:
+
+```json
+[
+  { "category": "vaults-gas", "scope": {"tag": {"key": "vault_id", "value": "vault-123"}}, "limit": 50.0, "current_total": 52.10 }
+]
+```
+
+Every call to `POST /admin/cost/entries` re-evaluates thresholds and logs a
+warning (`cost budget threshold breached`) for each one that has crossed its
+limit. `cost_tracking::breach_to_incident_request` and
+`breach_to_escalation_request` convert a `BudgetBreach` into an
+`incidents::CreateIncidentRequest` / `oncall::TriggerEscalationRequest`
+respectively, so a breach can be filed as an incident or paged to whoever is
+on call through those modules' existing workflows.
+
 ## Usage pattern
 
 1. Instrument billable code paths to call `POST /admin/cost/entries` (or use

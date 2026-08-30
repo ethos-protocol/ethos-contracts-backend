@@ -79,14 +79,65 @@ pub struct CostAllocation {
     pub allocations: HashMap<String, f64>,
 }
 
+/// What a `BudgetThreshold` measures cost against: either all entries for a
+/// given `operation`, or all entries carrying a specific tag key/value (e.g.
+/// per-vault gas, or per-tenant API cost via a `tenant` tag).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetScope {
+    Operation(String),
+    Tag { key: String, value: String },
+}
+
+impl BudgetScope {
+    fn matches(&self, entry: &CostEntry) -> bool {
+        match self {
+            BudgetScope::Operation(operation) => &entry.operation == operation,
+            BudgetScope::Tag { key, value } => {
+                entry.tags.get(key).is_some_and(|v| v == value)
+            }
+        }
+    }
+}
+
+/// A configured budget cap for a category of cost. Breached when the sum of
+/// recorded cost matching `scope` reaches `limit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetThreshold {
+    /// Human-readable category name, e.g. "vaults-gas" or "acme-corp-api".
+    pub category: String,
+    pub scope: BudgetScope,
+    pub limit: f64,
+}
+
+/// Request body for `POST /admin/cost/budget-thresholds`.
+#[derive(Debug, Deserialize)]
+pub struct SetBudgetThresholdRequest {
+    pub category: String,
+    pub scope: BudgetScope,
+    pub limit: f64,
+}
+
+/// A threshold whose configured `limit` has been reached or exceeded by
+/// recorded cost.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetBreach {
+    pub category: String,
+    pub scope: BudgetScope,
+    pub limit: f64,
+    pub current_total: f64,
+}
+
 pub struct CostState {
     entries: Mutex<Vec<CostEntry>>,
+    thresholds: Mutex<Vec<BudgetThreshold>>,
 }
 
 impl CostState {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            thresholds: Mutex::new(Vec::new()),
         }
     }
 
@@ -96,6 +147,48 @@ impl CostState {
 
     pub fn snapshot(&self) -> Vec<CostEntry> {
         self.entries.lock().unwrap().clone()
+    }
+
+    /// Configure (or replace, by `category`) a budget threshold.
+    pub fn set_budget_threshold(&self, threshold: BudgetThreshold) {
+        let mut thresholds = self.thresholds.lock().unwrap();
+        thresholds.retain(|t| t.category != threshold.category);
+        thresholds.push(threshold);
+    }
+
+    pub fn budget_thresholds(&self) -> Vec<BudgetThreshold> {
+        self.thresholds.lock().unwrap().clone()
+    }
+
+    /// Evaluate every configured budget threshold against currently
+    /// recorded cost and return the ones that have been reached or
+    /// exceeded, so callers can raise an alert before costs run further
+    /// away.
+    pub fn check_budget_breaches(&self) -> Vec<BudgetBreach> {
+        let entries = self.entries.lock().unwrap();
+        let thresholds = self.thresholds.lock().unwrap();
+
+        thresholds
+            .iter()
+            .filter_map(|threshold| {
+                let current_total: f64 = entries
+                    .iter()
+                    .filter(|e| threshold.scope.matches(e))
+                    .map(|e| e.amount)
+                    .sum();
+
+                if current_total >= threshold.limit {
+                    Some(BudgetBreach {
+                        category: threshold.category.clone(),
+                        scope: threshold.scope.clone(),
+                        limit: threshold.limit,
+                        current_total,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Build an aggregate report across all recorded cost entries.
@@ -165,6 +258,36 @@ impl Default for CostState {
     }
 }
 
+// ── Incident/on-call wiring ──────────────────────────────────────────────────
+
+/// Turn a budget breach into an incident creation request, so a threshold
+/// crossing can be filed through the standard incident workflow
+/// (`incidents::create_incident`).
+pub fn breach_to_incident_request(breach: &BudgetBreach) -> crate::incidents::CreateIncidentRequest {
+    crate::incidents::CreateIncidentRequest {
+        title: format!("Budget threshold breached: {}", breach.category),
+        description: format!(
+            "Category '{}' ({:?}) reached {:.4} against a configured limit of {:.4}.",
+            breach.category, breach.scope, breach.current_total, breach.limit
+        ),
+        severity: crate::incidents::IncidentSeverity::Sev3,
+        assigned_to: None,
+    }
+}
+
+/// Turn a budget breach into an on-call escalation trigger
+/// (`oncall::trigger_escalation`), so a threshold crossing can page whoever
+/// is on call for cost overruns.
+pub fn breach_to_escalation_request(breach: &BudgetBreach) -> crate::oncall::TriggerEscalationRequest {
+    crate::oncall::TriggerEscalationRequest {
+        reason: format!(
+            "budget threshold '{}' breached: {:.4} >= {:.4}",
+            breach.category, breach.current_total, breach.limit
+        ),
+        current_level: 0,
+    }
+}
+
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 /// `POST /admin/cost/entries` — record a cost entry.
@@ -195,6 +318,15 @@ pub async fn record_cost_entry(
     };
     state.record(entry.clone());
 
+    for breach in state.check_budget_breaches() {
+        tracing::warn!(
+            category = %breach.category,
+            limit = breach.limit,
+            current_total = breach.current_total,
+            "cost budget threshold breached"
+        );
+    }
+
     Ok((StatusCode::CREATED, Json(entry)))
 }
 
@@ -215,6 +347,43 @@ pub async fn allocate_cost(
         ));
     }
     Ok(Json(state.allocate(body.total_amount, &body.tag_key)))
+}
+
+/// `POST /admin/cost/budget-thresholds` — configure (or replace, by
+/// `category`) a budget alert threshold.
+pub async fn set_budget_threshold(
+    State(state): State<Arc<CostState>>,
+    Json(body): Json<SetBudgetThresholdRequest>,
+) -> Result<(StatusCode, Json<BudgetThreshold>), (StatusCode, Json<serde_json::Value>)> {
+    if body.category.trim().is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "category must not be empty" })),
+        ));
+    }
+    if body.limit < 0.0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "limit must be non-negative" })),
+        ));
+    }
+
+    let threshold = BudgetThreshold {
+        category: body.category,
+        scope: body.scope,
+        limit: body.limit,
+    };
+    state.set_budget_threshold(threshold.clone());
+
+    Ok((StatusCode::CREATED, Json(threshold)))
+}
+
+/// `GET /admin/cost/budget-breaches` — evaluate all configured thresholds
+/// against currently recorded cost and return the ones that are breached.
+pub async fn get_budget_breaches(
+    State(state): State<Arc<CostState>>,
+) -> Json<Vec<BudgetBreach>> {
+    Json(state.check_budget_breaches())
 }
 
 #[cfg(test)]

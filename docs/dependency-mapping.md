@@ -37,12 +37,20 @@ instrumentation middleware sitting in the request path:
 If the edge is new, it is diffed against the previous graph snapshot and the
 resulting `DependencyChange` is stored in history.
 
+The edge is rejected with `422 Unprocessable Entity` if registering it would
+introduce a cycle — either a direct self-loop (`from == to`) or a path that
+already exists from `to` back to `from` (`DependencyGraph::would_create_cycle`).
+Cyclic edges break traversal-based tooling such as `impacted_by`, so they are
+never admitted into the graph.
+
 ### `GET /dependencies/graph`
 
 Returns the current graph as both a raw edge list and a Graphviz DOT string
 (`graph.to_dot()`) suitable for rendering with any DOT-compatible
 visualization tool (e.g. `dot -Tsvg`, or a frontend graph library that
-accepts DOT).
+accepts DOT). This DOT export is the graph's visualization output — it stays
+in sync automatically since it's generated from the same edge set that
+`POST /dependencies/discover` maintains.
 
 ### `POST /dependencies/impact`
 
