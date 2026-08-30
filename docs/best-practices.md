@@ -11,6 +11,7 @@ This guide documents recommended practices for developing, deploying, and operat
 - [Security Best Practices](#security-best-practices)
 - [Configuration Best Practices](#configuration-best-practices)
 - [Testing Best Practices](#testing-best-practices)
+- [Regression Test Policy](#regression-test-policy)
 
 ---
 
@@ -465,3 +466,72 @@ The project includes a fuzz test harness under `contracts/ttl_vault/fuzz/`. Run 
 ```bash
 cargo fuzz run fuzz_target_1
 ```
+
+---
+
+## Regression Test Policy
+
+> **Issue #424** — Slice-failover correctness is safety-critical because a
+> promotion failure can leave a vault with no reachable slice, blocking
+> beneficiary payouts.  The policies below apply to all regression tests, with
+> special emphasis on slice-failover bugs.
+
+### What belongs in a regression test
+
+A regression test must be added for **every bug that is fixed**, regardless of
+severity.  The test:
+
+1. **Names the bug** — the `///` doc-comment on the test function must state
+   what previously failed and, optionally, which issue or PR introduced the fix.
+2. **Reproduces the minimal failure** — the test must fail on the code *before*
+   the fix and pass on the code *after* the fix.
+3. **Lives in the right file**:
+   - `contracts/ttl_vault/src/regression_tests.rs` — general vault bugs
+   - `contracts/ttl_vault/src/slice_failover_tests.rs` — slice-failover bugs
+
+Example format:
+
+```rust
+/// Regression: threshold=1 must fire immediately on the very first failure.
+///
+/// Previously the threshold check used `>` instead of `>=`, so a threshold
+/// of 1 required *two* failures before promotion.  Fixed in PR #212.
+#[test]
+fn regression_threshold_one_activates_on_first_failure() {
+    // ...
+}
+```
+
+### CI gate (required checks)
+
+Both files are compiled and run as part of `cargo test --package ttl-vault` in
+the `Run tests` CI step.  This step is a **required branch-protection check**:
+no PR can merge to `main` if any test in either file fails.
+
+The required checks to configure in GitHub branch protection settings are:
+
+| Check name                            | Enforces                                              |
+|---------------------------------------|-------------------------------------------------------|
+| `Test & Lint / test`                  | All unit tests incl. regression + slice-failover suites |
+| `Test & Lint / wasm-size-check`       | WASM size budget (see [wasm-size-budget.md](wasm-size-budget.md)) |
+
+### Slice-failover regression coverage
+
+Every edge-case scenario in the slice-failover mechanism has an explicit
+regression test.  When fixing a new slice-failover bug:
+
+- Add the test to `slice_failover_tests.rs` in the
+  `// ── Regression tests for previously fixed slice-failover bugs` section.
+- The test name must start with `regression_` so it is easily searchable.
+- Do **not** remove or weaken existing regression tests — if the contract API
+  changes, update the test to match the new API while preserving the intent.
+
+### Merge checklist for bug-fix PRs
+
+Before merging any bug-fix PR:
+
+- [ ] Regression test added to the appropriate file
+- [ ] Test fails on the branch *before* the fix (or has a comment explaining
+      why it cannot be easily demonstrated to fail)
+- [ ] Test passes after the fix
+- [ ] CI is green (both `test` and `wasm-size-check` status checks pass)

@@ -1,5 +1,18 @@
 name: CI
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Required CI checks (enforce via GitHub branch-protection → "Require status
+# checks to pass before merging"):
+#
+#   • "Test & Lint / test"              ← cargo test --package ttl-vault
+#                                         runs ALL #[cfg(test)] modules,
+#                                         including regression_tests.rs and
+#                                         slice_failover_tests.rs (Issue #424)
+#   • "Test & Lint / wasm-size-check"   ← enforces WASM size budget (Issue #425)
+#
+# Both jobs must be green before any PR can be merged to main.
+# ──────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches: [main]
@@ -37,7 +50,14 @@ jobs:
       - name: Build crate
         run: cargo build --package ttl-vault --lib
 
+      # ── Required check (Issue #424) ─────────────────────────────────────────
+      # Runs ALL #[cfg(test)] modules, which includes:
+      #   • regression_tests.rs   (general regression suite)
+      #   • slice_failover_tests.rs  (slice-failover regression suite)
+      # This step is a required branch-protection check — PRs cannot merge if
+      # any test in either file fails.
       - name: Run tests
+        id: test
         run: cargo test --package ttl-vault
 
       - name: Check formatting
@@ -80,5 +100,62 @@ jobs:
           LIB_VERSION=$(grep -oE 'DataKey::Version.*"([0-9]+\.[0-9]+\.[0-9]+)"' contracts/ttl_vault/src/lib.rs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           if [ "$CHANGELOG_VERSION" != "$LIB_VERSION" ]; then
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
+            exit 1
+          fi
+
+      # ── Required check (Issue #425) ─────────────────────────────────────────
+      # Builds the contract as WASM and enforces the size budgets defined in
+      # docs/wasm-size-budget.md.
+      #
+      # Thresholds (must be kept in sync with docs/wasm-size-budget.md):
+      #   ttl_vault  warning: 460 KB  hard limit: 512 KB
+      #
+      # The step fails the build when any contract exceeds its hard limit, and
+      # prints a warning when it exceeds the warning threshold.
+      - name: Build WASM artifact
+        id: wasm-build
+        run: |
+          cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+          echo "Built WASM artifact"
+
+      - name: Check WASM size budget
+        id: wasm-size-check
+        run: |
+          set -euo pipefail
+
+          # ── Thresholds (bytes) — keep in sync with docs/wasm-size-budget.md ──
+          TTL_VAULT_WARN_BYTES=$((460 * 1024))   # 460 KB warning threshold
+          TTL_VAULT_HARD_BYTES=$((512 * 1024))   # 512 KB hard limit
+
+          WASM_PATH="target/wasm32-unknown-unknown/release/ttl_vault.wasm"
+
+          if [ ! -f "$WASM_PATH" ]; then
+            echo "❌ WASM artifact not found at $WASM_PATH"
+            exit 1
+          fi
+
+          WASM_BYTES=$(stat -c%s "$WASM_PATH")
+          WASM_KB=$(( WASM_BYTES / 1024 ))
+
+          echo "ttl_vault WASM size: ${WASM_KB} KB (${WASM_BYTES} bytes)"
+          echo "  Warning threshold : $(( TTL_VAULT_WARN_BYTES / 1024 )) KB"
+          echo "  Hard limit        : $(( TTL_VAULT_HARD_BYTES / 1024 )) KB"
+
+          FAIL=0
+
+          if [ "$WASM_BYTES" -gt "$TTL_VAULT_HARD_BYTES" ]; then
+            OVER=$(( (WASM_BYTES - TTL_VAULT_HARD_BYTES) / 1024 ))
+            echo "❌ ttl_vault WASM exceeds hard limit by ${OVER} KB (${WASM_KB} KB > $(( TTL_VAULT_HARD_BYTES / 1024 )) KB)"
+            echo "   See docs/wasm-size-budget.md for optimization strategies."
+            FAIL=1
+          elif [ "$WASM_BYTES" -gt "$TTL_VAULT_WARN_BYTES" ]; then
+            OVER=$(( (WASM_BYTES - TTL_VAULT_WARN_BYTES) / 1024 ))
+            echo "⚠️  ttl_vault WASM is within ${OVER} KB of the hard limit — consider optimizing."
+            echo "   See docs/wasm-size-budget.md for optimization strategies."
+          else
+            echo "✅ ttl_vault WASM size is within budget."
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
             exit 1
           fi
