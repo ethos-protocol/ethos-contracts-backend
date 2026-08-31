@@ -61,6 +61,11 @@ pub struct BulkJob {
     pub error: Option<String>,
     /// Optional label supplied by the caller.
     pub label: Option<String>,
+    /// Ingress correlation id (issue #349), propagated from the `X-Request-Id`
+    /// header of the request that enqueued the job so its asynchronous
+    /// processing can be traced back to that request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl BulkJob {
@@ -85,7 +90,15 @@ impl BulkJob {
             result: None,
             error: None,
             label,
+            request_id: None,
         }
+    }
+
+    /// Attach the ingress correlation id (issue #349).
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
     }
 
     /// Advance progress; clamps to 100.
@@ -93,8 +106,7 @@ impl BulkJob {
         self.processed_items += processed;
         self.failed_items += failed;
         if self.total_items > 0 {
-            self.progress =
-                ((self.processed_items * 100) / self.total_items).min(100) as u8;
+            self.progress = ((self.processed_items * 100) / self.total_items).min(100) as u8;
         }
     }
 
@@ -201,11 +213,19 @@ pub fn process_job(store: &JobStore, id: &str) {
     }
 
     // Simulate processing — real implementations would call domain logic here.
-    let (operation, total_items) = {
+    let (operation, total_items, request_id) = {
         let s = store.lock().unwrap();
         let job = s.get(id).unwrap();
-        (job.operation.clone(), job.total_items)
+        (
+            job.operation.clone(),
+            job.total_items,
+            job.request_id.clone(),
+        )
     };
+
+    // Carry the correlation id into the span so every log line emitted while
+    // this job runs is joinable with the request that enqueued it (#349).
+    let _span = tracing::info_span!("bulk_job", job_id = %id, request_id = request_id.as_deref().unwrap_or("none")).entered();
 
     // Step through items in batches of up to 10.
     let batch_size = 10.min(total_items.max(1));
@@ -229,6 +249,7 @@ pub fn process_job(store: &JobStore, id: &str) {
         "operation": format!("{:?}", operation),
         "total_processed": total_items,
         "total_failed": 0,
+        "request_id": request_id,
         "message": "Bulk operation completed successfully"
     });
 
@@ -271,15 +292,17 @@ pub struct ListJobsQuery {
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 
 use crate::error::AppError;
+use crate::error_context::REQUEST_ID_HEADER;
 
 /// POST /jobs — submit a bulk operation job.
 pub async fn create_job_handler(
     State(job_store): State<JobStore>,
+    headers: HeaderMap,
     Json(body): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<CreateJobResponse>), AppError> {
     let items_count = match &body.items {
@@ -291,7 +314,15 @@ pub async fn create_job_handler(
         return Err(AppError::InvalidInput("items must not be empty".into()));
     }
 
-    let job = BulkJob::new(body.operation, body.items, items_count, body.label);
+    // Propagate the ingress correlation id (#349) into the job so its async
+    // processing is traceable back to this request.
+    let request_id = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let job = BulkJob::new(body.operation, body.items, items_count, body.label)
+        .with_request_id(request_id);
     let job_id = job.id.clone();
 
     enqueue_job(&job_store, job);
@@ -423,6 +454,26 @@ mod tests {
         assert_eq!(queued.len(), 3);
         let running = list_jobs(&store, Some(JobStatus::Running));
         assert_eq!(running.len(), 0);
+    }
+
+    #[test]
+    fn test_request_id_propagates_into_job_and_result() {
+        let store = create_job_store();
+        let job = BulkJob::new(
+            BulkOperationType::UpdateTtl,
+            serde_json::json!(["v1", "v2"]),
+            2,
+            None,
+        )
+        .with_request_id(Some("req-job-77".into()));
+        assert_eq!(job.request_id.as_deref(), Some("req-job-77"));
+
+        let id = enqueue_job(&store, job);
+        process_job(&store, &id);
+        let done = get_job(&store, &id).unwrap();
+        assert_eq!(done.status, JobStatus::Completed);
+        // The correlation id survives into the job's structured result.
+        assert_eq!(done.result.unwrap()["request_id"], "req-job-77");
     }
 
     #[test]

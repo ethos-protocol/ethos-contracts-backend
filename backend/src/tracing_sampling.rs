@@ -223,6 +223,23 @@ impl TraceSampler {
         sample
     }
 
+    /// Build the tracing span for a sampled request, carrying the correlation
+    /// id (issue #349) so every log line and child span emitted while the
+    /// request is handled is tagged with `request_id` and can be joined against
+    /// job and message-queue records for the same request.
+    ///
+    /// `request_id` is the value assigned at ingress by
+    /// `error_context::correlation_id_middleware` (`X-Request-Id`).
+    pub fn request_span(&self, request_id: &str, method: &str, path: &str) -> tracing::Span {
+        tracing::info_span!(
+            "sampled_request",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            sampled = true,
+        )
+    }
+
     /// Force a trace for an error response, regardless of sample rate.
     ///
     /// Returns `true` if `always_trace_errors` is on (and tracing is enabled).
@@ -436,6 +453,22 @@ mod tests {
         // With 0 threshold and 0.8 rate, effective should be halved to 0.4.
         let rate = sampler.effective_rate();
         assert!((rate - 0.4).abs() < 1e-9, "expected ~0.4, got {rate}");
+    }
+
+    #[test]
+    fn test_request_span_carries_correlation_id() {
+        // With a subscriber active the span is enabled and its metadata is
+        // observable; assert the correlation-id field is declared on it.
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let sampler = TraceSampler::new(SamplingConfig::default());
+            let span = sampler.request_span("req-abc-123", "GET", "/api/vaults/1/reminders");
+            let meta = span
+                .metadata()
+                .expect("span should be enabled under a subscriber");
+            assert!(meta.fields().field("request_id").is_some());
+            assert_eq!(meta.name(), "sampled_request");
+        });
     }
 
     #[test]
