@@ -115,6 +115,10 @@ mod beneficiary_auction_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
 #[cfg(test)]
+mod duplicate_vault_concurrency_tests;
+#[cfg(test)]
+mod vesting_timestamp_edge_case_tests;
+#[cfg(test)]
 mod beneficiary_vesting_auction_tests;
 #[cfg(test)]
 mod beneficiary_vesting_tests;
@@ -122,6 +126,8 @@ mod beneficiary_vesting_tests;
 mod bps_invariant_tests;
 #[cfg(test)]
 mod composition_rules_tests;
+#[cfg(test)]
+mod hibernation_consistency_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -2807,7 +2813,12 @@ impl TtlVaultContract {
                     }
                 }
                 ReleaseCondition::Oracle(addr) => {
-                    if oracle::query(&env, &addr) {
+                    // Reject stale oracle observations (#343): a read older than
+                    // the configured bound falls back to "condition not met"
+                    // rather than releasing on outdated data.
+                    if oracle::query_checked(&env, &addr, &oracle::OracleConfig::default())
+                        .unwrap_or(false)
+                    {
                         condition_met = true;
                     }
                 }
