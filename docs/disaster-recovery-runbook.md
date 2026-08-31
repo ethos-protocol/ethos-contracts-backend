@@ -15,6 +15,37 @@ This runbook covers emergency procedures for Ethos-Protocol operators. Follow ea
 
 ---
 
+## 0. Automated Runbook Steps (API)
+
+The pause/unpause and archived-vault-restore steps below (§1, §3) can also be
+triggered through admin-only HTTP endpoints (`dr_automation` module) instead
+of retyping the `stellar contract invoke` commands by hand during an
+incident. Every step is destructive and requires a two-phase confirmation:
+
+```bash
+# Phase 1 — request the action, get a confirmation token
+curl -X POST $BACKEND_URL/admin/dr/actions \
+  -H 'Content-Type: application/json' \
+  -d '{"step": "pause_contract", "requested_by": "<your-name>"}'
+# → { "step": "pause_contract", "confirmation_token": "...", "expires_at": "..." }
+
+# Phase 2 — confirm within 5 minutes to actually execute
+curl -X POST $BACKEND_URL/admin/dr/actions/<confirmation_token>/confirm
+```
+
+Supported `step` values: `pause_contract`, `unpause_contract`,
+`restore_vault` (also requires `"vault_id": <VAULT_ID>` in the phase-1
+request body). Each executes the same `stellar contract invoke` command
+shown in the corresponding manual section below, using
+`$CONTRACT_TTL_VAULT` / `$STELLAR_NETWORK` / `$DEPLOYER_IDENTITY` from the
+backend's environment. A confirmation token is single-use and expires after
+5 minutes if unconfirmed.
+
+Backup validation (§4) can similarly be triggered without manual steps via
+`POST /admin/validate-backup`.
+
+---
+
 ## 1. Emergency Contract Pause
 
 Use when an exploit or critical bug is detected.

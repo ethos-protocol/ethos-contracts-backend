@@ -31,6 +31,32 @@ of ad hoc cleanup code scattered through handlers.
 - A step with no registered compensation is simply left as `Completed`
   during rollback (nothing to undo).
 
+## Idempotency Guarantee
+
+`CompensationRegistry` tracks, per step name, whether that step's
+compensation has already **succeeded** once. If `execute()` is retried on
+the same `Saga` instance — e.g. the process crashed mid-rollback and the
+caller re-runs the saga, or an external retry layer re-triggers the same
+logical operation — any step whose compensation already completed
+successfully is *not* invoked again. Instead its `SagaStepRecord` is
+reported as `Compensated` with `compensation_already_ran: true`, so a
+double-refund or double-release can't happen just because the saga run was
+retried.
+
+A compensation that *failed* is deliberately **not** marked done, so a
+retry can still attempt it again until it succeeds — idempotency guards
+against re-running work that already took effect, not against retrying
+work that didn't.
+
+This guard lives on the registry (and therefore the `Saga` instance) rather
+than in each individual compensation closure, so a compensation function
+itself doesn't need to implement its own idempotency check to get this
+guarantee — though a compensation that calls an external system (e.g. a
+payment API) should still prefer an idempotent operation there (such as a
+stable idempotency key) as defense in depth, since the registry's guard
+only protects against re-invocation *within the lifetime of one `Saga`
+instance*, not across separate instances built for a retried operation.
+
 ## Example
 
 ```rust

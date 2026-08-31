@@ -3,11 +3,17 @@
 /// `BackupValidator` inspects raw backup byte slices to verify that:
 /// 1. The data is non-empty and begins with the SQLite magic bytes.
 /// 2. A simulated in-memory restore succeeds without error.
+/// 3. When an expected checksum was recorded at backup-creation time, the
+///    backup's current SHA-256 digest still matches it — catching silent
+///    corruption that file presence/size checks alone would miss.
 ///
 /// `BackupValidationJob` tracks scheduling metadata for the periodic
 /// validation job run by the scheduler.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::incidents::{open_incident, IncidentSeverity, IncidentStore};
 
 // ── SQLite file-format magic ───────────────────────────────────────────────────
 
@@ -28,10 +34,36 @@ pub struct BackupValidationResult {
     pub integrity_ok: bool,
     /// `true` iff the simulated in-memory restore succeeded.
     pub restore_test_ok: bool,
+    /// `Some(true)` iff the backup's current checksum matches the expected
+    /// checksum recorded at creation time; `Some(false)` on a mismatch;
+    /// `None` when no expected checksum was supplied (checksum not checked).
+    pub checksum_ok: Option<bool>,
     /// Human-readable error description when `valid` is `false`.
     pub error: Option<String>,
     /// When this validation was performed.
     pub validated_at: DateTime<Utc>,
+}
+
+/// Checksum recorded for a backup artifact at creation time, alongside its
+/// metadata, so later validation runs can detect silent corruption instead
+/// of only checking file presence/size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupChecksumRecord {
+    pub backup_id: String,
+    /// SHA-256 hex digest of the backup data at creation time.
+    pub expected_checksum: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl BackupChecksumRecord {
+    /// Compute and record the checksum for `data` at backup-creation time.
+    pub fn record(backup_id: &str, data: &[u8]) -> Self {
+        Self {
+            backup_id: backup_id.to_string(),
+            expected_checksum: BackupValidator::compute_checksum(data),
+            recorded_at: Utc::now(),
+        }
+    }
 }
 
 // ── BackupValidationJob ───────────────────────────────────────────────────────
@@ -79,6 +111,7 @@ impl BackupValidator {
                 valid: false,
                 integrity_ok: false,
                 restore_test_ok: false,
+                checksum_ok: None,
                 error: Some("backup data is empty".to_string()),
                 validated_at: now,
             };
@@ -93,6 +126,7 @@ impl BackupValidator {
                 valid: false,
                 integrity_ok: false,
                 restore_test_ok: false,
+                checksum_ok: None,
                 error: Some("backup data does not start with the SQLite magic header".to_string()),
                 validated_at: now,
             };
@@ -116,6 +150,7 @@ impl BackupValidator {
             valid,
             integrity_ok,
             restore_test_ok,
+            checksum_ok: None,
             error: restore_error,
             validated_at: now,
         }
@@ -128,6 +163,56 @@ impl BackupValidator {
             .iter()
             .map(|(id, data)| Self::validate_backup(id, data))
             .collect()
+    }
+
+    /// SHA-256 hex digest of `data`. Used both to record the expected
+    /// checksum at backup-creation time (`BackupChecksumRecord::record`) and
+    /// to re-verify it during validation.
+    pub fn compute_checksum(data: &[u8]) -> String {
+        let digest = Sha256::digest(data);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Validate a backup exactly as `validate_backup` does, plus verify its
+    /// checksum against `expected.expected_checksum`.
+    ///
+    /// On a checksum mismatch, validation fails regardless of the
+    /// integrity/restore checks, and — when `incidents` is supplied — a Sev2
+    /// incident is opened via [`crate::incidents::open_incident`] so the
+    /// corruption surfaces immediately instead of being discovered during an
+    /// actual restore.
+    pub fn validate_backup_with_checksum(
+        data: &[u8],
+        expected: &BackupChecksumRecord,
+        incidents: Option<&IncidentStore>,
+    ) -> BackupValidationResult {
+        let mut result = Self::validate_backup(&expected.backup_id, data);
+
+        let actual_checksum = Self::compute_checksum(data);
+        let checksum_matches = actual_checksum == expected.expected_checksum;
+        result.checksum_ok = Some(checksum_matches);
+
+        if !checksum_matches {
+            result.valid = false;
+            result.error = Some(format!(
+                "checksum mismatch: expected {}, computed {actual_checksum}",
+                expected.expected_checksum
+            ));
+
+            if let Some(store) = incidents {
+                open_incident(
+                    store,
+                    format!("Backup checksum mismatch: {}", expected.backup_id),
+                    format!(
+                        "Backup '{}' failed checksum verification (expected {}, computed {actual_checksum}). This indicates possible silent corruption.",
+                        expected.backup_id, expected.expected_checksum
+                    ),
+                    IncidentSeverity::Sev2,
+                );
+            }
+        }
+
+        result
     }
 
     // ── private helpers ───────────────────────────────────────────────────────

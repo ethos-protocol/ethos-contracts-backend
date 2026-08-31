@@ -6,7 +6,8 @@
 //! recovery"); if a step still fails, previously completed steps are undone
 //! in reverse order by invoking their compensations ("backward recovery").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -19,14 +20,34 @@ pub type StepOutput = Value;
 type ForwardAction = Box<dyn Fn() -> Result<StepOutput, String> + Send + Sync>;
 type CompensationFn = Box<dyn Fn(&StepOutput) -> Result<(), String> + Send + Sync>;
 
+/// Outcome of asking the registry to run a step's compensation.
+enum CompensationOutcome {
+    /// No compensation is registered for this step.
+    NotRegistered,
+    /// The compensation ran for the first time and produced this result.
+    Ran(Result<(), String>),
+    /// The compensation already succeeded on a previous call for this step
+    /// (on this registry instance) and was therefore *not* invoked again.
+    AlreadyCompensated,
+}
+
 /// Registry mapping step name to its compensation (undo) action.
 ///
 /// Kept separate from the forward actions so compensations can be
 /// registered, inspected, or swapped independently of the steps that
 /// trigger them.
+///
+/// Idempotent by construction: once a step's compensation has succeeded,
+/// `run` will not invoke it again for the lifetime of this registry, even
+/// if it's asked to compensate that step a second time (e.g. because the
+/// saga that owns it was retried after a crash or timeout). A compensation
+/// that *failed* is deliberately not marked done, so a later retry can
+/// still succeed.
 #[derive(Default)]
 pub struct CompensationRegistry {
     compensations: HashMap<String, CompensationFn>,
+    /// Step names whose compensation has already completed successfully.
+    executed: Mutex<HashSet<String>>,
 }
 
 impl CompensationRegistry {
@@ -47,8 +68,27 @@ impl CompensationRegistry {
         self.compensations.contains_key(step_name)
     }
 
-    fn run(&self, step_name: &str, output: &StepOutput) -> Option<Result<(), String>> {
-        self.compensations.get(step_name).map(|f| f(output))
+    /// `true` if `step_name`'s compensation has already run to a successful
+    /// completion on this registry.
+    pub fn already_compensated(&self, step_name: &str) -> bool {
+        self.executed.lock().unwrap().contains(step_name)
+    }
+
+    fn run(&self, step_name: &str, output: &StepOutput) -> CompensationOutcome {
+        if self.already_compensated(step_name) {
+            return CompensationOutcome::AlreadyCompensated;
+        }
+
+        match self.compensations.get(step_name) {
+            None => CompensationOutcome::NotRegistered,
+            Some(f) => {
+                let result = f(output);
+                if result.is_ok() {
+                    self.executed.lock().unwrap().insert(step_name.to_string());
+                }
+                CompensationOutcome::Ran(result)
+            }
+        }
     }
 }
 
@@ -87,6 +127,11 @@ pub struct SagaStepRecord {
     pub attempts: u32,
     pub output: Option<StepOutput>,
     pub error: Option<String>,
+    /// `true` if this step's compensation had already completed
+    /// successfully before this `execute()` call — i.e. this run skipped
+    /// re-invoking it rather than risking a double-refund/double-release.
+    /// Always `false` the first time a step is compensated.
+    pub compensation_already_ran: bool,
 }
 
 /// Full state trace of one saga run, suitable for audit logs or a status API.
@@ -181,6 +226,7 @@ impl Saga {
                 attempts: 0,
                 output: None,
                 error: None,
+                compensation_already_ran: false,
             })
             .collect();
 
@@ -228,15 +274,25 @@ impl Saga {
                     }
                     let output = record.output.clone().unwrap_or(Value::Null);
                     match self.compensations.run(&record.name, &output) {
-                        Some(Ok(())) => {
+                        CompensationOutcome::Ran(Ok(())) => {
                             record.status = SagaStepStatus::Compensated;
                         }
-                        Some(Err(err)) => {
+                        CompensationOutcome::AlreadyCompensated => {
+                            // Idempotency guard tripped: this step's
+                            // compensation already succeeded on a prior
+                            // execute() call for this saga (e.g. it was
+                            // retried after a crash). Report it as
+                            // compensated without invoking the function
+                            // again, so a refund/release can't double-fire.
+                            record.status = SagaStepStatus::Compensated;
+                            record.compensation_already_ran = true;
+                        }
+                        CompensationOutcome::Ran(Err(err)) => {
                             record.status = SagaStepStatus::CompensationFailed;
                             record.error = Some(err);
                             any_compensation_failed = true;
                         }
-                        None => {
+                        CompensationOutcome::NotRegistered => {
                             // No compensation registered; nothing to undo.
                         }
                     }

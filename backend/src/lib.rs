@@ -24,6 +24,7 @@ pub mod decompression;
 pub mod degradation;
 pub mod dependency_map;
 pub mod dlq;
+pub mod dr_automation;
 pub mod error;
 pub mod error_context;
 pub mod event_sourcing;
