@@ -244,6 +244,88 @@ Result:
 | `#45` | `CannotRemoveOwner` | Cannot remove the owner from signers |
 | `#46` | `CannotRemoveLastSigner` | Must keep at least one co-signer |
 | `#47` | `SignerNotFound` | Signer not in the current configuration |
+| `#127` | `ThresholdChangePending` | A threshold-change proposal is already pending for this vault |
+| `#128` | `ThresholdChangeTimeLocked` | 24-hour timelock has not elapsed; cannot apply the change yet |
+| `#129` | `NoPendingThresholdChange` | No pending threshold-change proposal exists for this vault |
+
+---
+
+## Threshold Change Timelock
+
+### Overview
+
+Changing the approval threshold of an existing multi-sig configuration is a
+security-sensitive operation. An instant reduction (e.g., lowering required
+approvals from 3 to 1) could be abused if a single admin key is compromised.
+
+To prevent this, threshold changes follow a **propose → wait → apply** flow with
+a 24-hour timelock. Co-signers who detect a malicious proposal can cancel it
+during the window.
+
+```
+Owner
+  │
+  ├─ propose_multisig_threshold(vault_id, new_threshold)
+  │   └─ Emits ms_t_prp event (monitoring can alert on this)
+  │
+  ├── 24-hour window ──────────────────────────────────────────────
+  │   │                                            │
+  │   │ (co-signer detects malicious proposal)     │
+  │   ├─ cancel_multisig_threshold(vault_id)        │
+  │   │   └─ Emits ms_t_can; change is aborted     │
+  │   │                                            │
+  │   └────────────────────────────────────────────┘
+  │
+  └─ apply_multisig_threshold(vault_id)   ← only works after 24h
+      └─ Emits ms_t_app; config.threshold updated
+```
+
+### API
+
+```rust
+/// Propose a new threshold. Emits ms_t_prp. Fails if a proposal is already pending.
+propose_multisig_threshold(vault_id, caller, new_threshold) -> Result<(), ContractError>
+
+/// Apply the pending threshold change after the 24-hour timelock.
+apply_multisig_threshold(vault_id, caller) -> Result<(), ContractError>
+
+/// Cancel a pending threshold proposal (owner or any co-signer).
+cancel_multisig_threshold(vault_id, caller) -> Result<(), ContractError>
+
+/// Query the pending proposal, if any.
+get_pending_multisig_threshold(vault_id) -> Option<PendingThresholdChange>
+// PendingThresholdChange { new_threshold: u32, proposed_at: u64 }
+```
+
+### Events
+
+| Event | Topic | Data |
+|---|---|---|
+| Proposed | `ms_t_prp` | `(vault_id, (new_threshold, proposed_at))` |
+| Applied | `ms_t_app` | `(vault_id, new_threshold)` |
+| Cancelled | `ms_t_can` | `(vault_id, canceller_address)` |
+
+### Constraints
+
+- Only the vault owner may propose or apply a threshold change.
+- Any co-signer (or the owner) may cancel a pending proposal.
+- Only one pending proposal is allowed per vault at a time.
+- `new_threshold` must satisfy `1 ≤ new_threshold ≤ signers.len() + 1`.
+- Attempting to apply before 24 hours returns `ThresholdChangeTimeLocked`.
+
+### Example: Lower threshold from 3-of-3 to 2-of-3
+
+```rust
+// 1. Owner proposes the change (an event is emitted immediately)
+propose_multisig_threshold(vault_id, owner, 2);
+
+// 2. Wait 24+ hours …
+// (co-signers may cancel during this window)
+
+// 3. Owner applies the change
+apply_multisig_threshold(vault_id, owner);
+// → config.threshold is now 2
+```
 
 ## Example: 2-of-3 Withdraw
 
