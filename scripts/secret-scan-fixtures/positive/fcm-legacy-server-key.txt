@@ -1,0 +1,3 @@
+# Positive fixture for the "fcm-legacy-server-key" custom rule (.gitleaks.toml).
+# Fake legacy FCM server key in the correct shape, not a real key.
+FCM_SERVER_KEY=AAAAbcdefgh:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX

@@ -67,9 +67,35 @@ pub enum CoseAlgorithm {
     EdDsa = -8,
 }
 
+/// Algorithms this server accepts for new credential registrations. Removing
+/// a variant here (e.g. an algorithm later found to be weak or deprecated)
+/// causes registrations declaring it to be rejected without touching the
+/// COSE parsing / signature-verification code paths.
+const ALLOWED_ALGORITHMS: &[CoseAlgorithm] = &[
+    CoseAlgorithm::EdDsa,
+    CoseAlgorithm::ES256,
+    CoseAlgorithm::RS256,
+];
+
 impl CoseAlgorithm {
     pub fn cose_id(self) -> i32 {
         self as i32
+    }
+
+    /// Whether this algorithm is currently accepted for new registrations.
+    pub fn is_allowed(self) -> bool {
+        ALLOWED_ALGORITHMS.contains(&self)
+    }
+
+    /// Relative cryptographic strength, higher is stronger. Used to detect
+    /// downgrade attempts: registering a new credential with a weaker
+    /// algorithm than one already registered for the same user.
+    fn strength(self) -> u8 {
+        match self {
+            CoseAlgorithm::EdDsa => 3,
+            CoseAlgorithm::ES256 => 2,
+            CoseAlgorithm::RS256 => 1,
+        }
     }
 }
 
@@ -723,7 +749,20 @@ pub async fn complete_registration(
     let (_public_key, algorithm) = parse_cose_public_key(&attested.cose_key_bytes)
         .map_err(|e| bad_request(format!("could not parse public key: {e}")))?;
 
-    // 6. Check for duplicate credential IDs across all users.
+    if !algorithm.is_allowed() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("algorithm {algorithm:?} is not permitted for registration")
+            })),
+        ));
+    }
+
+    // 6. Check for duplicate credential IDs across all users, and reject a
+    //    downgrade: this user must not register a credential using an
+    //    algorithm weaker than one they've already registered, which would
+    //    let an attacker add a weak-algorithm credential to an account that
+    //    has moved to a stronger one.
     {
         let store = state.credentials.lock().unwrap();
         for creds in store.values() {
@@ -732,6 +771,19 @@ pub async fn complete_registration(
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({ "error": "credential already registered" })),
                 ));
+            }
+        }
+
+        if let Some(existing) = store.get(&pending.user_id) {
+            if let Some(strongest) = existing.iter().map(|c| c.algorithm.strength()).max() {
+                if algorithm.strength() < strongest {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "algorithm downgrade rejected: a stronger algorithm was already registered for this account"
+                        })),
+                    ));
+                }
             }
         }
     }
@@ -1370,6 +1422,104 @@ mod tests {
             )
             .unwrap();
         (client_data, auth_data, b64url_encode(&signature))
+    }
+
+    #[test]
+    fn test_allowed_algorithms_permit_all_current_variants() {
+        assert!(CoseAlgorithm::ES256.is_allowed());
+        assert!(CoseAlgorithm::RS256.is_allowed());
+        assert!(CoseAlgorithm::EdDsa.is_allowed());
+    }
+
+    /// Registering a weaker RS256 credential for a user who already has a
+    /// stronger ES256 credential must be rejected as a downgrade attempt.
+    #[tokio::test]
+    async fn test_algorithm_downgrade_after_stronger_registration_rejected() {
+        let state = make_state();
+        let user_id = "user5";
+
+        register_es256_credential(&state, user_id, "Eve", 0xEE).await;
+
+        let begin = begin_registration(
+            State(Arc::clone(&state)),
+            Json(BeginRegistrationRequest {
+                user_id: user_id.into(),
+                user_name: "Eve".into(),
+                label: None,
+                is_backup: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let (_, Json(begin)) = begin;
+
+        let client_data =
+            client_data_json("webauthn.create", &begin.challenge, "http://localhost:3000");
+        let cred_id = b64url_encode(&[0xFF; 32]);
+        let cred_id_bytes = b64url_decode(&cred_id).unwrap();
+        let reg_auth_data = registration_auth_data(&cred_id_bytes, &cose_key_rs256());
+
+        let result = complete_registration(
+            State(Arc::clone(&state)),
+            Json(CompleteRegistrationRequest {
+                session_id: begin.session_id,
+                credential_id: cred_id,
+                client_data_json: client_data,
+                attestation_object: attestation_object(&reg_auth_data),
+                label: None,
+                is_backup: false,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+    }
+
+    /// Registering a stronger ES256 credential for a user who already has a
+    /// weaker RS256 credential must still be allowed (only downgrades are
+    /// blocked).
+    #[tokio::test]
+    async fn test_stronger_algorithm_allowed_after_weaker_registration() {
+        let state = make_state();
+        let user_id = "user6";
+
+        let begin = begin_registration(
+            State(Arc::clone(&state)),
+            Json(BeginRegistrationRequest {
+                user_id: user_id.into(),
+                user_name: "Frank".into(),
+                label: None,
+                is_backup: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let (_, Json(begin)) = begin;
+
+        let client_data =
+            client_data_json("webauthn.create", &begin.challenge, "http://localhost:3000");
+        let cred_id = b64url_encode(&[0x11; 32]);
+        let cred_id_bytes = b64url_decode(&cred_id).unwrap();
+        let reg_auth_data = registration_auth_data(&cred_id_bytes, &cose_key_rs256());
+
+        complete_registration(
+            State(Arc::clone(&state)),
+            Json(CompleteRegistrationRequest {
+                session_id: begin.session_id,
+                credential_id: cred_id,
+                client_data_json: client_data,
+                attestation_object: attestation_object(&reg_auth_data),
+                label: None,
+                is_backup: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = register_es256_credential(&state, user_id, "Frank", 0x22).await;
+        let _ = result;
     }
 
     #[tokio::test]

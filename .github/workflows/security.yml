@@ -90,3 +90,52 @@ jobs:
 
       - name: Scan for secrets
         run: gitleaks detect --source . --config .gitleaks.toml --redact --exit-code 1
+
+  secret-scan-fixture-coverage:
+    # Regression check for #397: proves the pattern list in .gitleaks.toml
+    # (built-in ruleset + our custom rules) actually detects every documented
+    # secret format, and doesn't false-positive on the documented safe cases.
+    # See scripts/secret-scan-fixtures/ and docs/secret-scanning.md.
+    name: Secret Scan Fixture Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar xz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Verify every positive fixture is detected
+        run: |
+          FAILED=0
+          for f in scripts/secret-scan-fixtures/positive/*.txt; do
+            if gitleaks detect --no-git --source "$f" \
+                --config scripts/secret-scan-fixtures/gitleaks-fixtures.toml \
+                --redact --exit-code 1 >/tmp/gitleaks-out.txt 2>&1; then
+              echo "::error file=$f::expected a secret to be detected in this positive fixture, but gitleaks found nothing"
+              cat /tmp/gitleaks-out.txt
+              FAILED=1
+            else
+              echo "OK (detected): $f"
+            fi
+          done
+          exit $FAILED
+
+      - name: Verify no negative fixture is flagged
+        run: |
+          FAILED=0
+          for f in scripts/secret-scan-fixtures/negative/*.txt; do
+            if gitleaks detect --no-git --source "$f" \
+                --config scripts/secret-scan-fixtures/gitleaks-fixtures.toml \
+                --redact --exit-code 1 >/tmp/gitleaks-out.txt 2>&1; then
+              echo "OK (clean): $f"
+            else
+              echo "::error file=$f::expected no secret to be detected in this negative fixture, but gitleaks found one (false positive)"
+              cat /tmp/gitleaks-out.txt
+              FAILED=1
+            fi
+          done
+          exit $FAILED

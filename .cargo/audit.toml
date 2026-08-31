@@ -6,17 +6,26 @@
 
 # Accepted vulnerability advisories
 # Format: advisory IDs that have been reviewed and accepted due to legitimate reasons
-# Include justification for each acceptance
+# Include justification for each acceptance.
+#
+# ALLOWLIST POLICY (see docs/vulnerability-scanning.md):
+#   - Every entry MUST include an expiry date comment in the form: expires = "YYYY-MM-DD"
+#   - Maximum allowlist duration: 90 days from the date the entry was added.
+#   - The CI `allowlist-expiry-check` job fails the build when an entry is past its expiry.
+#   - Re-justifying an entry resets the expiry clock (update the date comment).
 [advisories]
 ignore = [
     # `paste` (unmaintained) is pulled in transitively by soroban-wasmi, part of
     # the pinned Soroban SDK's WASM interpreter. No newer version exists and it
     # cannot be removed without a Soroban SDK upgrade.
+    # No known exploitable code path in this codebase.
+    # expires = "2026-11-28"
     "RUSTSEC-2024-0436",
     # `rand` 0.8.5 (unsound only when combined with a custom logger calling
     # rand::rng(), which this codebase does not do) is pinned transitively by
     # soroban-env-host/soroban-sdk and tokio-tungstenite; multiple rand versions
     # already coexist in the tree and 0.8.5 cannot be removed without an SDK
     # upgrade.
+    # expires = "2026-11-28"
     "RUSTSEC-2026-0097",
 ]

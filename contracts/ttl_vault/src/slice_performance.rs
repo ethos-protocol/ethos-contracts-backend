@@ -177,6 +177,10 @@ pub fn record_attestor_performance(
         crate::VAULT_TTL_LEDGERS,
     );
 
+    // A fresh performance sample can change a slice's standing — invalidate the
+    // cached ranking so the next `ranking::get_rank` recomputes lazily (#342).
+    crate::ranking::invalidate_ranks(env);
+
     env.events().publish(
         (ATTESTOR_PERF_RECORDED_TOPIC, slice_id),
         AttestorPerfRecordedEvent {
