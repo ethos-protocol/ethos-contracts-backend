@@ -2,6 +2,8 @@
 
 > **Tip**: Use your browser's search (`Ctrl+F` / `Cmd+F`) or the section links below to jump directly to your topic.
 
+> **Terminology**: Terms used in this FAQ (e.g., "vault slice", "attestor", "TTL") follow the definitions in [docs/glossary.md](glossary.md). If a term here seems inconsistent with the glossary, the glossary is the source of truth — please file a docs issue.
+
 ## Table of Contents
 
 - [General](#general)

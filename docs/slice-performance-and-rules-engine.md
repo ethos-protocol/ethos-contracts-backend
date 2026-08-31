@@ -131,10 +131,29 @@ subscribe to `SliceValidated` events.
 
 ### Conflict Detection
 
-Two rules **conflict** when they share the same `priority` and produce opposite
-outcomes for the same `slice_data`.  Conflicts are surfaced in
-`ValidationResult::conflicts` (pairs of `rule_id`s) and set `overall_valid =
-false`.
+Conflicts are caught at two points in a rule's lifecycle.
+
+**At registration.**  `register_composition_rule` runs a conflict-check pass
+against every already-registered **enabled** rule.  A candidate rule conflicts
+with an existing rule when **all three** hold:
+
+1. **same `priority`** — the two rules are evaluated as peers with no tie-break;
+2. **overlapping conditions** — one rule's `rule_bytes` is a prefix of the
+   other's, so (under the prefix-match predicate) some `slice_data` satisfies
+   both rules; an empty payload overlaps everything;
+3. **contradictory outcomes** — the rules carry different `tag`s, i.e. they would
+   sort the same shared slice into two different categories.
+
+When a conflict is found the new rule is **not** persisted and the call returns
+`CompositionRuleError::ConflictingRule(existing_rule_id)`, which the contract
+surfaces as `ContractError::ConflictingRule`.  Registering a rule that overlaps
+an existing one but shares its `tag` (consistent outcome), or that contradicts
+it at a *different* priority (resolved by ordering), is allowed.
+
+**At validation.**  Two rules also **conflict** when they share the same
+`priority` and produce opposite pass/fail outcomes for the same `slice_data`.
+These conflicts are surfaced in `ValidationResult::conflicts` (pairs of
+`rule_id`s) and set `overall_valid = false`.
 
 ### Contract API
 

@@ -1,0 +1,54 @@
+{
+  "title": "Ethos-Protocol: Vault Activity",
+  "uid": "ethos-vault-activity",
+  "tags": ["ethos-protocol", "vault"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Vaults Created (rate)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(ethos_protocol_vaults_total[5m])" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Active Vaults",
+      "type": "stat",
+      "targets": [
+        { "expr": "ethos_protocol_active_vaults" }
+      ],
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Check-ins (rate)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(ethos_protocol_checkins_total[5m])" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "title": "Releases (rate)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(ethos_protocol_releases_total[5m])" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Contract Paused",
+      "type": "stat",
+      "targets": [
+        { "expr": "ethos_protocol_contract_paused" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 }
+    }
+  ]
+}

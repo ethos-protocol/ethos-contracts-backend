@@ -53,12 +53,52 @@ openssl rand -base64 32
 2. Set `FIELD_ENCRYPTION_KEY_VERSION=2`.
 3. Keep `FIELD_ENCRYPTION_KEY_1` in the environment during the grace period
    so that existing ciphertexts (version 1) can still be decrypted.
-4. Migrate stored ciphertexts with a background job using
-   `FieldEncryptionEngine::rotate_field`.
+4. Migrate stored ciphertexts with the backfill job (see below), or let
+   individual records lazily migrate via `FieldEncryptionEngine::rotate_field`
+   on their next write.
 5. Once all records are migrated, record the key retirement via
    `GET /api/encryption/keys` and remove `FIELD_ENCRYPTION_KEY_1`.
 
 Key version metadata is tracked in the `encryption_key_versions` table.
+
+### Backfill job
+
+Rather than waiting for every record to be rewritten naturally, a background
+job proactively re-encrypts records still on an old key version to
+`active_version`, in batches:
+
+```rust
+let summary = encryption::run_backfill(
+    &engine,
+    &records,           // Vec<encryption::BackfillRecord>
+    cursor,              // encryption::BackfillCursor, persisted between runs
+    batch_size,          // e.g. 200
+    rate_limit_delay,    // sleep between batches, e.g. 1s
+    |batch| persist_updated_fields(batch),
+).await;
+```
+
+- **Batching & rate limiting** — `run_backfill` processes `batch_size`
+  records at a time and sleeps `rate_limit_delay` between batches, so a large
+  backfill doesn't saturate the database with writes.
+- **Resumability** — each batch reports a `next_cursor`. The caller persists
+  it after applying that batch's updates, so a crash or restart mid-run
+  resumes from the last completed batch instead of rescanning every record.
+  `run_backfill_batch` is the single-batch primitive this loop is built on,
+  and is what a resumed run calls directly with the saved cursor.
+- **Already-current records** are detected by comparing `key_version` against
+  `engine.active_version()` and skipped without re-encrypting.
+
+The core batching, rate-limiting, and resumability logic lives in
+`backend/src/encryption.rs` (`run_backfill_batch`, `run_backfill`) and is
+exercised by that module's tests. The scheduler wiring
+(`run_encryption_backfill_job` in `backend/src/scheduler.rs`) runs this
+hourly, but the current schema stores `two_factor_config`, `reminder_preferences`,
+and `unsubscribe_tokens` fields as plain columns rather than `EncryptedField`
+JSON blobs (see "Sensitive fields" above), so there is not yet a live query
+that lists records needing backfill — the scheduled run currently exercises
+the job over an empty record set. Wiring in a real source of records is
+tracked as follow-up work once those columns store `EncryptedField` values.
 
 ## API
 

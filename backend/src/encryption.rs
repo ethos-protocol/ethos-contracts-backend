@@ -32,6 +32,7 @@
 //! runtime if it detects the dev key in a non-test environment.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde::{Deserialize, Serialize};
 
 use crate::models::{EncryptedField, KeyRotationResult};
 
@@ -303,6 +304,136 @@ impl FieldEncryptionEngine {
     }
 }
 
+// ── Key rotation backfill job ──────────────────────────────────────────────────
+//
+// `rotate_field` re-encrypts one record on demand (e.g. lazily, on next
+// write). This section adds a batch job that proactively walks records still
+// encrypted under an old key version and re-encrypts them to
+// `active_version`, instead of waiting for each record's next write.
+
+/// One stored record awaiting backfill: its identifier plus its current
+/// encrypted value.
+#[derive(Debug, Clone)]
+pub struct BackfillRecord {
+    pub id: String,
+    pub field: EncryptedField,
+}
+
+/// Where a backfill run left off, so a restart can resume instead of
+/// rescanning from the beginning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillCursor {
+    pub offset: usize,
+}
+
+/// Outcome of processing one batch.
+#[derive(Debug, Clone, Default)]
+pub struct BackfillBatchResult {
+    /// `(id, new_field)` for every record successfully re-encrypted.
+    pub updated: Vec<(String, EncryptedField)>,
+    /// Records already on `active_version`; nothing to do.
+    pub skipped_already_current: usize,
+    /// `(id, error message)` for records that failed to re-encrypt (e.g. an
+    /// old key version's environment variable was removed too early).
+    pub failed: Vec<(String, String)>,
+    /// Cursor to resume from on the next call.
+    pub next_cursor: BackfillCursor,
+    /// Whether this batch reached the end of `records`.
+    pub done: bool,
+}
+
+/// Re-encrypt one bounded batch of records to `engine.active_version()`,
+/// starting at `cursor`.
+///
+/// Bounding the work per call — rather than looping until every record is
+/// done — is what makes the job rate-limitable (the caller sleeps between
+/// batches) and resumable after an interruption (the caller persists
+/// `next_cursor` and passes it back in as `cursor` on the next run).
+pub fn run_backfill_batch(
+    engine: &FieldEncryptionEngine,
+    records: &[BackfillRecord],
+    cursor: BackfillCursor,
+    batch_size: usize,
+) -> BackfillBatchResult {
+    let start = cursor.offset.min(records.len());
+    let end = start.saturating_add(batch_size).min(records.len());
+
+    let mut result = BackfillBatchResult {
+        next_cursor: BackfillCursor { offset: end },
+        done: end >= records.len(),
+        ..Default::default()
+    };
+
+    for record in &records[start..end] {
+        if record.field.key_version == engine.active_version() {
+            result.skipped_already_current += 1;
+            continue;
+        }
+        match engine.rotate_field(&record.field, engine.active_version()) {
+            Ok((new_field, _)) => result.updated.push((record.id.clone(), new_field)),
+            Err(e) => result.failed.push((record.id.clone(), e.to_string())),
+        }
+    }
+
+    result
+}
+
+/// Aggregate outcome of a full backfill run across every batch.
+#[derive(Debug, Clone, Default)]
+pub struct BackfillSummary {
+    pub total_updated: usize,
+    pub total_skipped: usize,
+    pub total_failed: usize,
+    pub failed: Vec<(String, String)>,
+    pub final_cursor: BackfillCursor,
+}
+
+/// Run the backfill to completion, applying `persist` after each batch and
+/// rate-limiting with `delay_between_batches` so a large backfill doesn't
+/// saturate the database with writes.
+///
+/// `persist` is called once per batch with that batch's updated fields; the
+/// caller is expected to write them and durably record `next_cursor` (e.g.
+/// in its own table) so a crash mid-run resumes rather than restarting from
+/// the beginning.
+pub async fn run_backfill<F>(
+    engine: &FieldEncryptionEngine,
+    records: &[BackfillRecord],
+    start_cursor: BackfillCursor,
+    batch_size: usize,
+    delay_between_batches: std::time::Duration,
+    mut persist: F,
+) -> BackfillSummary
+where
+    F: FnMut(&BackfillBatchResult),
+{
+    let mut cursor = start_cursor;
+    let mut summary = BackfillSummary {
+        final_cursor: start_cursor,
+        ..Default::default()
+    };
+
+    loop {
+        let batch = run_backfill_batch(engine, records, cursor, batch_size);
+
+        summary.total_updated += batch.updated.len();
+        summary.total_skipped += batch.skipped_already_current;
+        summary.total_failed += batch.failed.len();
+        summary.failed.extend(batch.failed.iter().cloned());
+        summary.final_cursor = batch.next_cursor;
+
+        persist(&batch);
+
+        cursor = batch.next_cursor;
+        if batch.done {
+            break;
+        }
+        tokio::time::sleep(delay_between_batches).await;
+    }
+
+    summary
+}
+
 // ── Sensitive field helpers ───────────────────────────────────────────────────
 
 /// Identifies which model fields contain sensitive data that must be encrypted.
@@ -422,5 +553,117 @@ mod tests {
         let field = encrypt_optional(&engine, Some("test")).unwrap();
         let plain = decrypt_optional(&engine, Some(&field)).unwrap();
         assert_eq!(plain, "test");
+    }
+
+    // ── Backfill job ─────────────────────────────────────────────────────────
+
+    /// Engine with an old (v1) and active (v2) key, mirroring a rotation in
+    /// progress.
+    fn rotating_engine() -> FieldEncryptionEngine {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(1, [7u8; KEY_LEN]);
+        keys.insert(2, [8u8; KEY_LEN]);
+        FieldEncryptionEngine::from_keys(keys, 2)
+    }
+
+    /// Build `count` records encrypted under the old (v1) key, as if written
+    /// before a rotation to v2.
+    fn backfill_records(_engine: &FieldEncryptionEngine, count: usize) -> Vec<BackfillRecord> {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(1, [7u8; KEY_LEN]);
+        let old_engine = FieldEncryptionEngine::from_keys(keys, 1);
+
+        (0..count)
+            .map(|i| BackfillRecord {
+                id: format!("record-{i}"),
+                field: old_engine.encrypt(&format!("secret-{i}")).unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_backfill_batch_re_encrypts_to_active_version() {
+        let engine = rotating_engine();
+        let records = backfill_records(&engine, 3);
+
+        let result = run_backfill_batch(&engine, &records, BackfillCursor::default(), 10);
+
+        assert!(result.done);
+        assert_eq!(result.updated.len(), 3);
+        assert_eq!(result.skipped_already_current, 0);
+        assert!(result.failed.is_empty());
+        for (id, field) in &result.updated {
+            assert_eq!(field.key_version, 2);
+            let index: usize = id.strip_prefix("record-").unwrap().parse().unwrap();
+            assert_eq!(engine.decrypt(field).unwrap(), format!("secret-{index}"));
+        }
+    }
+
+    #[test]
+    fn run_backfill_batch_skips_records_already_on_active_version() {
+        let engine = rotating_engine();
+        let mut records = backfill_records(&engine, 2);
+        records.push(BackfillRecord {
+            id: "already-current".to_string(),
+            field: engine.encrypt("current").unwrap(),
+        });
+
+        let result = run_backfill_batch(&engine, &records, BackfillCursor::default(), 10);
+
+        assert_eq!(result.skipped_already_current, 1);
+        assert_eq!(result.updated.len(), 2);
+    }
+
+    #[test]
+    fn run_backfill_batch_is_resumable_across_interruptions() {
+        let engine = rotating_engine();
+        let records = backfill_records(&engine, 5);
+
+        // First batch processes only 2 records and reports where to resume.
+        let first = run_backfill_batch(&engine, &records, BackfillCursor::default(), 2);
+        assert!(!first.done);
+        assert_eq!(first.updated.len(), 2);
+        assert_eq!(first.next_cursor, BackfillCursor { offset: 2 });
+
+        // Simulate a restart: resume from the persisted cursor rather than
+        // starting over from offset 0.
+        let second = run_backfill_batch(&engine, &records, first.next_cursor, 2);
+        assert!(!second.done);
+        assert_eq!(second.updated.len(), 2);
+        assert_eq!(second.next_cursor, BackfillCursor { offset: 4 });
+
+        let third = run_backfill_batch(&engine, &records, second.next_cursor, 2);
+        assert!(third.done);
+        assert_eq!(third.updated.len(), 1);
+
+        // No record was processed twice and none were skipped.
+        let all_ids: std::collections::HashSet<_> = [&first, &second, &third]
+            .iter()
+            .flat_map(|r| r.updated.iter().map(|(id, _)| id.clone()))
+            .collect();
+        assert_eq!(all_ids.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn run_backfill_drives_every_batch_to_completion() {
+        let engine = rotating_engine();
+        let records = backfill_records(&engine, 7);
+
+        let mut persisted_batches = 0;
+        let summary = run_backfill(
+            &engine,
+            &records,
+            BackfillCursor::default(),
+            3,
+            std::time::Duration::from_millis(0),
+            |_batch| persisted_batches += 1,
+        )
+        .await;
+
+        assert_eq!(summary.total_updated, 7);
+        assert_eq!(summary.total_failed, 0);
+        assert_eq!(summary.final_cursor, BackfillCursor { offset: 7 });
+        // 7 records at batch size 3 takes 3 batches (3 + 3 + 1).
+        assert_eq!(persisted_batches, 3);
     }
 }

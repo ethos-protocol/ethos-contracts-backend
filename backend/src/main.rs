@@ -32,10 +32,6 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
-    incidents::{
-        add_timeline_entry, create_incident, escalate_incident, get_incident, list_incidents,
-        update_incident_status, IncidentState,
-    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -43,23 +39,20 @@ use ethos_protocol_backend::{
         self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
     },
     priority::{PriorityConfig, PriorityEnforcer},
+    rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
-    scheduler::SchedulerContext,
+    schema_validation::{openapi_validation_middleware, OpenApiSpec},
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
-    token_revocation::{revoke_token, RevocationList},
     tracing_sampling::TraceSampler,
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
         WebAuthnState,
     },
-    webhook::{
-        delete_webhook, list_webhooks, register_webhook, rotate_webhook_secret, verify_webhook,
-        WebhookState,
-    },
+    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
 };
 
 #[cfg(test)]
@@ -89,7 +82,10 @@ fn build_cors_layer() -> CorsLayer {
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
-    ethos_protocol_backend::health::health_handler().await
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// GET /api/encryption/keys — list all known encryption key versions (#101).
@@ -192,14 +188,7 @@ pub fn build_router(state: AppState) -> Router {
         // ── Webhook routes (#65) ─────────────────────────────────────────────
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
-        .route("/webhooks/:id/rotate-secret", post(rotate_webhook_secret))
         .route("/webhooks/verify", post(verify_webhook))
-        // ── Incident tracking routes (#373) ───────────────────────────────────
-        .route("/incidents", post(create_incident).get(list_incidents))
-        .route("/incidents/:id", get(get_incident))
-        .route("/incidents/:id/timeline", post(add_timeline_entry))
-        .route("/incidents/:id/status", post(update_incident_status))
-        .route("/incidents/:id/escalate", post(escalate_incident))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
@@ -211,14 +200,34 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             admission_middleware,
         ))
-        // Correlation IDs (#349): assign/propagate `X-Request-Id` for every
-        // request. Sits above admission control so even load-shed rejections
-        // carry the id, and echoes it on every response, including errors.
-        .layer(axum::middleware::from_fn(
-            ethos_protocol_backend::error_context::correlation_id_middleware,
+        // ── OpenAPI schema validation (#347) ────────────────────────────────
+        // Rejects requests/responses that do not conform to docs/openapi.yaml.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(OpenApiSpec::load_bundled()),
+            openapi_validation_middleware,
+        ))
+        // ── API rate limiting (#348) ───────────────────────────────────────
+        // Outermost app layer: wraps *every* route above. Endpoints with no
+        // explicit limit still get the default-deny fallback tier, so no
+        // handler can bypass the limiter. Returns 429 + Retry-After.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(build_rate_limiter()),
+            enforce_rate_limit,
         ))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+/// Rate limiter used by [`enforce_rate_limit`] for the whole app (#348).
+///
+/// Per-tier, per-endpoint limits; unauthenticated callers and unregistered
+/// endpoints fall back to [`TierLimit::default_deny`].
+fn build_rate_limiter() -> RateLimiter {
+    use std::time::Duration;
+
+    // Global default for authenticated tiers on endpoints without a specific
+    // entry: 300 requests / minute.
+    RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)))
 }
 
 #[tokio::main]
@@ -303,6 +312,11 @@ async fn main() {
         "consensus cache initialized"
     );
 
+    let scheduler_db = Arc::clone(&db);
+    tokio::spawn(async move {
+        scheduler::run(scheduler_db).await;
+    });
+
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
@@ -336,20 +350,6 @@ async fn main() {
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
 
-    let incident_state = Arc::new(IncidentState::new());
-
-    // ── Background scheduler (reminders, TTL insurance, retention, secret
-    // rotation, consensus reconciliation (#373)) ──────────────────────────
-    let scheduler_ctx = SchedulerContext {
-        db: Arc::clone(&db),
-        consensus: Arc::clone(&consensus),
-        metrics: Arc::clone(&metrics),
-        incident_state: Arc::clone(&incident_state),
-    };
-    tokio::spawn(async move {
-        scheduler::run(scheduler_ctx).await;
-    });
-
     let state = AppState {
         db: Arc::clone(&db),
         vault_store,
@@ -373,7 +373,6 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
-        incident_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
@@ -442,19 +441,12 @@ async fn main() {
         )
         .with_state(webauthn_state);
 
-    // ── Auth token revocation list (#350) ────────────────────────────────
-    let revocation_list = RevocationList::new();
-    let auth_router = Router::new()
-        .route("/auth/revoke", post(revoke_token))
-        .with_state(revocation_list);
-
     let app = build_router(state)
         // .merge(acl_router)
         // .merge(custom_metrics_router)
         // .merge(anomaly_router)
         // .merge(log_router)
-        .merge(webauthn_router)
-        .merge(auth_router);
+        .merge(webauthn_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

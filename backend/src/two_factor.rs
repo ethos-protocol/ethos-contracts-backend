@@ -17,6 +17,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 use crate::{
     db::Db,
@@ -40,7 +41,49 @@ static PENDING_OTPS: std::sync::LazyLock<Mutex<HashMap<String, Vec<PendingOtp>>>
 static SESSION_VERIFIED: std::sync::LazyLock<Mutex<HashMap<String, bool>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Serializes read-check-remove-write of a vault's backup codes so that two
+/// concurrent verification attempts for the same code cannot both observe it
+/// as unused before either has persisted its removal.
+static BACKUP_CODE_CONSUME_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+const BACKUP_CODE_COUNT: usize = 10;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Generate a fresh set of plaintext backup codes.
+fn generate_backup_codes() -> Vec<String> {
+    let mut rng = rand::thread_rng();
+    (0..BACKUP_CODE_COUNT)
+        .map(|_| format!("{:010}", rng.gen_range(0..10_000_000_000u64)))
+        .collect()
+}
+
+/// SHA-256 hex digest of a backup code, for storage/comparison without
+/// keeping the code itself in recoverable form.
+fn hash_backup_code(code: &str) -> String {
+    let digest = Sha256::digest(code.trim().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Atomically check `code` against `vault_id`'s unused backup codes and, if
+/// it matches, remove it so it cannot be used again. Returns `true` only for
+/// the call that actually consumed the code; under concurrent attempts with
+/// the same code, exactly one caller sees `true`.
+fn verify_and_consume_backup_code(db: &Db, vault_id: &str, code: &str) -> Result<bool, AppError> {
+    let _guard = BACKUP_CODE_CONSUME_LOCK.lock().unwrap();
+
+    let Some(mut config) = db.get_2fa_config(vault_id)? else {
+        return Ok(false);
+    };
+    let hashed = hash_backup_code(code);
+    let Some(pos) = config.backup_codes.iter().position(|c| c == &hashed) else {
+        return Ok(false);
+    };
+    config.backup_codes.remove(pos);
+    db.upsert_2fa_config(&config)?;
+    Ok(true)
+}
 
 fn generate_otp_code() -> String {
     let mut rng = rand::thread_rng();
@@ -233,6 +276,8 @@ pub async fn enable_2fa(
         TwoFactorMethod::Totp => {
             let secret = generate_totp_secret();
             let provisioning_uri = generate_provisioning_uri(&secret, &vault_id);
+            let backup_codes = generate_backup_codes();
+            let hashed_backup_codes = backup_codes.iter().map(|c| hash_backup_code(c)).collect();
 
             let config = TwoFactorConfig {
                 vault_id: vault_id.clone(),
@@ -243,6 +288,7 @@ pub async fn enable_2fa(
                 email: None,
                 created_at: Utc::now(),
                 verified_at: None,
+                backup_codes: hashed_backup_codes,
             };
             db.upsert_2fa_config(&config)?;
 
@@ -251,6 +297,7 @@ pub async fn enable_2fa(
                 method: TwoFactorMethod::Totp,
                 secret: Some(secret),
                 provisioning_uri: Some(provisioning_uri),
+                backup_codes: Some(backup_codes),
             }))
         }
         TwoFactorMethod::Sms => {
@@ -281,6 +328,7 @@ pub async fn enable_2fa(
                 email: None,
                 created_at: Utc::now(),
                 verified_at: None,
+                backup_codes: Vec::new(),
             };
             db.upsert_2fa_config(&config)?;
 
@@ -291,6 +339,7 @@ pub async fn enable_2fa(
                 method: TwoFactorMethod::Sms,
                 secret: None,
                 provisioning_uri: None,
+                backup_codes: None,
             }))
         }
         TwoFactorMethod::Email => {
@@ -321,6 +370,7 @@ pub async fn enable_2fa(
                 email: Some(email.clone()),
                 created_at: Utc::now(),
                 verified_at: None,
+                backup_codes: Vec::new(),
             };
             db.upsert_2fa_config(&config)?;
 
@@ -331,6 +381,7 @@ pub async fn enable_2fa(
                 method: TwoFactorMethod::Email,
                 secret: None,
                 provisioning_uri: None,
+                backup_codes: None,
             }))
         }
     }
@@ -344,13 +395,21 @@ pub async fn verify_2fa(
 ) -> Result<StatusCode, AppError> {
     let config = db.get_2fa_config(&vault_id)?.ok_or(AppError::NotFound)?;
 
+    let mut used_backup_code = false;
     let valid = match &config.method {
         TwoFactorMethod::Totp => {
             let secret = config
                 .secret
                 .as_ref()
                 .ok_or_else(|| AppError::InvalidInput("TOTP secret not found".into()))?;
-            verify_totp_code(secret, &body.otp)
+            if verify_totp_code(secret, &body.otp) {
+                true
+            } else if verify_and_consume_backup_code(&db, &vault_id, &body.otp)? {
+                used_backup_code = true;
+                true
+            } else {
+                false
+            }
         }
         TwoFactorMethod::Sms | TwoFactorMethod::Email => verify_pending_otp(&vault_id, &body.otp),
     };
@@ -359,10 +418,18 @@ pub async fn verify_2fa(
         return Err(AppError::InvalidInput("Invalid or expired OTP".into()));
     }
 
+    // If a backup code was just consumed, re-read the config so this update
+    // doesn't overwrite `backup_codes` with the stale pre-consumption list.
+    let base = if used_backup_code {
+        db.get_2fa_config(&vault_id)?.unwrap_or(config)
+    } else {
+        config
+    };
+
     let updated = TwoFactorConfig {
         enabled: true,
         verified_at: Some(Utc::now()),
-        ..config
+        ..base
     };
     db.upsert_2fa_config(&updated)?;
 
@@ -422,4 +489,111 @@ pub async fn challenge_2fa(
 pub async fn clear_2fa_session(Path(vault_id): Path<String>) -> Result<StatusCode, AppError> {
     SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
     Ok(StatusCode::OK)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn config_with_codes(vault_id: &str, codes: &[&str]) -> TwoFactorConfig {
+        TwoFactorConfig {
+            vault_id: vault_id.to_string(),
+            method: TwoFactorMethod::Totp,
+            enabled: true,
+            secret: Some(generate_totp_secret()),
+            phone: None,
+            email: None,
+            created_at: Utc::now(),
+            verified_at: Some(Utc::now()),
+            backup_codes: codes.iter().map(|c| hash_backup_code(c)).collect(),
+        }
+    }
+
+    #[test]
+    fn generate_backup_codes_are_unique_and_well_formed() {
+        let codes = generate_backup_codes();
+        assert_eq!(codes.len(), BACKUP_CODE_COUNT);
+        let unique: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(unique.len(), codes.len());
+        for code in &codes {
+            assert_eq!(code.len(), 10);
+            assert!(code.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn backup_code_is_single_use() {
+        let db = Db::open(":memory:").unwrap();
+        db.migrate().unwrap();
+        let config = config_with_codes("vault-1", &["1111111111", "2222222222"]);
+        db.upsert_2fa_config(&config).unwrap();
+
+        // First use succeeds and removes the code.
+        assert!(verify_and_consume_backup_code(&db, "vault-1", "1111111111").unwrap());
+        let after_first = db.get_2fa_config("vault-1").unwrap().unwrap();
+        assert_eq!(after_first.backup_codes.len(), 1);
+
+        // Reusing the same code is rejected.
+        assert!(!verify_and_consume_backup_code(&db, "vault-1", "1111111111").unwrap());
+
+        // The other, untouched code still works.
+        assert!(verify_and_consume_backup_code(&db, "vault-1", "2222222222").unwrap());
+        let after_second = db.get_2fa_config("vault-1").unwrap().unwrap();
+        assert!(after_second.backup_codes.is_empty());
+    }
+
+    #[test]
+    fn unknown_backup_code_is_rejected() {
+        let db = Db::open(":memory:").unwrap();
+        db.migrate().unwrap();
+        let config = config_with_codes("vault-1", &["1111111111"]);
+        db.upsert_2fa_config(&config).unwrap();
+
+        assert!(!verify_and_consume_backup_code(&db, "vault-1", "9999999999").unwrap());
+        assert_eq!(
+            db.get_2fa_config("vault-1").unwrap().unwrap().backup_codes.len(),
+            1
+        );
+    }
+
+    /// Regression test: two threads racing to consume the same backup code
+    /// must not both succeed. Without the atomic read-check-remove-write
+    /// under `BACKUP_CODE_CONSUME_LOCK`, both could observe the code as
+    /// unused before either persisted its removal.
+    #[test]
+    fn concurrent_verification_consumes_backup_code_exactly_once() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        let config = config_with_codes("vault-race", &["5555555555"]);
+        db.upsert_2fa_config(&config).unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    verify_and_consume_backup_code(&db, "vault-race", "5555555555").unwrap()
+                })
+            })
+            .collect();
+
+        let successes = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|&ok| ok)
+            .count();
+
+        assert_eq!(successes, 1, "exactly one concurrent attempt should consume the code");
+        assert!(db
+            .get_2fa_config("vault-race")
+            .unwrap()
+            .unwrap()
+            .backup_codes
+            .is_empty());
+    }
 }

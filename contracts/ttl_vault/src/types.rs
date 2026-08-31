@@ -94,6 +94,10 @@ pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
 pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
+// Issue #400: threshold-change timelock events
+pub const MULTISIG_THRESHOLD_PROPOSED_TOPIC: Symbol = symbol_short!("ms_t_prp");
+pub const MULTISIG_THRESHOLD_APPLIED_TOPIC: Symbol = symbol_short!("ms_t_app");
+pub const MULTISIG_THRESHOLD_CANCELLED_TOPIC: Symbol = symbol_short!("ms_t_can");
 
 pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
 pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
@@ -392,6 +396,8 @@ pub enum DataKey {
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
+    // Issue #400: pending threshold change (vault_id → PendingThresholdChange)
+    PendingMultiSigThreshold(u64),
     MetadataHistory(u64),
     CustomMetadataHistory(u64),
     OwnerVaultCount(Address),
@@ -540,6 +546,9 @@ pub enum DataKey {
     PasskeyEscrow(u64, BytesN<32>),
     // Issue #558: passkey audit trail
     PasskeyAuditLog(u64),
+    // Upgrade safety: recorded interface/storage fingerprint of the
+    // currently running contract, checked by validate_upgrade.
+    UpgradeManifest,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1139,6 +1148,21 @@ pub struct MultiSigProposal {
     pub created_at: u64,
 }
 
+/// Pending threshold change under timelock — Issue #400.
+///
+/// When the vault owner calls `propose_multisig_threshold`, the desired new
+/// threshold is stored here along with the timestamp at which the change was
+/// proposed. The change cannot be applied until
+/// `proposed_at + MULTISIG_THRESHOLD_TIMELOCK` seconds have elapsed.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingThresholdChange {
+    /// The new threshold value that is waiting to take effect.
+    pub new_threshold: u32,
+    /// Unix timestamp (seconds) when this proposal was created.
+    pub proposed_at: u64,
+}
+
 /// Multi-signature operation types
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -1534,6 +1558,32 @@ pub struct PauseRecord {
     pub paused_by: Address,
     pub reason: Bytes,
     pub paused_at: u64,
+}
+
+/// Fingerprint of the currently-deployed contract's interface, set by the
+/// admin via `set_upgrade_manifest` and checked by `validate_upgrade` before
+/// any `upgrade()` call is allowed to proceed.
+///
+/// This does not (and cannot, from within the contract itself) introspect
+/// the raw WASM bytes of a proposed upgrade. Instead it requires the admin
+/// to declare the new contract's fingerprint out-of-band (e.g. computed by
+/// a build-time tool that inspects the new WASM's export table and error
+/// enum) and compares it against the fingerprint recorded for the running
+/// contract, so an upgrade cannot silently shrink the interface, drop
+/// storage keys, or renumber error codes. See docs/upgrade-safety.md.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeManifest {
+    /// Number of exported contract functions in the currently running WASM.
+    pub exported_fn_count: u32,
+    /// Number of variants in `ContractError` in the currently running WASM.
+    pub error_code_count: u32,
+    /// Hash over the sorted list of storage schema key names/tags in use,
+    /// so a new WASM that stops writing/reading an existing key is caught.
+    pub storage_schema_hash: BytesN<32>,
+    /// Monotonically increasing manifest version, bumped every time the
+    /// admin records a new baseline (i.e. after each successful upgrade).
+    pub version: u32,
 }
 
 /// Stored when an owner commits to an anonymous beneficiary.

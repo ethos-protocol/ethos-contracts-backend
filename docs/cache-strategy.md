@@ -153,6 +153,40 @@ Returns per-level statistics:
 
 Flushes both L1 and L2 immediately.
 
+## Redis Failover and Recovery Sequence
+
+The backend guards Redis-backed cache access in three layers so in-flight requests still degrade gracefully during a connection loss:
+
+1. `FaultTolerantCache` detects backend unavailability, marks the backend as degraded, and records the failure event.
+2. `CircuitBreaker` transitions to `Open` after the configured failure threshold is reached and short-circuits subsequent requests.
+3. `call_with_fallback()` executes the configured degraded fallback instead of returning a raw 500 when the breaker is already open or the Redis call fails mid-request.
+
+This is the recovery sequence during an active failover:
+
+```text
+Redis connection drops mid-request
+  │
+  ▼
+Cache read/write returns an error
+  │
+  ▼
+FaultTolerantCache::record_failure() marks cache degraded
+  │
+  ▼
+Circuit breaker trips open after threshold
+  │
+  ▼
+New requests hit call_with_fallback(..., fallback)
+  │
+  ▼
+Fallback responder serves a stale-or-derived value instead of 500
+  │
+  ▼
+Recovery: rebuild cache from source and close the breaker after probe success
+```
+
+This sequence is intentionally designed to keep request latency bounded while the backend rebuilds state from the source of truth.
+
 ## Production Deployment
 
 The current L2 implementation uses an in-memory store to allow testing without a Redis instance. To use real Redis in production:

@@ -13,7 +13,7 @@
 //! | `api_key`           | 90 days              | 24 hours     |
 //! | `database_password` | 30 days              | 2 hours      |
 //! | `encryption_key`    | 365 days             | 48 hours     |
-//! | `jwt_secret`        | 30 days              | 1 hour       |
+//! | `jwt_secret`        | 30 days              | 192 hours    |
 //! | `webhook_secret`    | 90 days              | 24 hours     |
 //! | `reminders_api_key` | 90 days              | 24 hours     |
 //!
@@ -44,20 +44,28 @@ use crate::{
 // ── Default policies seeded on startup ───────────────────────────────────────
 
 /// Default rotation schedules for all known secret types.
-const DEFAULTS: &[(SecretType, u32, u32)] = &[
-    // (type, interval_days, grace_period_hours)
-    (SecretType::ApiKey, 90, 24),
-    (SecretType::DatabasePassword, 30, 2),
-    (SecretType::EncryptionKey, 365, 48),
-    (SecretType::JwtSecret, 30, 1),
-    (SecretType::WebhookSecret, 90, 24),
-    (SecretType::RemindersApiKey, 90, 24),
+///
+/// `max_token_lifetime_hours` is the longest-lived session or token issued
+/// using that secret; the grace period must exceed it (see
+/// [`validate_grace_period_overlap`]) so a rotation can never invalidate a
+/// still-valid session mid-use.
+const DEFAULTS: &[(SecretType, u32, u32, u32)] = &[
+    // (type, interval_days, grace_period_hours, max_token_lifetime_hours)
+    (SecretType::ApiKey, 90, 24, 0),
+    (SecretType::DatabasePassword, 30, 2, 0),
+    (SecretType::EncryptionKey, 365, 48, 0),
+    // JWTs minted with this secret live up to 168h (see
+    // `handlers::DEFAULT_TOKEN_EXPIRY_SECONDS`); the default 1h grace period
+    // is far too short and is widened here to stay a safe margin above it.
+    (SecretType::JwtSecret, 30, 192, 168),
+    (SecretType::WebhookSecret, 90, 24, 0),
+    (SecretType::RemindersApiKey, 90, 24, 0),
 ];
 
 /// Insert default rotation policies for all known secret types if none exist yet.
 /// Safe to call on every startup — skips types that already have a policy.
 pub fn seed_default_policies(db: &Arc<Db>) {
-    for (secret_type, interval_days, grace_hours) in DEFAULTS {
+    for (secret_type, interval_days, grace_hours, max_token_lifetime_hours) in DEFAULTS {
         match db.get_secret_rotation_policy(secret_type) {
             Ok(Some(_)) => {} // already configured
             Ok(None) => {
@@ -66,11 +74,20 @@ pub fn seed_default_policies(db: &Arc<Db>) {
                     secret_type: secret_type.clone(),
                     rotation_interval_days: *interval_days,
                     grace_period_hours: *grace_hours,
+                    max_token_lifetime_hours: *max_token_lifetime_hours,
                     auto_rotate: false,
                     notify_channels: vec!["log".to_string()],
                     created_at: now,
                     updated_at: now,
                 };
+                if let Err(e) = validate_grace_period_overlap(&policy) {
+                    tracing::error!(
+                        secret_type = ?policy.secret_type,
+                        error = %e,
+                        "secret_rotation: default policy violates grace period invariant"
+                    );
+                    continue;
+                }
                 if let Err(e) = db.upsert_secret_rotation_policy(&policy) {
                     tracing::warn!(error = %e, "secret_rotation: failed to seed default policy");
                 }
@@ -80,6 +97,23 @@ pub fn seed_default_policies(db: &Arc<Db>) {
             }
         }
     }
+}
+
+/// Ensure a policy's grace period exceeds the maximum lifetime of any
+/// session/token issued using that secret.
+///
+/// If the grace period were shorter, a session or token created just before
+/// rotation could still be in flight after the old secret is fully
+/// invalidated, forcing that session to re-authenticate mid-use.
+pub fn validate_grace_period_overlap(policy: &SecretRotationPolicy) -> Result<(), AppError> {
+    if policy.grace_period_hours <= policy.max_token_lifetime_hours {
+        return Err(AppError::InvalidInput(format!(
+            "grace_period_hours ({}) must exceed max_token_lifetime_hours ({}) for {:?}, \
+             or a session/token issued just before rotation could be invalidated mid-use",
+            policy.grace_period_hours, policy.max_token_lifetime_hours, policy.secret_type
+        )));
+    }
+    Ok(())
 }
 
 // ── HTTP endpoints ────────────────────────────────────────────────────────────
@@ -133,11 +167,18 @@ pub async fn upsert_policy(
         .get_secret_rotation_policy(&secret_type)
         .map_err(AppError::Db)?;
     let created_at = existing.as_ref().map(|p| p.created_at).unwrap_or(now);
+    let max_token_lifetime_hours = body.max_token_lifetime_hours.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .map(|p| p.max_token_lifetime_hours)
+            .unwrap_or(0)
+    });
 
     let policy = SecretRotationPolicy {
         secret_type,
         rotation_interval_days: body.rotation_interval_days,
         grace_period_hours: body.grace_period_hours.unwrap_or(24),
+        max_token_lifetime_hours,
         auto_rotate: body.auto_rotate.unwrap_or(false),
         notify_channels: body
             .notify_channels
@@ -145,6 +186,7 @@ pub async fn upsert_policy(
         created_at,
         updated_at: now,
     };
+    validate_grace_period_overlap(&policy)?;
     state
         .db
         .upsert_secret_rotation_policy(&policy)
@@ -391,4 +433,65 @@ fn parse_secret_type(s: &str) -> Result<SecretType, AppError> {
              encryption_key, jwt_secret, webhook_secret, reminders_api_key"
         ))
     })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(grace_period_hours: u32, max_token_lifetime_hours: u32) -> SecretRotationPolicy {
+        let now = Utc::now();
+        SecretRotationPolicy {
+            secret_type: SecretType::JwtSecret,
+            rotation_interval_days: 30,
+            grace_period_hours,
+            max_token_lifetime_hours,
+            auto_rotate: false,
+            notify_channels: vec!["log".to_string()],
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn accepts_grace_period_exceeding_max_token_lifetime() {
+        assert!(validate_grace_period_overlap(&policy(192, 168)).is_ok());
+    }
+
+    #[test]
+    fn rejects_grace_period_shorter_than_max_token_lifetime() {
+        let err = validate_grace_period_overlap(&policy(1, 168)).unwrap_err();
+        assert!(matches!(err, AppError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_grace_period_exactly_equal_to_max_token_lifetime() {
+        // Equal, not just shorter, must be rejected: a token minted at the
+        // instant the grace period ends is still valid until its own
+        // lifetime expires, i.e. `>` is required, not `>=`.
+        assert!(validate_grace_period_overlap(&policy(24, 24)).is_err());
+    }
+
+    #[test]
+    fn all_seeded_defaults_satisfy_the_invariant() {
+        for (secret_type, interval_days, grace_hours, max_token_lifetime_hours) in DEFAULTS {
+            let now = Utc::now();
+            let policy = SecretRotationPolicy {
+                secret_type: secret_type.clone(),
+                rotation_interval_days: *interval_days,
+                grace_period_hours: *grace_hours,
+                max_token_lifetime_hours: *max_token_lifetime_hours,
+                auto_rotate: false,
+                notify_channels: vec!["log".to_string()],
+                created_at: now,
+                updated_at: now,
+            };
+            assert!(
+                validate_grace_period_overlap(&policy).is_ok(),
+                "default policy for {secret_type:?} violates the grace period invariant"
+            );
+        }
+    }
 }

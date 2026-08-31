@@ -1,0 +1,38 @@
+title = "Ethos-Protocol gitleaks fixture-coverage config"
+
+# Used ONLY by the "Secret Scan Fixture Coverage" CI job
+# (.github/workflows/security.yml) to verify that scripts/secret-scan-fixtures/
+# positive/* IS detected and scripts/secret-scan-fixtures/negative/* is NOT.
+#
+# This mirrors the root .gitleaks.toml (built-in ruleset + the same custom
+# rules) but deliberately omits the fixtures-path allowlist entry that exists
+# there — that entry exists only so the repo-wide scan doesn't self-trigger
+# on these intentionally secret-shaped fixtures; without it here, detection
+# coverage is actually exercised.
+
+[extend]
+  useDefault = true
+
+[[rules]]
+  id = "stellar-secret-seed"
+  description = "Stellar/Soroban secret seed (StrKey 'S...' signing key — never the 'G...' public address)"
+  regex = '''\bS[A-Z2-7]{55}\b'''
+  tags = ["stellar", "soroban", "secret-key"]
+
+[[rules]]
+  id = "database-connection-string-with-credentials"
+  description = "Database/cache connection URI with an embedded username:password (Postgres, MySQL, MongoDB, Redis)"
+  regex = '''\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss)://[^\s:'"@/]+:[^\s@'"]{3,}@[^\s'"]+'''
+  tags = ["database", "connection-string"]
+
+[[rules]]
+  id = "abuseipdb-api-key"
+  description = "AbuseIPDB API key (ABUSEIPDB_API_KEY, consumed by backend/src/ip_reputation.rs)"
+  regex = '''(?i)abuseipdb[a-z0-9_ =:"'\-]{0,20}\b([a-f0-9]{80})\b'''
+  tags = ["abuseipdb", "api-key"]
+
+[[rules]]
+  id = "fcm-legacy-server-key"
+  description = "Firebase Cloud Messaging legacy server key (FCM_SERVER_KEY, consumed by backend/src/notifications.rs)"
+  regex = '''\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140,}\b'''
+  tags = ["firebase", "fcm", "api-key"]

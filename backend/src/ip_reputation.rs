@@ -18,7 +18,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -143,6 +143,80 @@ fn stub_score(ip: &str, source: &str) -> IpReputationScore {
     }
 }
 
+// ── Score decay (#393) ──────────────────────────────────────────────────────
+//
+// Without decay, a locally-penalized IP (see `apply_local_penalty`, used by
+// `captcha::record_captcha_failure` for #392) stays flagged forever, which
+// unfairly punishes shared/NAT IPs whose bad behaviour was transient. Decay
+// pulls a score back toward a neutral baseline over time, at independently
+// configurable rates depending on which side of the baseline the score sits.
+
+/// Compute the value `score.score` decays to after `now`, given `config`.
+///
+/// This is a pure function of the input score/config/time so it can be unit
+/// tested against simulated elapsed time without sleeping in tests.
+pub fn apply_score_decay(
+    score: &IpReputationScore,
+    config: &IpReputationConfig,
+    now: DateTime<Utc>,
+) -> f64 {
+    if !config.decay_enabled {
+        return score.score;
+    }
+
+    let elapsed_hours = (now - score.last_checked).num_seconds() as f64 / 3600.0;
+    if elapsed_hours <= 0.0 {
+        return score.score;
+    }
+
+    let baseline = config.decay_baseline;
+    if score.score > baseline {
+        // "Negative" adjustment: score moves down toward baseline.
+        (score.score - config.decay_rate_down_per_hour * elapsed_hours).max(baseline)
+    } else if score.score < baseline {
+        // "Positive" adjustment: score moves up toward baseline.
+        (score.score + config.decay_rate_up_per_hour * elapsed_hours).min(baseline)
+    } else {
+        score.score
+    }
+}
+
+/// Record a local reputation penalty for `ip` that did not come from
+/// AbuseIPDB — e.g. repeated CAPTCHA verification failures flagged by
+/// `captcha::record_captcha_failure` (#392). Any existing cached score is
+/// decayed first (so a burst of penalties right after a long-idle period
+/// doesn't stack on top of a stale value), then `delta` is added and the
+/// result clamped to `0.0..=100.0`.
+pub fn apply_local_penalty(ip: &str, delta: f64, reason: &str) -> IpReputationScore {
+    let config = IP_REPUTATION_CONFIG
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let now = Utc::now();
+
+    let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = store.entry(ip.to_string()).or_insert_with(|| IpReputationScore {
+        ip: ip.to_string(),
+        score: config.decay_baseline,
+        risk_level: score_to_risk(config.decay_baseline),
+        is_blocked: false,
+        last_checked: now,
+        source: "local-penalty".to_string(),
+        details: serde_json::json!({}),
+    });
+
+    let decayed = apply_score_decay(entry, &config, now);
+    let new_score = (decayed + delta).clamp(0.0, 100.0);
+
+    entry.score = new_score;
+    entry.risk_level = score_to_risk(new_score);
+    entry.last_checked = now;
+    entry.source = "local-penalty".to_string();
+    entry.details = serde_json::json!({ "reason": reason });
+
+    entry.clone()
+}
+
 /// Return `true` if `ip` matches any active (non-expired) block rule.
 ///
 /// Matching strategy:
@@ -205,6 +279,22 @@ pub async fn get_ip_reputation_handler(
 
     let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
     let mut score = check_ip_reputation(&ip, &config);
+
+    // When there's no authoritative upstream check (subsystem disabled, or no
+    // API key configured), prefer a decayed local score over resetting to a
+    // flat 0.0 on every lookup — otherwise an IP locally penalized by #392
+    // would never stay flagged between admin lookups. See #393.
+    if score.source == "disabled" || score.source == "stub" {
+        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        if let Some(existing) = store.get_mut(&ip) {
+            let now = Utc::now();
+            let decayed = apply_score_decay(existing, &config, now);
+            existing.score = decayed;
+            existing.risk_level = score_to_risk(decayed);
+            existing.last_checked = now;
+            score = existing.clone();
+        }
+    }
 
     // Annotate with current block status.
     {
@@ -491,5 +581,89 @@ mod tests {
     fn resolve_ip_unknown_fallback() {
         let headers = HeaderMap::new();
         assert_eq!(resolve_ip(&headers, None), "unknown");
+    }
+
+    // ── Score decay (#393) ──────────────────────────────────────────────────
+
+    fn decay_test_config() -> IpReputationConfig {
+        IpReputationConfig {
+            decay_enabled: true,
+            decay_baseline: 0.0,
+            decay_rate_up_per_hour: 1.0,
+            decay_rate_down_per_hour: 10.0,
+            ..IpReputationConfig::default()
+        }
+    }
+
+    fn score_at(ip: &str, value: f64, hours_ago: i64) -> IpReputationScore {
+        IpReputationScore {
+            ip: ip.to_string(),
+            score: value,
+            risk_level: score_to_risk(value),
+            is_blocked: false,
+            last_checked: Utc::now() - chrono::Duration::hours(hours_ago),
+            source: "test".to_string(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn decay_pulls_above_baseline_score_down_over_simulated_time() {
+        let config = decay_test_config();
+        let score = score_at("192.0.2.50", 80.0, 3);
+        let decayed = apply_score_decay(&score, &config, Utc::now());
+        // 3 simulated hours * 10.0/hr decay ≈ 80 - 30 = 50.
+        assert!((decayed - 50.0).abs() < 0.5, "decayed = {decayed}");
+    }
+
+    #[test]
+    fn decay_never_overshoots_baseline() {
+        let config = decay_test_config();
+        let score = score_at("192.0.2.51", 10.0, 5);
+        let decayed = apply_score_decay(&score, &config, Utc::now());
+        assert_eq!(decayed, 0.0);
+    }
+
+    #[test]
+    fn decay_moves_below_baseline_score_up_over_simulated_time() {
+        let mut config = decay_test_config();
+        config.decay_baseline = 20.0;
+        let score = score_at("192.0.2.52", 10.0, 4);
+        let decayed = apply_score_decay(&score, &config, Utc::now());
+        // 4 simulated hours * 1.0/hr ≈ 10 + 4 = 14, still below baseline of 20.
+        assert!((decayed - 14.0).abs() < 0.5, "decayed = {decayed}");
+    }
+
+    #[test]
+    fn decay_disabled_leaves_score_unchanged() {
+        let mut config = decay_test_config();
+        config.decay_enabled = false;
+        let score = score_at("192.0.2.53", 42.0, 10);
+        let decayed = apply_score_decay(&score, &config, Utc::now());
+        assert_eq!(decayed, 42.0);
+    }
+
+    #[test]
+    fn decay_no_elapsed_time_leaves_score_unchanged() {
+        let config = decay_test_config();
+        let score = score_at("192.0.2.54", 42.0, 0);
+        let decayed = apply_score_decay(&score, &config, score.last_checked);
+        assert_eq!(decayed, 42.0);
+    }
+
+    #[test]
+    fn local_penalty_raises_and_caches_score() {
+        let ip = "192.0.2.55";
+        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+
+        let first = apply_local_penalty(ip, 15.0, "test failure burst");
+        assert!((first.score - 15.0).abs() < f64::EPSILON);
+        assert_eq!(first.source, "local-penalty");
+
+        let second = apply_local_penalty(ip, 15.0, "test failure burst");
+        assert!(second.score >= first.score);
+        assert!(second.score <= 100.0);
+
+        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
     }
 }

@@ -25,6 +25,10 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserTier {
+    /// Unauthenticated callers (no valid credential presented). Default-deny
+    /// fallback tier (#348): always subject to the strictest limit so an
+    /// anonymous client can never bypass the limiter.
+    Unauthenticated,
     /// Free-tier users; lowest limits.
     Free,
     /// Pro-tier users; medium limits.
@@ -58,6 +62,17 @@ impl TierLimit {
     pub fn unlimited() -> Self {
         Self {
             max_requests: u64::MAX,
+            window: Duration::from_secs(60),
+        }
+    }
+
+    /// Default-deny fallback (#348): the strictest limit, applied to
+    /// unauthenticated callers and to any route that has not registered its
+    /// own configuration. Deliberately low so an unknown/anonymous caller is
+    /// never treated as unlimited.
+    pub fn default_deny() -> Self {
+        Self {
+            max_requests: 10,
             window: Duration::from_secs(60),
         }
     }
@@ -163,6 +178,17 @@ pub enum RateLimitError {
     UnknownEndpoint(String),
 }
 
+impl RateLimitError {
+    /// Value for the `Retry-After` HTTP header (seconds) when this error is
+    /// surfaced as a `429 Too Many Requests` response (#348).
+    pub fn retry_after_secs(&self) -> u64 {
+        match self {
+            Self::TooManyRequests { reset_in_secs, .. } => (*reset_in_secs).max(1),
+            Self::UnknownEndpoint(_) => 1,
+        }
+    }
+}
+
 impl std::fmt::Display for RateLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -239,9 +265,27 @@ impl RateLimiter {
             return Ok(TierLimit::unlimited());
         }
 
+        // Unauthenticated callers are default-denied to the strictest limit,
+        // regardless of endpoint configuration (#348).
+        if tier == UserTier::Unauthenticated {
+            return Ok(TierLimit::default_deny());
+        }
+
         match self.endpoints.get(endpoint) {
             Some(cfg) => Ok(cfg.tier_limit(tier).unwrap_or(self.default_limit)),
             None => Err(RateLimitError::UnknownEndpoint(endpoint.to_string())),
+        }
+    }
+
+    /// Like [`resolve_limit`](Self::resolve_limit) but never fails: an endpoint
+    /// with no registered configuration falls back to the default-deny limit
+    /// instead of returning `UnknownEndpoint`. Used by the enforcement
+    /// middleware so a handler can never silently bypass the limiter (#348).
+    pub fn resolve_limit_or_deny(&self, endpoint: &str, tier: UserTier) -> TierLimit {
+        match self.resolve_limit(endpoint, tier) {
+            Ok(limit) => limit,
+            Err(RateLimitError::UnknownEndpoint(_)) => TierLimit::default_deny(),
+            Err(_) => TierLimit::default_deny(),
         }
     }
 
@@ -259,6 +303,29 @@ impl RateLimiter {
         endpoint: &str,
     ) -> Result<QuotaStatus, RateLimitError> {
         let limit = self.resolve_limit(endpoint, tier)?;
+        self.record(user_id, endpoint, limit)
+    }
+
+    /// Check-and-record that always applies *some* limit: endpoints without a
+    /// registered configuration fall back to the default-deny limit rather
+    /// than being allowed through unlimited (#348). This is what the
+    /// enforcement middleware calls for every request.
+    pub fn check_and_record_enforced(
+        &self,
+        user_id: &str,
+        tier: UserTier,
+        endpoint: &str,
+    ) -> Result<QuotaStatus, RateLimitError> {
+        let limit = self.resolve_limit_or_deny(endpoint, tier);
+        self.record(user_id, endpoint, limit)
+    }
+
+    fn record(
+        &self,
+        user_id: &str,
+        endpoint: &str,
+        limit: TierLimit,
+    ) -> Result<QuotaStatus, RateLimitError> {
         let quota_key = format!("{user_id}:{endpoint}");
 
         let mut quotas = self.quotas.lock().unwrap();
@@ -335,6 +402,98 @@ impl RateLimiter {
     }
 }
 
+// ── Axum enforcement middleware (#348) ───────────────────────────────────────
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+
+/// Resolve the caller's tier from request headers.
+///
+/// Default-deny: a request with no `Authorization` header is
+/// [`UserTier::Unauthenticated`]. An authenticated request may declare its
+/// plan via `X-User-Tier` (`free` | `pro` | `enterprise` | `admin`);
+/// anything unrecognised is treated as `Free`.
+pub fn tier_from_headers(headers: &axum::http::HeaderMap) -> UserTier {
+    if headers.get(header::AUTHORIZATION).is_none() {
+        return UserTier::Unauthenticated;
+    }
+    match headers
+        .get("x-user-tier")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pro") => UserTier::Pro,
+        Some("enterprise") => UserTier::Enterprise,
+        Some("admin") => UserTier::Admin,
+        _ => UserTier::Free,
+    }
+}
+
+/// Stable identity used as the per-user quota key: the bearer token if present,
+/// otherwise the client's forwarded address, otherwise `"anonymous"`.
+fn caller_identity(headers: &axum::http::HeaderMap) -> String {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        return format!("auth:{auth}");
+    }
+    if let Some(fwd) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+    {
+        return format!("ip:{}", fwd.trim());
+    }
+    "anonymous".to_string()
+}
+
+/// Axum middleware that enforces the rate limiter on **every** request it
+/// wraps. Endpoints with no explicit configuration still get the default-deny
+/// limit, so no handler can bypass the limiter (#348). On rejection it returns
+/// `429 Too Many Requests` with a `Retry-After` header.
+pub async fn enforce_rate_limit(
+    State(limiter): State<Arc<RateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers().clone();
+    let tier = tier_from_headers(&headers);
+    let identity = caller_identity(&headers);
+    let endpoint = format!("{} {}", request.method(), request.uri().path());
+
+    match limiter.check_and_record_enforced(&identity, tier, &endpoint) {
+        Ok(_) => next.run(request).await,
+        Err(err) => {
+            let retry_after = err.retry_after_secs();
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, retry_after.to_string()),
+                    (
+                        axum::http::HeaderName::from_static("x-ratelimit-tier"),
+                        format!("{tier:?}"),
+                    ),
+                ],
+                axum::Json(serde_json::json!({
+                    "error": "rate_limit_exceeded",
+                    "message": err.to_string(),
+                    "retry_after_secs": retry_after,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -384,7 +543,14 @@ mod tests {
             .check_and_record("user1", UserTier::Free, ENDPOINT)
             .unwrap_err();
         assert!(
-            matches!(err, RateLimitError::TooManyRequests { used: 3, limit: 3, .. }),
+            matches!(
+                err,
+                RateLimitError::TooManyRequests {
+                    used: 3,
+                    limit: 3,
+                    ..
+                }
+            ),
             "expected TooManyRequests, got: {err}"
         );
     }
@@ -417,7 +583,7 @@ mod tests {
     #[test]
     fn test_admin_tier_always_unlimited() {
         let limiter = make_limiter(1, 60); // Even with a very low global default.
-        // Admin should never be rate-limited.
+                                           // Admin should never be rate-limited.
         for _ in 0..1000 {
             limiter
                 .check_and_record("admin_user", UserTier::Admin, ENDPOINT)
@@ -596,10 +762,7 @@ mod tests {
         let default = TierLimit::new(100, Duration::from_secs(60));
         let mut limiter = RateLimiter::new(default);
         let mut cfg = EndpointConfig::new();
-        cfg.set_tier_limit(
-            UserTier::Free,
-            TierLimit::new(2, Duration::from_millis(50)),
-        );
+        cfg.set_tier_limit(UserTier::Free, TierLimit::new(2, Duration::from_millis(50)));
         limiter.register_endpoint(ENDPOINT, cfg);
 
         // Exhaust the 2-request quota.
@@ -672,5 +835,99 @@ mod tests {
         assert!(limiter
             .check_and_record("user1", UserTier::Free, "POST /api/checkin")
             .is_ok());
+    }
+
+    // ── Issue #348: per-tier enforcement + default-deny fallback ─────────────
+
+    /// Drive `tier` up to (and past) its configured limit on ENDPOINT and
+    /// assert the (n+1)-th request is rejected with the tier's exact limit.
+    fn assert_tier_hits_limit(tier: UserTier, expected_limit: u64) {
+        let limiter = make_limiter(100, 60);
+        for _ in 0..expected_limit {
+            limiter
+                .check_and_record("u", tier, ENDPOINT)
+                .expect("within-limit request should be allowed");
+        }
+        let err = limiter.check_and_record("u", tier, ENDPOINT).unwrap_err();
+        match err {
+            RateLimitError::TooManyRequests { limit, .. } => assert_eq!(limit, expected_limit),
+            other => panic!("expected TooManyRequests, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_free_tier_hits_its_configured_limit() {
+        assert_tier_hits_limit(UserTier::Free, 3);
+    }
+
+    #[test]
+    fn test_pro_tier_hits_its_configured_limit() {
+        assert_tier_hits_limit(UserTier::Pro, 20);
+    }
+
+    #[test]
+    fn test_enterprise_tier_hits_its_configured_limit() {
+        assert_tier_hits_limit(UserTier::Enterprise, 200);
+    }
+
+    #[test]
+    fn test_unauthenticated_tier_hits_default_deny_limit() {
+        // Unauthenticated ignores endpoint config and uses the strict fallback.
+        assert_tier_hits_limit(
+            UserTier::Unauthenticated,
+            TierLimit::default_deny().max_requests,
+        );
+    }
+
+    #[test]
+    fn test_admin_tier_is_never_limited() {
+        let limiter = make_limiter(1, 60);
+        for _ in 0..5_000 {
+            limiter
+                .check_and_record("admin", UserTier::Admin, ENDPOINT)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_unregistered_endpoint_is_default_denied_not_bypassed() {
+        let limiter = make_limiter(100, 60);
+        // Endpoint was never registered: strict enforcement still applies.
+        for _ in 0..TierLimit::default_deny().max_requests {
+            limiter
+                .check_and_record_enforced("u", UserTier::Free, "GET /never/registered")
+                .unwrap();
+        }
+        assert!(limiter
+            .check_and_record_enforced("u", UserTier::Free, "GET /never/registered")
+            .is_err());
+    }
+
+    #[test]
+    fn test_429_error_carries_retry_after() {
+        let limiter = make_limiter(100, 60);
+        for _ in 0..3 {
+            limiter
+                .check_and_record("u", UserTier::Free, ENDPOINT)
+                .unwrap();
+        }
+        let err = limiter
+            .check_and_record("u", UserTier::Free, ENDPOINT)
+            .unwrap_err();
+        assert!(err.retry_after_secs() >= 1);
+    }
+
+    #[test]
+    fn test_tier_from_headers_defaults_to_unauthenticated() {
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(tier_from_headers(&headers), UserTier::Unauthenticated);
+    }
+
+    #[test]
+    fn test_tier_from_headers_reads_declared_plan() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer x".parse().unwrap());
+        headers.insert("x-user-tier", "enterprise".parse().unwrap());
+        assert_eq!(tier_from_headers(&headers), UserTier::Enterprise);
     }
 }
