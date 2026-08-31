@@ -20,6 +20,39 @@ use uuid::Uuid;
 use crate::error::AppError;
 
 pub const CORRELATION_ID_HEADER: &str = "x-correlation-id";
+/// Primary request-correlation header (issue #349). Generated at ingress when
+/// the client does not supply one, echoed on every response (including error
+/// responses), and propagated into tracing spans, job payloads and queue
+/// message headers so a single request can be traced end to end.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// The resolved correlation id for the in-flight request, inserted into the
+/// request extensions by [`correlation_id_middleware`] so handlers, jobs and
+/// downstream producers can read it with `request.extensions().get::<RequestId>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestId(pub String);
+
+impl RequestId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Resolve the correlation id from request headers, preferring `X-Request-Id`
+/// and falling back to the legacy `X-Correlation-Id`. Generates a fresh v4 UUID
+/// when neither is present.
+pub fn resolve_request_id(headers: &HeaderMap) -> String {
+    header_str(headers, REQUEST_ID_HEADER)
+        .or_else(|| header_str(headers, CORRELATION_ID_HEADER))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
 
 /// Snapshot of the HTTP request an error occurred while handling.
 #[derive(Debug, Clone, Serialize)]
@@ -115,13 +148,16 @@ impl ErrorContext {
     }
 
     /// Builds an `ErrorContext` directly from an in-flight axum request.
+    ///
+    /// Prefers the `RequestId` inserted by [`correlation_id_middleware`], then
+    /// the `X-Request-Id` / `X-Correlation-Id` headers, generating one only as a
+    /// last resort so error responses always carry a correlatable id.
     pub fn from_request(request: &Request) -> Self {
         let correlation_id = request
-            .headers()
-            .get(CORRELATION_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+            .extensions()
+            .get::<RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| resolve_request_id(request.headers()));
 
         Self::new()
             .with_correlation_id(correlation_id)
@@ -206,28 +242,40 @@ impl EnrichExt for AppError {
     }
 }
 
-/// Axum middleware that ensures every request/response pair carries an
-/// `X-Correlation-Id` header, generating one if the caller didn't supply
-/// it, and threading it through so downstream handlers/errors can pick it
-/// up via `ErrorContext::from_request`.
+/// Axum middleware that ensures every request/response pair carries a stable
+/// correlation id (issue #349).
+///
+/// - Generates an `X-Request-Id` at ingress when the client did not supply one
+///   (accepting a legacy `X-Correlation-Id` as an alias).
+/// - Inserts a [`RequestId`] extension and normalises both headers on the
+///   request so handlers, job payloads and queue producers can propagate it.
+/// - Runs the downstream stack inside a `tracing` span carrying `request_id`,
+///   so every log line emitted while handling the request includes it.
+/// - Echoes the id on `X-Request-Id` (and `X-Correlation-Id`) of the response,
+///   including error responses, which flow through this same layer.
 pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Response {
-    let correlation_id = request
-        .headers()
-        .get(CORRELATION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let request_id = resolve_request_id(request.headers());
 
-    request.headers_mut().insert(
-        CORRELATION_ID_HEADER,
-        HeaderValue::from_str(&correlation_id)
-            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-    );
+    let header_value =
+        HeaderValue::from_str(&request_id).unwrap_or_else(|_| HeaderValue::from_static("invalid"));
+    request
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value.clone());
+    request
+        .headers_mut()
+        .insert(CORRELATION_ID_HEADER, header_value.clone());
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
 
-    let mut response = next.run(request).await;
-    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
-        response.headers_mut().insert(CORRELATION_ID_HEADER, value);
-    }
+    let span = tracing::info_span!("http_request", request_id = %request_id);
+    let mut response = tracing::Instrument::instrument(next.run(request), span).await;
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value.clone());
+    response
+        .headers_mut()
+        .insert(CORRELATION_ID_HEADER, header_value);
     response
 }
 
@@ -254,5 +302,124 @@ mod tests {
         let err = EnrichedError::new(AppError::NotFound, ctx);
         assert_eq!(err.status, StatusCode::NOT_FOUND);
         assert_eq!(err.code, "not_found");
+    }
+
+    #[test]
+    fn resolve_request_id_prefers_request_id_then_correlation_id() {
+        let mut headers = HeaderMap::new();
+        assert_ne!(resolve_request_id(&headers), resolve_request_id(&headers)); // generated
+
+        headers.insert(CORRELATION_ID_HEADER, "corr-1".parse().unwrap());
+        assert_eq!(resolve_request_id(&headers), "corr-1");
+
+        headers.insert(REQUEST_ID_HEADER, "req-1".parse().unwrap());
+        assert_eq!(resolve_request_id(&headers), "req-1");
+    }
+
+    // ── End-to-end middleware tests (issue #349) ────────────────────────────
+
+    use axum::{body::Body, extract::Request as AxumRequest, routing::get, Router};
+    use tower::ServiceExt;
+
+    fn test_app() -> Router {
+        Router::new()
+            .route(
+                "/echo",
+                get(|req: AxumRequest| async move {
+                    // Handler observes the id the middleware resolved.
+                    req.extensions()
+                        .get::<RequestId>()
+                        .map(|r| r.0.clone())
+                        .unwrap_or_default()
+                }),
+            )
+            .route(
+                "/boom",
+                get(|| async { AppError::NotFound.into_response() }),
+            )
+            .layer(axum::middleware::from_fn(correlation_id_middleware))
+    }
+
+    #[tokio::test]
+    async fn generates_request_id_at_ingress_when_absent() {
+        let resp = test_app()
+            .oneshot(Request::builder().uri("/echo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let header_id = resp
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!header_id.is_empty());
+        // Legacy alias is echoed too.
+        assert_eq!(
+            resp.headers()
+                .get(CORRELATION_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            header_id
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        // Handler saw the same id the response advertises: propagated end to end.
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), header_id);
+    }
+
+    #[tokio::test]
+    async fn preserves_client_supplied_request_id() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/echo")
+                    .header(REQUEST_ID_HEADER, "client-abc-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.headers()
+                .get(REQUEST_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "client-abc-123"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "client-abc-123");
+    }
+
+    #[tokio::test]
+    async fn error_responses_also_carry_the_request_id() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/boom")
+                    .header(REQUEST_ID_HEADER, "trace-err-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(REQUEST_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "trace-err-9"
+        );
     }
 }
