@@ -30,8 +30,10 @@
 //! | `DB_POOL_IDLE_TIMEOUT_SECS` | `300` | Idle threshold before a connection is culled |
 //! | `DB_POOL_MAX_LIFETIME_SECS` | `3600` | Maximum connection age before recycling |
 //! | `DB_POOL_QUEUE_TIMEOUT_MS` | `5000` | How long a caller waits for a free connection |
+//! | `DB_POOL_MAX_CHECKOUT_SECS` | `60` | How long a connection may stay checked out before being flagged as a suspected leak |
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,9 @@ pub struct OptimizedPoolConfig {
     pub max_lifetime_secs: u64,
     /// How long a caller will block waiting for a free connection (ms).
     pub queue_timeout_ms: u64,
+    /// A connection checked out longer than this is flagged as a suspected
+    /// leak (checked out and never returned).
+    pub max_checkout_secs: u64,
     /// Path to the SQLite database (`:memory:` for tests).
     pub db_path: String,
 }
@@ -65,6 +70,7 @@ impl Default for OptimizedPoolConfig {
             idle_timeout_secs: 300,
             max_lifetime_secs: 3600,
             queue_timeout_ms: 5000,
+            max_checkout_secs: 60,
             db_path: ":memory:".to_string(),
         }
     }
@@ -97,6 +103,10 @@ impl OptimizedPoolConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5000),
+            max_checkout_secs: std::env::var("DB_POOL_MAX_CHECKOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
             db_path: std::env::var("DB_PATH").unwrap_or_else(|_| ":memory:".to_string()),
         }
     }
@@ -149,6 +159,19 @@ pub struct PoolMetrics {
     pub min: u32,
     /// Current configured maximum.
     pub max: u32,
+    /// Number of currently checked-out connections held longer than
+    /// `max_checkout_secs` — suspected leaks.
+    pub suspected_leaks: u32,
+}
+
+/// A connection checked out longer than `max_checkout_secs` without being
+/// returned — a suspected connection leak.
+#[derive(Debug, Clone)]
+pub struct LeakFinding {
+    /// ID of the suspected-leaked connection.
+    pub connection_id: u64,
+    /// How long the connection has been checked out, in seconds.
+    pub held_for_secs: u64,
 }
 
 // ── Pool inner state ──────────────────────────────────────────────────────────
@@ -169,6 +192,10 @@ struct Inner {
     idle_culled: u64,
     /// Simulated in-use count (updated on acquire/release).
     in_use_count: u32,
+    /// Checkout time of every currently-leased connection, by connection ID.
+    /// Populated on acquire, cleared on release; anything still present
+    /// beyond `max_checkout_secs` is a suspected leak.
+    checked_out: HashMap<u64, Instant>,
 }
 
 impl Inner {
@@ -184,6 +211,7 @@ impl Inner {
             recycled_connections: 0,
             idle_culled: 0,
             in_use_count: 0,
+            checked_out: HashMap::new(),
         }
     }
 
@@ -255,7 +283,23 @@ impl Inner {
             idle_culled: self.idle_culled,
             min: self.config.min,
             max: self.config.max,
+            suspected_leaks: self.detect_leaks().len() as u32,
         }
+    }
+
+    /// Connections currently checked out longer than `max_checkout_secs`.
+    fn detect_leaks(&self) -> Vec<LeakFinding> {
+        let max = Duration::from_secs(self.config.max_checkout_secs);
+        self.checked_out
+            .iter()
+            .filter_map(|(id, checked_out_at)| {
+                let held_for = checked_out_at.elapsed();
+                (held_for >= max).then_some(LeakFinding {
+                    connection_id: *id,
+                    held_for_secs: held_for.as_secs(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -328,6 +372,7 @@ impl OptimizedConnectionPool {
                 pc.meta.last_used_at = Instant::now();
                 inner.total_acquires += 1;
                 inner.in_use_count += 1;
+                inner.checked_out.insert(pc.meta.id, Instant::now());
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
@@ -341,6 +386,7 @@ impl OptimizedConnectionPool {
                 pc.meta.total_uses += 1;
                 inner.total_acquires += 1;
                 inner.in_use_count += 1;
+                inner.checked_out.insert(pc.meta.id, Instant::now());
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
@@ -379,6 +425,42 @@ impl OptimizedConnectionPool {
     pub fn metrics(&self) -> PoolMetrics {
         let (lock, _) = &*self.inner;
         lock.lock().unwrap().metrics()
+    }
+
+    /// List connections currently checked out longer than
+    /// `max_checkout_secs` — suspected leaks (checked out and never
+    /// returned). Should be called periodically alongside [`Self::maintain`].
+    pub fn detect_leaks(&self) -> Vec<LeakFinding> {
+        let (lock, _) = &*self.inner;
+        lock.lock().unwrap().detect_leaks()
+    }
+
+    /// Run leak detection and, for anything found, log an error and raise an
+    /// on-call alert via [`crate::oncall::raise_alert`].
+    ///
+    /// `schedule_id` identifies which on-call schedule (`OnCallSchedule::id`)
+    /// should be paged.
+    pub fn check_for_leaks_and_alert(
+        &self,
+        oncall_state: &crate::oncall::OnCallState,
+        schedule_id: &str,
+    ) {
+        for leak in self.detect_leaks() {
+            tracing::error!(
+                connection_id = leak.connection_id,
+                held_for_secs = leak.held_for_secs,
+                "suspected leaked database connection: checked out and not returned"
+            );
+            crate::oncall::raise_alert(
+                oncall_state,
+                schedule_id,
+                "pool_optimizer",
+                &format!(
+                    "connection {} has been checked out for {}s without being returned",
+                    leak.connection_id, leak.held_for_secs
+                ),
+            );
+        }
     }
 
     /// Current number of idle connections.
@@ -420,6 +502,7 @@ impl Drop for PoolGuard<'_> {
             let (lock, cvar) = &*self.pool;
             let mut inner = lock.lock().unwrap();
             inner.in_use_count = inner.in_use_count.saturating_sub(1);
+            inner.checked_out.remove(&pc.meta.id);
             inner.idle.push(pc);
             cvar.notify_one();
         }
@@ -496,6 +579,7 @@ mod tests {
             idle_timeout_secs: 300,
             max_lifetime_secs: 3600,
             queue_timeout_ms: 200,
+            max_checkout_secs: 60,
             db_path: ":memory:".to_string(),
         };
         let pool = OptimizedConnectionPool::new(config).expect("pool");
@@ -588,6 +672,7 @@ mod tests {
             idle_timeout_secs: 0, // instant idle timeout
             max_lifetime_secs: 3600,
             queue_timeout_ms: 200,
+            max_checkout_secs: 60,
             db_path: ":memory:".to_string(),
         };
         let pool = OptimizedConnectionPool::new(config).expect("pool");
@@ -639,5 +724,104 @@ mod tests {
         }
         // All connections returned, idle >= min.
         assert!(pool.idle_count() >= 2);
+    }
+
+    #[test]
+    fn test_leaked_connection_is_detected() {
+        let config = OptimizedPoolConfig {
+            min: 1,
+            max: 5,
+            timeout_secs: 5,
+            idle_timeout_secs: 300,
+            max_lifetime_secs: 3600,
+            queue_timeout_ms: 200,
+            max_checkout_secs: 0, // anything checked out is immediately "leaked"
+            db_path: ":memory:".to_string(),
+        };
+        let pool = OptimizedConnectionPool::new(config).expect("pool");
+        pool.prefill().expect("prefill");
+
+        let guard = pool.acquire().expect("acquire");
+        std::thread::sleep(Duration::from_millis(5));
+
+        let leaks = pool.detect_leaks();
+        assert_eq!(leaks.len(), 1);
+
+        drop(guard);
+        // Returned connections are no longer flagged.
+        assert!(pool.detect_leaks().is_empty());
+    }
+
+    #[test]
+    fn test_connection_within_max_checkout_not_flagged() {
+        let pool = make_pool(1, 5); // max_checkout_secs: 60
+        let _guard = pool.acquire().expect("acquire");
+        assert!(pool.detect_leaks().is_empty());
+    }
+
+    #[test]
+    fn test_metrics_reflect_suspected_leaks() {
+        let config = OptimizedPoolConfig {
+            min: 1,
+            max: 5,
+            timeout_secs: 5,
+            idle_timeout_secs: 300,
+            max_lifetime_secs: 3600,
+            queue_timeout_ms: 200,
+            max_checkout_secs: 0,
+            db_path: ":memory:".to_string(),
+        };
+        let pool = OptimizedConnectionPool::new(config).expect("pool");
+        pool.prefill().expect("prefill");
+
+        let _guard = pool.acquire().expect("acquire");
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(pool.metrics().suspected_leaks, 1);
+    }
+
+    #[test]
+    fn test_check_for_leaks_and_alert_pages_oncall() {
+        use crate::oncall::{EscalationLevel, EscalationPolicy, OnCallSchedule, OnCallState};
+
+        let config = OptimizedPoolConfig {
+            min: 1,
+            max: 5,
+            timeout_secs: 5,
+            idle_timeout_secs: 300,
+            max_lifetime_secs: 3600,
+            queue_timeout_ms: 200,
+            max_checkout_secs: 0,
+            db_path: ":memory:".to_string(),
+        };
+        let pool = OptimizedConnectionPool::new(config).expect("pool");
+        pool.prefill().expect("prefill");
+        let _guard = pool.acquire().expect("acquire");
+        std::thread::sleep(Duration::from_millis(5));
+
+        let oncall_state = OnCallState::new();
+        let schedule = OnCallSchedule {
+            id: "db-oncall".into(),
+            name: "Database On-Call".into(),
+            rotation_hours: 24,
+            shifts: vec![],
+            escalation_policy: EscalationPolicy {
+                levels: vec![EscalationLevel {
+                    level: 1,
+                    delay_minutes: 5,
+                    contacts: vec!["dba@example.com".into()],
+                }],
+            },
+            handoffs: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        oncall_state
+            .store
+            .lock()
+            .unwrap()
+            .insert(schedule.id.clone(), schedule);
+
+        // Should not panic and should log/alert for the one leaked connection.
+        pool.check_for_leaks_and_alert(&oncall_state, "db-oncall");
     }
 }

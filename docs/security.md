@@ -59,3 +59,47 @@
 ## Audit Status
 
 Not yet audited. Community review welcome.
+
+## ACL Permission Resolution Order
+
+The dynamic ACL store (`backend/src/acl.rs`) uses the following resolution order
+for every access-control check:
+
+```
+is_allowed(subject, resource, action)
+    │
+    ├─ 1. Collect all rules where:
+    │       rule.subject == "*"  OR  rule.subject == subject
+    │       rule.resource == "*" OR  resource.starts_with(rule.resource)
+    │       rule.action   == "*" OR  rule.action == action   (case-insensitive)
+    │
+    ├─ 2. If ANY matching rule has effect = Deny  →  DENY  (deny always wins)
+    │
+    └─ 3. Otherwise  →  ALLOW  (including the case where no rules match at all)
+```
+
+**Key properties:**
+
+- **Deny beats allow**: A single matching Deny rule blocks access regardless of
+  how many Allow rules are present for the same principal, resource, or action.
+- **Wildcard subjects model inheritance**: A rule with `subject = "*"` acts as a
+  "parent role" that applies to all principals. A more-specific rule
+  (e.g., `subject = "alice"`) acts as the child override, but it cannot lift a
+  deny that comes from a wildcard rule.
+- **Default allow**: When no rules match the request at all, access is permitted.
+  This preserves backwards compatibility with the previous static-allow behavior.
+- **Immediate effect**: Rules take effect on the very next request — there is no
+  reload step or caching layer between a mutation and enforcement.
+
+**Implications for operators:**
+
+| Scenario | Result |
+|---|---|
+| Wildcard allow + per-user deny | Deny wins — user is blocked |
+| Wildcard deny + per-user allow | Deny wins — allow is ignored |
+| No matching rules | Default allow |
+| Role with zero rules | Default allow for all its requests |
+| Removing the only deny rule | Access immediately restored |
+
+See `backend/src/acl.rs` (tests section, `#[cfg(test)]`) for a full suite of
+inheritance and resolution-order tests covering these cases.

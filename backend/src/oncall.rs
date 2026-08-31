@@ -159,6 +159,51 @@ impl Default for OnCallState {
     }
 }
 
+/// An ad-hoc alert raised against a schedule's primary escalation contacts,
+/// outside the normal `trigger_escalation` HTTP flow — used by other
+/// subsystems (e.g. connection-pool leak detection) that need to page
+/// on-call without going through a pre-defined escalation level.
+#[derive(Debug, Clone)]
+pub struct AlertRecord {
+    pub schedule_id: String,
+    pub source: String,
+    pub message: String,
+    pub contacts_notified: Vec<String>,
+}
+
+/// Raise an alert against `schedule_id`'s primary (level-1) escalation
+/// contacts and log it. Returns `None` if the schedule doesn't exist, in
+/// which case the alert is only logged, not attributed to any contacts.
+pub fn raise_alert(
+    state: &OnCallState,
+    schedule_id: &str,
+    source: &str,
+    message: &str,
+) -> Option<AlertRecord> {
+    let contacts = {
+        let store = state.store.lock().unwrap();
+        store
+            .get(schedule_id)
+            .and_then(|schedule| schedule.escalation_policy.levels.first())
+            .map(|level| level.contacts.clone())
+    };
+
+    tracing::error!(
+        schedule_id = %schedule_id,
+        source = %source,
+        message = %message,
+        contacts = ?contacts,
+        "alert raised"
+    );
+
+    contacts.map(|contacts_notified| AlertRecord {
+        schedule_id: schedule_id.to_string(),
+        source: source.to_string(),
+        message: message.to_string(),
+        contacts_notified,
+    })
+}
+
 /// Build a round-robin rotation of `shift_count` shifts across
 /// `participants`, each `rotation_hours` long, starting now.
 fn build_rotation(
@@ -308,4 +353,51 @@ pub async fn trigger_escalation(
         contacts_notified: level.contacts.clone(),
         reason: body.reason,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schedule_with_contacts(contacts: Vec<String>) -> OnCallSchedule {
+        OnCallSchedule {
+            id: "sched-1".into(),
+            name: "Backend On-Call".into(),
+            rotation_hours: 24,
+            shifts: vec![],
+            escalation_policy: EscalationPolicy {
+                levels: vec![EscalationLevel {
+                    level: 1,
+                    delay_minutes: 5,
+                    contacts,
+                }],
+            },
+            handoffs: vec![],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn raise_alert_notifies_primary_escalation_contacts() {
+        let state = OnCallState::new();
+        let schedule = schedule_with_contacts(vec!["oncall@example.com".into()]);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert(schedule.id.clone(), schedule.clone());
+
+        let alert = raise_alert(&state, &schedule.id, "pool_optimizer", "leak detected")
+            .expect("schedule exists");
+
+        assert_eq!(alert.contacts_notified, vec!["oncall@example.com".to_string()]);
+        assert_eq!(alert.source, "pool_optimizer");
+    }
+
+    #[test]
+    fn raise_alert_on_unknown_schedule_returns_none() {
+        let state = OnCallState::new();
+        let alert = raise_alert(&state, "does-not-exist", "pool_optimizer", "leak detected");
+        assert!(alert.is_none());
+    }
 }
