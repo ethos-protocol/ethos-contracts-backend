@@ -27,7 +27,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -69,6 +69,100 @@ static TRUSTED_STORE: std::sync::LazyLock<Arc<Mutex<Vec<TrustedUser>>>> =
 /// Maps IP → count of events seen in the current window.
 static IP_EVENT_COUNTER: std::sync::LazyLock<Arc<Mutex<HashMap<String, u32>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Per-IP CAPTCHA failure tracking, used to detect automated bypass attempts
+/// (#392): a client that repeatedly fails CAPTCHA and retries rapidly looks
+/// like a bot rather than a confused human.
+#[derive(Debug, Clone)]
+struct FailureRecord {
+    consecutive_failures: u32,
+    last_failure_at: DateTime<Utc>,
+    blocked_until: Option<DateTime<Utc>>,
+}
+
+static CAPTCHA_FAILURE_STORE: std::sync::LazyLock<Arc<Mutex<HashMap<String, FailureRecord>>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Number of consecutive failures before progressive backoff kicks in.
+const BACKOFF_FAILURE_THRESHOLD: u32 = 3;
+
+/// Number of consecutive failures before the offending IP is flagged in the
+/// IP-reputation subsystem (integration with #96, per #392's task list).
+const REPUTATION_FLAG_THRESHOLD: u32 = 5;
+
+/// Reputation score penalty applied each time the flag threshold is hit.
+const REPUTATION_PENALTY: f64 = 15.0;
+
+/// Base backoff duration in seconds; doubles for every failure past
+/// `BACKOFF_FAILURE_THRESHOLD`, capped at `MAX_BACKOFF_SECS`.
+const BASE_BACKOFF_SECS: i64 = 5;
+const MAX_BACKOFF_SECS: i64 = 900;
+
+/// Record a failed CAPTCHA verification attempt for `ip`.
+///
+/// Increments the consecutive-failure counter, applies progressive backoff
+/// once `BACKOFF_FAILURE_THRESHOLD` is reached, and — once
+/// `REPUTATION_FLAG_THRESHOLD` consecutive failures accumulate — flags the
+/// IP in the IP-reputation subsystem so it carries elevated risk elsewhere
+/// in the system too. Returns the updated consecutive-failure count.
+pub fn record_captcha_failure(ip: &str) -> u32 {
+    let now = Utc::now();
+    let failures = {
+        let mut store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
+        let record = store.entry(ip.to_string()).or_insert(FailureRecord {
+            consecutive_failures: 0,
+            last_failure_at: now,
+            blocked_until: None,
+        });
+
+        record.consecutive_failures += 1;
+        record.last_failure_at = now;
+
+        if record.consecutive_failures >= BACKOFF_FAILURE_THRESHOLD {
+            let backoff_exponent = (record.consecutive_failures - BACKOFF_FAILURE_THRESHOLD).min(10);
+            let backoff_secs = BASE_BACKOFF_SECS
+                .saturating_mul(1i64 << backoff_exponent)
+                .min(MAX_BACKOFF_SECS);
+            record.blocked_until = Some(now + chrono::Duration::seconds(backoff_secs));
+        }
+
+        record.consecutive_failures
+    };
+
+    if failures >= REPUTATION_FLAG_THRESHOLD && failures % REPUTATION_FLAG_THRESHOLD == 0 {
+        crate::ip_reputation::apply_local_penalty(
+            ip,
+            REPUTATION_PENALTY,
+            "repeated CAPTCHA verification failures",
+        );
+    }
+
+    failures
+}
+
+/// Clear the failure/backoff record for `ip`, called after a successful
+/// CAPTCHA verification.
+pub fn record_captcha_success(ip: &str) {
+    let mut store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    store.remove(ip);
+}
+
+/// Returns `true` if `ip` is currently within its progressive-backoff window
+/// and should be rejected before attempting CAPTCHA verification at all.
+pub fn is_backoff_active(ip: &str) -> bool {
+    let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    store
+        .get(ip)
+        .and_then(|r| r.blocked_until)
+        .map(|until| Utc::now() < until)
+        .unwrap_or(false)
+}
+
+/// Current consecutive-failure count recorded for `ip` (0 if none).
+pub fn consecutive_failures_for_ip(ip: &str) -> u32 {
+    let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    store.get(ip).map(|r| r.consecutive_failures).unwrap_or(0)
+}
 
 // ── Helper: extract IP from request headers ───────────────────────────────────
 
@@ -324,28 +418,55 @@ pub async fn post_challenge_handler(
 ///
 /// Accepts a `CaptchaVerifyRequest` JSON body.  On success returns a
 /// `CaptchaVerifyResponse` with a session token; on failure returns
-/// `422 Unprocessable Entity`.
+/// `422 Unprocessable Entity`. An IP currently in its progressive-backoff
+/// window (#392, see `is_backoff_active`) is rejected with
+/// `429 Too Many Requests` before verification is even attempted.
 pub async fn post_verify_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CaptchaVerifyRequest>,
 ) -> Result<Json<CaptchaVerifyResponse>, AppError> {
+    let ip = extract_ip(&headers);
+
+    if is_backoff_active(&ip) {
+        return Err(AppError::TooManyRequests(
+            "too many failed CAPTCHA attempts; please wait before retrying".to_string(),
+        ));
+    }
+
     match verify_captcha(&req, &state).await {
         Ok(resp) => {
             if resp.verified {
-                // Reset the suspicious-activity counter so that subsequent
-                // requests from this IP are not immediately flagged again.
-                // We cannot extract the IP here without the HeaderMap, so the
-                // counter reset is best-effort via the user_token as a hint.
-                // A full implementation would pass the IP in the request body
-                // or a separate middleware.
+                // Successful verification clears the failure/backoff record
+                // and the suspicious-activity counter for this IP so that
+                // subsequent requests are not immediately flagged again.
+                record_captcha_success(&ip);
+                reset_event_counter_for_ip(&ip);
                 tracing::debug!(
                     challenge_id = %req.challenge_id,
+                    ip = %ip,
                     "CAPTCHA verified successfully"
+                );
+            } else {
+                let failures = record_captcha_failure(&ip);
+                tracing::warn!(
+                    ip = %ip,
+                    consecutive_failures = failures,
+                    "CAPTCHA verification failed"
                 );
             }
             Ok(Json(resp))
         }
-        Err(e) => Err(AppError::InvalidInput(e)),
+        Err(e) => {
+            let failures = record_captcha_failure(&ip);
+            tracing::warn!(
+                ip = %ip,
+                consecutive_failures = failures,
+                error = %e,
+                "CAPTCHA verification error"
+            );
+            Err(AppError::InvalidInput(e))
+        }
     }
 }
 
@@ -418,13 +539,26 @@ mod tests {
     use super::*;
 
     fn dummy_state() -> AppState {
+        use crate::batching::{AdaptiveBatcher, BatchConfig};
+        use crate::consensus::NodeCache;
         use crate::db::{
             create_audit_store, create_event_store, create_share_store, create_share_token_store,
             create_vault_store, Db, PoolConfig,
         };
+        use crate::deadlock::DeadlockDetector;
+        use crate::degradation::DegradationState;
+        use crate::event_sourcing::EventSourcingState;
+        use crate::feature_flags::FlagState;
         use crate::graphql::build_schema;
+        use crate::load_shedding::{LoadMonitor, LoadShedder, SheddingConfig};
+        use crate::message_queue::MessageQueueState;
+        use crate::metrics::Metrics;
+        use crate::predictive_scaling::{
+            ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
+        };
+        use crate::priority::{PriorityConfig, PriorityEnforcer};
+        use crate::query_cache::QueryCache;
         use crate::webhook::WebhookState;
-        use crate::consensus::NodeCache;
 
         let db = Arc::new(
             Db::open_with_pool_config(":memory:", &PoolConfig::default())
@@ -434,8 +568,11 @@ mod tests {
         let vault_store = create_vault_store();
         let event_store = create_event_store();
         let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
+        let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+        let degradation_state = Arc::new(DegradationState::new(Arc::clone(&db)));
+
         AppState {
-            db,
+            db: Arc::clone(&db),
             vault_store,
             event_store,
             audit_store: create_audit_store(),
@@ -444,6 +581,27 @@ mod tests {
             consensus: NodeCache::from_env(),
             webhook_state: Arc::new(WebhookState::new()),
             graphql_schema,
+            metrics: Metrics::new(),
+            priority_enforcer: Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
+            load_shedder: Arc::new(LoadShedder::new(
+                LoadMonitor::new(),
+                SheddingConfig::default(),
+            )),
+            batcher: Arc::new(AdaptiveBatcher::new(BatchConfig::default())),
+            scaler: Arc::new(PredictiveScaler::new(
+                10,
+                ForecastModel::default(),
+                ScalingConfig::default(),
+                Box::new(LoggingAutoscalerClient),
+            )),
+            event_sourcing: Arc::new(EventSourcingState::with_db(Arc::clone(&db))),
+            message_queue: Arc::new(
+                MessageQueueState::new().expect("failed to initialize message queue"),
+            ),
+            degradation_state,
+            flag_state,
+            query_cache: Arc::new(QueryCache::new()),
+            deadlock_detector: Arc::new(DeadlockDetector::new()),
         }
     }
 
@@ -540,5 +698,115 @@ mod tests {
 
         let result = verify_captcha(&req, &state).await;
         assert!(result.is_err());
+    }
+
+    // ── CAPTCHA bypass detection / backoff (#392) ────────────────────────────
+
+    #[test]
+    fn failure_count_tracks_and_resets_on_success() {
+        let ip = "203.0.113.10";
+        assert_eq!(consecutive_failures_for_ip(ip), 0);
+
+        assert_eq!(record_captcha_failure(ip), 1);
+        assert_eq!(record_captcha_failure(ip), 2);
+        assert_eq!(consecutive_failures_for_ip(ip), 2);
+
+        record_captcha_success(ip);
+        assert_eq!(consecutive_failures_for_ip(ip), 0);
+        assert!(!is_backoff_active(ip));
+    }
+
+    #[test]
+    fn no_backoff_below_threshold() {
+        let ip = "203.0.113.11";
+        for _ in 0..(BACKOFF_FAILURE_THRESHOLD - 1) {
+            record_captcha_failure(ip);
+        }
+        assert!(!is_backoff_active(ip));
+        record_captcha_success(ip);
+    }
+
+    #[test]
+    fn backoff_triggers_at_threshold_and_clears_on_success() {
+        let ip = "203.0.113.12";
+        for _ in 0..BACKOFF_FAILURE_THRESHOLD {
+            record_captcha_failure(ip);
+        }
+        assert!(is_backoff_active(ip));
+
+        record_captcha_success(ip);
+        assert!(!is_backoff_active(ip));
+        assert_eq!(consecutive_failures_for_ip(ip), 0);
+    }
+
+    #[test]
+    fn backoff_window_grows_with_further_failures() {
+        let ip = "203.0.113.13";
+        for _ in 0..BACKOFF_FAILURE_THRESHOLD {
+            record_captcha_failure(ip);
+        }
+        let blocked_until_first = {
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            store.get(ip).and_then(|r| r.blocked_until).unwrap()
+        };
+
+        record_captcha_failure(ip);
+        let blocked_until_second = {
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            store.get(ip).and_then(|r| r.blocked_until).unwrap()
+        };
+
+        assert!(blocked_until_second > blocked_until_first);
+        record_captcha_success(ip);
+    }
+
+    #[test]
+    fn repeated_failures_flag_ip_in_reputation_store() {
+        let ip = "203.0.113.14";
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+
+        for _ in 0..REPUTATION_FLAG_THRESHOLD {
+            record_captcha_failure(ip);
+        }
+
+        let score = crate::ip_reputation::IP_REPUTATION_STORE
+            .lock()
+            .unwrap()
+            .get(ip)
+            .cloned()
+            .expect("ip should have been flagged in the reputation store");
+        assert!(score.score > 0.0);
+        assert_eq!(score.source, "local-penalty");
+
+        record_captcha_success(ip);
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+    }
+
+    #[tokio::test]
+    async fn post_verify_handler_rejects_backed_off_ip() {
+        std::env::remove_var("RECAPTCHA_SECRET_KEY");
+
+        let ip = "203.0.113.15";
+        for _ in 0..BACKOFF_FAILURE_THRESHOLD {
+            record_captcha_failure(ip);
+        }
+
+        let state = Arc::new(dummy_state());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", ip.parse().unwrap());
+
+        let req = CaptchaVerifyRequest {
+            challenge_id: "irrelevant".to_string(),
+            captcha_token: "irrelevant".to_string(),
+            user_token: "irrelevant".to_string(),
+        };
+
+        let result = post_verify_handler(State(state), headers, Json(req)).await;
+        match result {
+            Err(AppError::TooManyRequests(_)) => {}
+            other => panic!("expected TooManyRequests, got {other:?}"),
+        }
+
+        record_captcha_success(ip);
     }
 }
