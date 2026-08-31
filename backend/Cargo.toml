@@ -65,7 +65,7 @@ once_cell = "1"
 # `rsa` crate: `rsa` has an unpatched RUSTSEC-2023-0071 (Marvin Attack timing
 # side-channel) advisory that fails `cargo audit --deny warnings` in CI.
 ciborium = "0.2"
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["der"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 ring = "0.17"
