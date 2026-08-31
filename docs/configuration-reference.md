@@ -152,6 +152,9 @@ REMINDER_SECOND_LEAD_TIME_HOURS=24
 | `DB_MIN_CONNECTIONS` | `integer` | `1` | Minimum idle connections |
 | `DB_CONNECT_TIMEOUT_SECONDS` | `integer` | `30` | Connection timeout |
 | `DB_IDLE_TIMEOUT_SECONDS` | `integer` | `600` | Idle connection timeout |
+| `DB_POOL_MIN` | `integer` | `2` | Minimum live connections (adaptive pool, `pool_optimizer.rs`) |
+| `DB_POOL_MAX` | `integer` | `10` | Maximum live connections (adaptive pool, `pool_optimizer.rs`) |
+| `DB_POOL_MAX_CHECKOUT_SECS` | `integer` | `60` | How long a connection may stay checked out before being flagged as a suspected leak |
 
 **Recommended**:
 
@@ -161,6 +164,27 @@ DB_MAX_CONNECTIONS=10
 ```
 
 **Validation**: `DATABASE_URL` must be a valid PostgreSQL URI. The schema must be initialized before starting the backend.
+
+### Connection leak detection
+
+`backend/src/pool_optimizer.rs`'s adaptive connection pool tracks a checkout
+timestamp for every connection it hands out. A connection still checked out
+longer than `DB_POOL_MAX_CHECKOUT_SECS` (default `60`) is treated as a
+suspected leak — code that acquired a connection and never returned it
+(e.g. via an early `return` that skips dropping the guard, or a stuck
+downstream call holding it indefinitely).
+
+- `OptimizedConnectionPool::detect_leaks()` returns the list of suspected
+  leaks (connection ID + how long it's been held).
+- `PoolMetrics::suspected_leaks` exposes the current count for dashboards.
+- `OptimizedConnectionPool::check_for_leaks_and_alert(oncall_state,
+  schedule_id)` logs an error for each suspected leak and pages the given
+  on-call schedule via `oncall::raise_alert` (`backend/src/oncall.rs`). Call
+  this periodically (e.g. alongside `maintain()`) from a background task.
+
+Set `DB_POOL_MAX_CHECKOUT_SECS` above your slowest expected query/transaction
+duration to avoid false positives; lower it in environments where connection
+leaks are a known risk (e.g. after a recent incident) to catch them sooner.
 
 ---
 

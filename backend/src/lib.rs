@@ -6,8 +6,12 @@ pub mod batch_conditional_completion;
 pub mod batching;
 pub mod bulkhead;
 pub mod cache;
+<<<<<<< HEAD
+pub mod captcha;
+=======
 pub mod cache_partition;
 pub mod cdc_lag;
+>>>>>>> origin/main
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
@@ -19,6 +23,7 @@ pub mod deadlock;
 pub mod decompression;
 pub mod degradation;
 pub mod dlq;
+pub mod encryption;
 pub mod error;
 pub mod error_context;
 pub mod event_sourcing;
@@ -28,7 +33,11 @@ pub mod graphql;
 pub mod handlers;
 pub mod health;
 pub mod health_routing;
+<<<<<<< HEAD
+pub mod ip_reputation;
+=======
 pub mod incidents;
+>>>>>>> origin/main
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
@@ -41,6 +50,7 @@ pub mod predictive_scaling;
 pub mod priority;
 pub mod profiler;
 pub mod query_cache;
+pub mod rate_limit;
 pub mod replay;
 pub mod request_queue;
 pub mod retention;
@@ -48,7 +58,9 @@ pub mod retry_policy;
 pub mod routes;
 pub mod rpc_pool;
 pub mod saga;
+pub mod saml;
 pub mod scheduler;
+pub mod schema_validation;
 pub mod secret_rotation;
 pub mod streaming;
 pub mod templates;

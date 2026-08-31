@@ -1,0 +1,5 @@
+# Negative fixture: prose that mentions credential-shaped keywords without an
+# assignment operator or an actual secret value should not trip generic-api-key.
+Never hardcode an API key or password inside this repository - use environment
+variables or your CI provider's secret store instead. See docs/secret-scanning.md
+for the full policy on handling credentials and access tokens.

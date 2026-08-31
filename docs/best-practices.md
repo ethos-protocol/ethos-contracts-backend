@@ -465,3 +465,39 @@ The project includes a fuzz test harness under `contracts/ttl_vault/fuzz/`. Run 
 ```bash
 cargo fuzz run fuzz_target_1
 ```
+
+## Coverage Expectations
+
+`scripts/test.sh` supports generating a code coverage report via
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```bash
+COVERAGE=1 ./scripts/test.sh
+```
+
+This writes:
+
+- `target/coverage/lcov.info` — machine-readable report, archived as a CI
+  artifact on every run (see the `coverage` job in `.github/workflows/ci.yml`)
+- `target/coverage/html/` — human-readable HTML report for local inspection
+
+**Minimum coverage threshold**
+
+CI enforces a minimum aggregate line coverage of **70%** (`MIN_COVERAGE`
+env var in `scripts/test.sh`) across `contracts/ttl_vault`. A CI run fails
+if coverage drops below this threshold, which is intended to catch
+under-tested modules before they land on `main`.
+
+**Guidance for new/changed files**
+
+- New contract logic (`contracts/*/src/**`) should aim for coverage at or
+  above the repo-wide threshold — untested branches in payout, TTL, or
+  auth logic are the highest-risk gaps.
+- Backend service code under `backend/src/` is not yet wired into the
+  coverage gate; when adding coverage there, extend the `--manifest-path`
+  arguments in `scripts/test.sh` rather than creating a parallel script.
+- Prefer adding a focused unit test over inflating coverage with trivial
+  assertions — the threshold is a floor, not a target to game.
+- If a module has a legitimate reason for low coverage (e.g. thin
+  glue code), note it in the PR description rather than lowering the
+  global threshold.

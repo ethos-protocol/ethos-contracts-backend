@@ -226,6 +226,60 @@ Secret values are redacted in CI output (`--redact` flag) so they are not visibl
 
 ---
 
+## Pattern Coverage Audit (2026-08-30)
+
+`.gitleaks.toml` previously defined only an `[allowlist]` with no `[[rules]]`
+and no `[extend]` block. Per gitleaks' config semantics, a config with no
+`[extend]` block does **not** fall back to the built-in ruleset — it
+replaces it. With zero `[[rules]]` defined, gitleaks was effectively
+scanning with **zero detection rules**, in CI and in the pre-commit hook
+alike: every run reported "no secrets found" regardless of what was staged
+or committed. `[extend]\n  useDefault = true` was added to restore the
+~180-rule built-in ruleset.
+
+On top of the built-in ruleset, `.gitleaks.toml` defines custom rules for
+secret formats specific to this repo's own dependencies/integrations that
+the built-in ruleset does not cover:
+
+| Rule ID | What it catches | Why it's repo-specific |
+|---|---|---|
+| `stellar-secret-seed` | A Stellar/Soroban StrKey secret seed (`S` + 55 base32 chars) | This is a Stellar/Soroban project (`STELLAR_IDENTITY`, `backend/src/consensus.rs`, `contracts/`); the built-in ruleset has no Stellar-specific rule. The `G...` public address form is *not* matched — it isn't a secret. |
+| `database-connection-string-with-credentials` | A `postgres(ql)/mysql/mongodb(+srv)/redis(s)://user:pass@host` URI with embedded credentials | Used for the Postgres (`rusqlite`... `docker-compose.yml`) and Redis (`redis` crate, distributed consensus cache) connections configured via `DATABASE_URL`/`REDIS_URL`. |
+| `abuseipdb-api-key` | An 80-char hex key near the word "abuseipdb" | `ABUSEIPDB_API_KEY`, consumed by `backend/src/ip_reputation.rs`'s AbuseIPDB integration (#96). |
+| `fcm-legacy-server-key` | A legacy Firebase Cloud Messaging server key (`AAAA...:...`) | `FCM_SERVER_KEY`, consumed by `backend/src/notifications.rs`'s push-notification integration. |
+
+Plus the built-in rules most relevant to this codebase:
+
+| Built-in rule | Relevant to |
+|---|---|
+| `generic-api-key` | `REMINDER_EMAIL_API_KEY`, `REMINDER_SMS_API_KEY`, `RECAPTCHA_SECRET_KEY`, `FIELD_ENCRYPTION_KEY_*`, and any other `*_KEY=`/`*_SECRET=`/`*_TOKEN=` assignment |
+| `private-key` | PEM-encoded key material (relevant given `ciborium`, `p256`, `ecdsa`, `ed25519-dalek`, and `ring` in `backend/Cargo.toml` for WebAuthn signature verification) |
+| `jwt` | Tokens issued via the `jsonwebtoken` crate (WebSocket auth) |
+
+An allowlist entry (`'''\w+_user:\w+_password@'''`) was also added for the
+intentionally simple local-dev-only Postgres credentials in
+`docker-compose.yml` (and its pre-Ethos-rename equivalent found in git
+history) — these are never used outside a developer's machine.
+
+### Fixture-based regression coverage
+
+`scripts/secret-scan-fixtures/{positive,negative}/` holds one fixture file
+per pattern above (plus `generic-api-key` and `private-key`): each positive
+fixture contains a fake-but-correctly-shaped secret that must be detected;
+each negative fixture contains a similar-looking value or empty placeholder
+that must **not** be. The **Secret Scan Fixture Coverage** CI job
+(`.github/workflows/security.yml`) runs gitleaks against every fixture file
+individually — using `scripts/secret-scan-fixtures/gitleaks-fixtures.toml`,
+which mirrors the root config minus the fixtures-path allowlist — and fails
+if a positive fixture goes undetected or a negative fixture is flagged. This
+turns "does our pattern list still catch X" into an automated regression
+check instead of a one-time manual audit.
+
+The fixtures directory itself is excluded from the repo-wide scan (see the
+`scripts/secret-scan-fixtures/positive/` path allowlist above) so the
+intentionally secret-shaped positive fixtures don't trip the main
+`secret-scan` job.
+
 ## File Reference
 
 | File | Purpose |
@@ -234,5 +288,8 @@ Secret values are redacted in CI output (`--redact` flag) so they are not visibl
 | `scripts/pre-commit-secret-scan.sh` | Pre-commit hook script |
 | `scripts/install-hooks.sh` | Installs the pre-commit hook into `.git/hooks/` |
 | `.github/workflows/ci.yml` | CI pipeline — includes the `Scan for secrets with Gitleaks` step |
+| `.github/workflows/security.yml` | Security workflow — `secret-scan` (repo-wide) and `secret-scan-fixture-coverage` (pattern regression) jobs |
+| `scripts/secret-scan-fixtures/` | Positive/negative fixtures exercising each custom + relevant built-in rule |
+| `scripts/secret-scan-fixtures/gitleaks-fixtures.toml` | gitleaks config used only for fixture-coverage testing (no fixtures-path allowlist) |
 | `.env.example` | Template for local environment variables (safe to commit) |
 | `.env` | Actual local secrets — git-ignored, never committed |

@@ -262,8 +262,12 @@ pub fn certificate_fingerprint(certificate: &str) -> String {
 pub struct SamlSecurityState {
     /// IDs of `AuthnRequest`s this SP issued and has not yet consumed.
     pub pending_requests: Mutex<HashSet<String>>,
-    /// IDs of assertions already consumed, to reject replays.
-    pub consumed_assertions: Mutex<HashSet<String>>,
+    /// IDs of assertions already consumed, mapped to the instant after which
+    /// the entry may be purged. The TTL matches the assertion's own
+    /// `NotOnOrAfter` (plus clock skew), since an assertion can never be
+    /// replayed successfully once it is outside its own validity window
+    /// anyway — keeping the entry longer would only grow this set forever.
+    pub consumed_assertions: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 /// Validate an assertion against SP configuration and request state.
@@ -311,10 +315,17 @@ pub fn validate_assertion(
         }
     }
 
+    // The TTL for the replay guard is the assertion's own validity window
+    // (widened by clock skew), so the set only ever holds entries for
+    // assertions that could plausibly still be replayed.
+    let guard_expiry = assertion.not_on_or_after.unwrap_or(now) + skew;
+
     let mut consumed = security.consumed_assertions.lock().unwrap();
-    if !consumed.insert(assertion.id.clone()) {
+    consumed.retain(|_, expiry| *expiry > now);
+    if consumed.contains_key(&assertion.id) {
         return Err(SamlError::Replayed(assertion.id.clone()));
     }
+    consumed.insert(assertion.id.clone(), guard_expiry);
 
     Ok(())
 }
@@ -816,6 +827,30 @@ mod tests {
             validate_assertion(&assertion, &config(), &security, now()),
             Err(SamlError::Replayed(_))
         ));
+    }
+
+    #[test]
+    fn validate_assertion_purges_expired_replay_guard_entries() {
+        let assertion = parse_response(&valid_response()).unwrap();
+        let security = security_with_pending("_req-1");
+        // Simulate a replay-guard entry left over from a much earlier
+        // assertion whose own validity window has since elapsed; it must not
+        // block a legitimately new assertion that happens to reuse the ID
+        // space (or, more importantly, must not accumulate unboundedly).
+        security
+            .consumed_assertions
+            .lock()
+            .unwrap()
+            .insert(assertion.id.clone(), now() - Duration::seconds(1));
+        assert_eq!(
+            validate_assertion(&assertion, &config(), &security, now()),
+            Ok(())
+        );
+        assert!(security
+            .consumed_assertions
+            .lock()
+            .unwrap()
+            .contains_key(&assertion.id));
     }
 
     #[test]
