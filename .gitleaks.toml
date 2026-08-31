@@ -1,5 +1,20 @@
 title = "Ethos-Protocol gitleaks config"
 
+# ── Coverage audit finding (#397) ──────────────────────────────────────────────
+#
+# This file previously defined only an [allowlist] with no [[rules]] and no
+# [extend] block. Per gitleaks' own semantics, a config with no [extend]
+# block does NOT fall back to the built-in ruleset — it replaces it, meaning
+# with zero [[rules]] defined, gitleaks was scanning with **zero detection
+# rules** in both CI (.github/workflows/ci.yml, .github/workflows/security.yml)
+# and the local pre-commit hook (scripts/pre-commit-secret-scan.sh): every
+# run reported "no secrets found" regardless of what was actually staged or
+# committed. `useDefault = true` below restores the ~180-rule built-in
+# ruleset (AWS, GCP, Stripe, Slack, generic API keys, PEM private keys, ...);
+# the [[rules]] further down extend it with formats specific to this repo.
+[extend]
+  useDefault = true
+
 [allowlist]
   description = "Allow test/example values and documentation placeholders"
   # gitleaks `paths` entries are regexes, not globs.
@@ -8,10 +23,58 @@ title = "Ethos-Protocol gitleaks config"
     '''README\.md$''',
     '''docs/''',
     '''mobile/''',
-    '''backend/src/websocket\.rs$'''
+    '''backend/src/websocket\.rs$''',
+    # Intentionally secret-shaped fixtures used to verify pattern coverage
+    # in CI (see scripts/secret-scan-fixtures/ and the "Secret Scan Fixture
+    # Coverage" job in .github/workflows/security.yml). These are excluded
+    # from the repo-wide scan so they don't self-trigger it; the fixture
+    # coverage job scans this directory directly with a config that does
+    # NOT carry this allowlist entry, so detection is still verified.
+    '''scripts/secret-scan-fixtures/positive/'''
   ]
   regexes = [
     "test-secret-key-for-unit-tests",
     "tok-secret",
-    "REMINDER_ENCRYPTION_SECRET="
+    "REMINDER_ENCRYPTION_SECRET=",
+    # Local-dev-only Postgres credentials in docker-compose.yml, matching the
+    # POSTGRES_USER/POSTGRES_PASSWORD set for the same file's local `db`
+    # service — not a real secret, never used outside a developer's machine.
+    # Pattern (not a literal) because this project has been renamed before
+    # (e.g. historical "ttl_user:ttl_password@" prior to the Ethos rename)
+    # and the same dev-only convention could recur under a future name.
+    '''\w+_user:\w+_password@'''
   ]
+
+# ── Project-specific secret patterns (#397) ───────────────────────────────────
+#
+# gitleaks' built-in ruleset already covers generic high-entropy API keys,
+# PEM-encoded private keys, and a long list of SaaS providers (AWS, GCP,
+# Stripe, Slack, SendGrid, ...). The rules below extend it with formats that
+# are specific to this repo's own dependencies/integrations and are NOT part
+# of the built-in ruleset. Coverage audited 2026-08-30 — see
+# docs/secret-scanning.md for the full pattern coverage table and the
+# fixtures that exercise each rule.
+
+[[rules]]
+  id = "stellar-secret-seed"
+  description = "Stellar/Soroban secret seed (StrKey 'S...' signing key — never the 'G...' public address)"
+  regex = '''\bS[A-Z2-7]{55}\b'''
+  tags = ["stellar", "soroban", "secret-key"]
+
+[[rules]]
+  id = "database-connection-string-with-credentials"
+  description = "Database/cache connection URI with an embedded username:password (Postgres, MySQL, MongoDB, Redis)"
+  regex = '''\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss)://[^\s:'"@/]+:[^\s@'"]{3,}@[^\s'"]+'''
+  tags = ["database", "connection-string"]
+
+[[rules]]
+  id = "abuseipdb-api-key"
+  description = "AbuseIPDB API key (ABUSEIPDB_API_KEY, consumed by backend/src/ip_reputation.rs)"
+  regex = '''(?i)abuseipdb[a-z0-9_ =:"'\-]{0,20}\b([a-f0-9]{80})\b'''
+  tags = ["abuseipdb", "api-key"]
+
+[[rules]]
+  id = "fcm-legacy-server-key"
+  description = "Firebase Cloud Messaging legacy server key (FCM_SERVER_KEY, consumed by backend/src/notifications.rs)"
+  regex = '''\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140,}\b'''
+  tags = ["firebase", "fcm", "api-key"]

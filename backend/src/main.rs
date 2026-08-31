@@ -12,6 +12,10 @@ use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
+    captcha::{
+        get_trusted_users_handler, post_add_trusted_user_handler, post_challenge_handler,
+        post_verify_handler,
+    },
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     // cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
@@ -32,9 +36,9 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
-    incidents::{
-        add_timeline_entry, create_incident, escalate_incident, get_incident, list_incidents,
-        update_incident_status, IncidentState,
+    ip_reputation::{
+        delete_block_rule_handler, get_block_rules_handler, get_ip_reputation_handler,
+        get_reputation_config_handler, post_block_ip_handler, post_check_handler,
     },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
@@ -46,20 +50,15 @@ use ethos_protocol_backend::{
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
-    scheduler::SchedulerContext,
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
-    token_revocation::{revoke_token, RevocationList},
     tracing_sampling::TraceSampler,
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
         WebAuthnState,
     },
-    webhook::{
-        delete_webhook, list_webhooks, register_webhook, rotate_webhook_secret, verify_webhook,
-        WebhookState,
-    },
+    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
 };
 
 #[cfg(test)]
@@ -195,30 +194,37 @@ pub fn build_router(state: AppState) -> Router {
         // ── Webhook routes (#65) ─────────────────────────────────────────────
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
-        .route("/webhooks/:id/rotate-secret", post(rotate_webhook_secret))
         .route("/webhooks/verify", post(verify_webhook))
-        // ── Incident tracking routes (#373) ───────────────────────────────────
-        .route("/incidents", post(create_incident).get(list_incidents))
-        .route("/incidents/:id", get(get_incident))
-        .route("/incidents/:id/timeline", post(add_timeline_entry))
-        .route("/incidents/:id/status", post(update_incident_status))
-        .route("/incidents/:id/escalate", post(escalate_incident))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── IP Reputation routes (#96, #393) ─────────────────────────────────
+        .route("/admin/ip-reputation", get(get_ip_reputation_handler))
+        .route("/admin/ip-reputation/block", post(post_block_ip_handler))
+        .route("/admin/ip-reputation/rules", get(get_block_rules_handler))
+        .route(
+            "/admin/ip-reputation/rules/:id",
+            delete(delete_block_rule_handler),
+        )
+        .route(
+            "/admin/ip-reputation/config",
+            get(get_reputation_config_handler),
+        )
+        .route("/ip-reputation/check", post(post_check_handler))
+        // ── CAPTCHA routes (#97, #392) ────────────────────────────────────────
+        .route("/captcha/challenge", post(post_challenge_handler))
+        .route("/captcha/verify", post(post_verify_handler))
+        .route(
+            "/admin/captcha/trusted-users",
+            get(get_trusted_users_handler).post(post_add_trusted_user_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admission_middleware,
-        ))
-        // Correlation IDs (#349): assign/propagate `X-Request-Id` for every
-        // request. Sits above admission control so even load-shed rejections
-        // carry the id, and echoes it on every response, including errors.
-        .layer(axum::middleware::from_fn(
-            ethos_protocol_backend::error_context::correlation_id_middleware,
         ))
         .layer(build_cors_layer())
         .with_state(state)
@@ -306,6 +312,11 @@ async fn main() {
         "consensus cache initialized"
     );
 
+    let scheduler_db = Arc::clone(&db);
+    tokio::spawn(async move {
+        scheduler::run(scheduler_db).await;
+    });
+
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
@@ -339,20 +350,6 @@ async fn main() {
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
 
-    let incident_state = Arc::new(IncidentState::new());
-
-    // ── Background scheduler (reminders, TTL insurance, retention, secret
-    // rotation, consensus reconciliation (#373)) ──────────────────────────
-    let scheduler_ctx = SchedulerContext {
-        db: Arc::clone(&db),
-        consensus: Arc::clone(&consensus),
-        metrics: Arc::clone(&metrics),
-        incident_state: Arc::clone(&incident_state),
-    };
-    tokio::spawn(async move {
-        scheduler::run(scheduler_ctx).await;
-    });
-
     let state = AppState {
         db: Arc::clone(&db),
         vault_store,
@@ -376,7 +373,6 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
-        incident_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
@@ -445,19 +441,12 @@ async fn main() {
         )
         .with_state(webauthn_state);
 
-    // ── Auth token revocation list (#350) ────────────────────────────────
-    let revocation_list = RevocationList::new();
-    let auth_router = Router::new()
-        .route("/auth/revoke", post(revoke_token))
-        .with_state(revocation_list);
-
     let app = build_router(state)
         // .merge(acl_router)
         // .merge(custom_metrics_router)
         // .merge(anomaly_router)
         // .merge(log_router)
-        .merge(webauthn_router)
-        .merge(auth_router);
+        .merge(webauthn_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

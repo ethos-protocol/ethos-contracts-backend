@@ -69,6 +69,16 @@ own `SamlError` variant:
 Pending request IDs and consumed assertion IDs live in `SamlSecurityState`,
 which is shared across requests through `SamlState`.
 
+### Replay protection TTL
+
+Consumed assertion IDs are kept only until their own `NotOnOrAfter` (widened
+by `clock_skew_secs`) has passed — a captured `SAMLResponse` can never be
+replayed successfully once it is outside its own validity window anyway, so
+the guard entry is purged at that point instead of being retained forever.
+This bounds the memory used by `consumed_assertions` to the set of
+assertions issued within one validity window, rather than growing without
+limit for the lifetime of the process.
+
 ### Signature verification scope
 
 The signature check pins the signing certificate; it does not perform

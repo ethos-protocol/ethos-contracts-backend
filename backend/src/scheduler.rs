@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,43 +5,20 @@ use chrono::Utc;
 
 use crate::{db::Db, models::Frequency};
 
-/// Dependencies the background scheduler needs to run all of its periodic
-/// jobs. Grouped into one struct (rather than many `run(...)` parameters)
-/// since the job list has grown from "poll reminder preferences" into a
-/// handful of unrelated periodic checks that each need their own slice of
-/// shared state.
-pub struct SchedulerContext {
-    pub db: Arc<Db>,
-    /// Distributed cache consensus checker (#373).
-    pub consensus: Arc<crate::consensus::NodeCache>,
-    /// Prometheus-style counters exposed at `/metrics`.
-    pub metrics: Arc<crate::metrics::Metrics>,
-    /// Shared incident store: consensus conflicts detected by the scheduled
-    /// job are opened here the same way a manually-filed incident would be.
-    pub incident_state: Arc<crate::incidents::IncidentState>,
-}
-
 /// Polls preferences every minute and fires reminders for vaults whose TTL
 /// is within the user-configured window.
 ///
 /// In production, replace `fetch_ttl_remaining` with a real Stellar RPC call
 /// and `send_reminder` with actual email/SMS/push dispatch.
-pub async fn run(ctx: SchedulerContext) {
-    let SchedulerContext {
-        db,
-        consensus,
-        metrics,
-        incident_state,
-    } = ctx;
-
+pub async fn run(db: Arc<Db>) {
     // Seed default secret rotation policies on startup.
     crate::secret_rotation::seed_default_policies(&db);
 
     let mut interval = tokio::time::interval(Duration::from_mins(1));
-    // Track when we last ran the daily/hourly/periodic tasks.
+    // Track when we last ran the daily/hourly tasks.
     let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
     let mut last_rotation_check = chrono::DateTime::<Utc>::MIN_UTC;
-    let mut last_consensus_check = chrono::DateTime::<Utc>::MIN_UTC;
+    let mut last_encryption_backfill = chrono::DateTime::<Utc>::MIN_UTC;
 
     loop {
         interval.tick().await;
@@ -134,14 +110,63 @@ pub async fn run(ctx: SchedulerContext) {
             last_rotation_check = now;
         }
 
-        // 5) Distributed cache consensus reconciliation (#373; runs at most
-        //    once every 5 minutes — cache drift needs tighter reconciliation
-        //    than the once-a-day/hour housekeeping jobs above).
-        if now.signed_duration_since(last_consensus_check).num_minutes() >= 5 {
-            run_consensus_check(&consensus, &metrics, &incident_state);
-            last_consensus_check = now;
+        // 5) Encryption key rotation backfill (runs at most once every hour).
+        if now.signed_duration_since(last_encryption_backfill).num_minutes() >= 60 {
+            run_encryption_backfill_job().await;
+            last_encryption_backfill = now;
         }
     }
+}
+
+// ── #390: Field Encryption Key Rotation Backfill Job ─────────────────────────
+
+/// Run the periodic encryption key rotation backfill.
+///
+/// In a real deployment this would page through the tables listed in
+/// `encryption::SENSITIVE_FIELDS`, decode each stored `EncryptedField`, and
+/// feed them through `encryption::run_backfill`, persisting its cursor
+/// between runs so an interruption resumes instead of rescanning from the
+/// start. Reading and writing those columns as `EncryptedField` JSON is not
+/// wired up yet (see `docs/encrypted-field-storage.md`), so this currently
+/// runs the job over an empty record set purely to exercise the scheduling
+/// path; `encryption::run_backfill_batch` and `encryption::run_backfill`
+/// carry the real batching, rate-limiting, and resumability logic and are
+/// covered directly by tests in `backend/src/encryption.rs`.
+async fn run_encryption_backfill_job() {
+    use crate::encryption::{BackfillCursor, FieldEncryptionEngine};
+
+    let engine = match FieldEncryptionEngine::from_env() {
+        Ok(engine) => engine,
+        Err(e) => {
+            tracing::error!(error = %e, "encryption_backfill: failed to load encryption engine");
+            return;
+        }
+    };
+
+    let placeholder_records: Vec<crate::encryption::BackfillRecord> = vec![];
+    let summary = crate::encryption::run_backfill(
+        &engine,
+        &placeholder_records,
+        BackfillCursor::default(),
+        /* batch_size */ 200,
+        Duration::from_secs(1),
+        |batch| {
+            tracing::debug!(
+                updated = batch.updated.len(),
+                skipped = batch.skipped_already_current,
+                failed = batch.failed.len(),
+                "encryption_backfill: batch processed"
+            );
+        },
+    )
+    .await;
+
+    tracing::info!(
+        updated = summary.total_updated,
+        skipped = summary.total_skipped,
+        failed = summary.total_failed,
+        "encryption_backfill: job completed"
+    );
 }
 
 fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
@@ -221,7 +246,6 @@ fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_left: u3
 /// storage and validate each one.  Here we log a scheduled-run notice and
 /// simulate a trivial no-op validation so the job framework is exercised
 /// without requiring an external storage integration.
-#[allow(dead_code)]
 fn run_backup_validation_job() {
     use crate::backup_validation::BackupValidator;
     use chrono::Utc;
@@ -265,7 +289,7 @@ fn run_backup_validation_job() {
 // ── #83: Consistency Check Job ───────────────────────────────────────────────
 
 /// Run the periodic data consistency verification job.
-pub fn run_consistency_check(db: &Arc<Db>) {
+fn run_consistency_check(db: &Arc<Db>) {
     use crate::consistency::ConsistencyChecker;
 
     tracing::info!("consistency check job started");
@@ -307,135 +331,4 @@ pub fn run_consistency_check(db: &Arc<Db>) {
         failed = report.failed_checks,
         "consistency check job completed"
     );
-}
-
-// ── #373: Consensus Reconciliation Job ───────────────────────────────────────
-
-/// Run the periodic distributed-cache consensus reconciliation job.
-///
-/// Compares this node's local cache against the shared `InMemoryBackend` /
-/// `RedisBackend` (see `consensus.rs`), publishes the result as metrics, and
-/// — when conflicts are found — opens an incident so operators are notified
-/// even if nobody is actively watching `/health/consensus` or `/metrics`.
-fn run_consensus_check(
-    consensus: &Arc<crate::consensus::NodeCache>,
-    metrics: &Arc<crate::metrics::Metrics>,
-    incident_state: &Arc<crate::incidents::IncidentState>,
-) {
-    tracing::info!("consensus reconciliation job started");
-
-    let report = match consensus.check_and_resolve() {
-        Ok(report) => report,
-        Err(e) => {
-            tracing::error!(error = %e, "consensus reconciliation job failed to run");
-            return;
-        }
-    };
-
-    metrics.consensus_checks_total.fetch_add(1, Ordering::Relaxed);
-    metrics
-        .consensus_conflicts_total
-        .fetch_add(report.conflicts.len() as u64, Ordering::Relaxed);
-    metrics
-        .consensus_consistent
-        .store(u64::from(report.consistent), Ordering::Relaxed);
-
-    if report.consistent {
-        tracing::info!(
-            node_id = %report.node_id,
-            keys_checked = report.keys_checked,
-            "consensus reconciliation job completed: cache consistent"
-        );
-        return;
-    }
-
-    tracing::warn!(
-        node_id = %report.node_id,
-        conflicts = report.conflicts.len(),
-        conflicts_resolved = report.conflicts_resolved,
-        keys_checked = report.keys_checked,
-        "consensus reconciliation job detected conflicts"
-    );
-
-    let conflicted_keys: Vec<&str> = report.conflicts.iter().map(|c| c.key.as_str()).collect();
-    crate::incidents::open_incident(
-        &incident_state.store,
-        "Distributed cache consensus conflict detected",
-        format!(
-            "Node '{}' found {} conflicting key(s) between its local cache and the distributed \
-             backend during scheduled reconciliation (strategy: {:?}). {} conflict(s) were \
-             auto-resolved. Affected keys: {}",
-            report.node_id,
-            report.conflicts.len(),
-            report.strategy,
-            report.conflicts_resolved,
-            conflicted_keys.join(", "),
-        ),
-        crate::incidents::IncidentSeverity::Sev3,
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::consensus::{CacheBackend, CacheEntry, ConflictStrategy, InMemoryBackend, NodeCache};
-    use crate::incidents::{create_incident_store, IncidentState};
-    use crate::metrics::Metrics;
-    use chrono::TimeZone;
-
-    #[test]
-    fn consensus_check_opens_incident_and_updates_metrics_on_conflict() {
-        let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
-        let consensus = Arc::new(NodeCache::new(
-            "test-node",
-            Arc::clone(&backend),
-            ConflictStrategy::LastWriteWins,
-        ));
-        consensus.put("vault:1", "authoritative").unwrap();
-        consensus.set_local_entry(CacheEntry {
-            key: "vault:1".to_string(),
-            value: "stale".to_string(),
-            node_id: "test-node".to_string(),
-            updated_at: chrono::Utc.timestamp_millis_opt(1).unwrap(),
-            version: 1,
-        });
-
-        let metrics = Metrics::new();
-        let incident_state = Arc::new(IncidentState {
-            store: create_incident_store(),
-        });
-
-        run_consensus_check(&consensus, &metrics, &incident_state);
-
-        assert_eq!(metrics.consensus_checks_total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.consensus_conflicts_total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.consensus_consistent.load(Ordering::Relaxed), 0);
-
-        let incidents = incident_state.store.lock().unwrap();
-        assert_eq!(incidents.len(), 1);
-        let incident = incidents.values().next().unwrap();
-        assert!(incident.description.contains("vault:1"));
-    }
-
-    #[test]
-    fn consensus_check_does_not_open_incident_when_consistent() {
-        let backend: Arc<dyn CacheBackend> = Arc::new(InMemoryBackend::new());
-        let consensus = Arc::new(NodeCache::new(
-            "test-node",
-            backend,
-            ConflictStrategy::LastWriteWins,
-        ));
-        consensus.put("vault:2", "value").unwrap();
-
-        let metrics = Metrics::new();
-        let incident_state = Arc::new(IncidentState {
-            store: create_incident_store(),
-        });
-
-        run_consensus_check(&consensus, &metrics, &incident_state);
-
-        assert_eq!(metrics.consensus_consistent.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.consensus_conflicts_total.load(Ordering::Relaxed), 0);
-        assert!(incident_state.store.lock().unwrap().is_empty());
-    }
 }
