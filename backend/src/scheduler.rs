@@ -221,6 +221,7 @@ fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_left: u3
 /// storage and validate each one.  Here we log a scheduled-run notice and
 /// simulate a trivial no-op validation so the job framework is exercised
 /// without requiring an external storage integration.
+#[allow(dead_code)]
 fn run_backup_validation_job() {
     use crate::backup_validation::BackupValidator;
     use chrono::Utc;
@@ -264,7 +265,7 @@ fn run_backup_validation_job() {
 // ── #83: Consistency Check Job ───────────────────────────────────────────────
 
 /// Run the periodic data consistency verification job.
-fn run_consistency_check(db: &Arc<Db>) {
+pub fn run_consistency_check(db: &Arc<Db>) {
     use crate::consistency::ConsistencyChecker;
 
     tracing::info!("consistency check job started");
