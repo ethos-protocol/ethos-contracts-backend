@@ -1143,6 +1143,20 @@ impl Db {
                 );
                 ",
             ),
+            (
+                "16",
+                r"
+                -- #389: 2FA backup codes, stored as SHA-256 digests so a
+                -- code can be checked and invalidated without ever
+                -- persisting it in recoverable form.
+                ALTER TABLE two_factor_config ADD COLUMN backup_codes TEXT NOT NULL DEFAULT '[]';
+
+                -- #391: the grace period for a secret rotation must exceed
+                -- the maximum lifetime of sessions/tokens issued with that
+                -- secret, or a rotation can invalidate a session mid-use.
+                ALTER TABLE secret_rotation_policies ADD COLUMN max_token_lifetime_hours INTEGER NOT NULL DEFAULT 0;
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1583,11 +1597,12 @@ impl Db {
         let enabled_i = i64::from(config.enabled);
         let verified_at = config.verified_at.map(|d| d.to_rfc3339());
         let method_str = serde_json::to_string(&config.method).unwrap();
+        let backup_codes_json = serde_json::to_string(&config.backup_codes).unwrap();
 
         self.conn.lock().unwrap().execute(
             r"
-            INSERT INTO two_factor_config (vault_id, method, enabled, secret, phone, email, created_at, verified_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            INSERT INTO two_factor_config (vault_id, method, enabled, secret, phone, email, created_at, verified_at, backup_codes)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(vault_id) DO UPDATE SET
                 method = excluded.method,
                 enabled = excluded.enabled,
@@ -1595,7 +1610,8 @@ impl Db {
                 phone = excluded.phone,
                 email = excluded.email,
                 created_at = excluded.created_at,
-                verified_at = excluded.verified_at
+                verified_at = excluded.verified_at,
+                backup_codes = excluded.backup_codes
             ",
             params![
                 config.vault_id,
@@ -1606,6 +1622,7 @@ impl Db {
                 config.email,
                 config.created_at.to_rfc3339(),
                 verified_at,
+                backup_codes_json,
             ],
         )?;
         Ok(())
@@ -1618,7 +1635,7 @@ impl Db {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             r"
-            SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at
+            SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at, backup_codes
             FROM two_factor_config
             WHERE vault_id = ?1
             ",
@@ -1650,6 +1667,9 @@ impl Db {
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             });
+            let backup_codes_str: String = r.get(8)?;
+            let backup_codes: Vec<String> =
+                serde_json::from_str(&backup_codes_str).unwrap_or_default();
 
             Ok(TwoFactorConfig {
                 vault_id: r.get(0)?,
@@ -1660,6 +1680,7 @@ impl Db {
                 email: r.get(5)?,
                 created_at,
                 verified_at,
+                backup_codes,
             })
         });
 
@@ -2542,19 +2563,21 @@ impl Db {
         let channels_json = serde_json::to_string(&policy.notify_channels).unwrap();
         self.conn.lock().unwrap().execute(
             r"INSERT INTO secret_rotation_policies
-                (secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
-                 notify_channels, created_at, updated_at)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (secret_type, rotation_interval_days, grace_period_hours, max_token_lifetime_hours,
+                 auto_rotate, notify_channels, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
               ON CONFLICT(secret_type) DO UPDATE SET
-                rotation_interval_days = excluded.rotation_interval_days,
-                grace_period_hours     = excluded.grace_period_hours,
-                auto_rotate            = excluded.auto_rotate,
-                notify_channels        = excluded.notify_channels,
-                updated_at             = excluded.updated_at",
+                rotation_interval_days   = excluded.rotation_interval_days,
+                grace_period_hours       = excluded.grace_period_hours,
+                max_token_lifetime_hours = excluded.max_token_lifetime_hours,
+                auto_rotate              = excluded.auto_rotate,
+                notify_channels          = excluded.notify_channels,
+                updated_at               = excluded.updated_at",
             params![
                 secret_type,
                 policy.rotation_interval_days as i64,
                 policy.grace_period_hours as i64,
+                policy.max_token_lifetime_hours as i64,
                 if policy.auto_rotate { 1i64 } else { 0i64 },
                 channels_json,
                 policy.created_at.to_rfc3339(),
@@ -2573,7 +2596,7 @@ impl Db {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
-                     notify_channels, created_at, updated_at
+                     notify_channels, created_at, updated_at, max_token_lifetime_hours
                FROM secret_rotation_policies WHERE secret_type = ?1",
         )?;
         match stmt.query_row(params![secret_type_str], |r| {
@@ -2592,7 +2615,7 @@ impl Db {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
-                     notify_channels, created_at, updated_at
+                     notify_channels, created_at, updated_at, max_token_lifetime_hours
                FROM secret_rotation_policies ORDER BY secret_type",
         )?;
         let iter = stmt.query_map([], |r| Self::row_to_rotation_policy(r))?;
@@ -2620,10 +2643,12 @@ impl Db {
         let notify_channels: Vec<String> = serde_json::from_str(&channels_str).unwrap_or_default();
         let created_at = Self::parse_rfc3339_col(r, 5)?;
         let updated_at = Self::parse_rfc3339_col(r, 6)?;
+        let max_token_lifetime_hours: i64 = r.get(7)?;
         Ok(crate::models::SecretRotationPolicy {
             secret_type,
             rotation_interval_days: r.get::<_, i64>(1)? as u32,
             grace_period_hours: r.get::<_, i64>(2)? as u32,
+            max_token_lifetime_hours: max_token_lifetime_hours as u32,
             auto_rotate: auto_rotate_i != 0,
             notify_channels,
             created_at,

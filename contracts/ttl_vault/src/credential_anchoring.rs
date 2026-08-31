@@ -48,6 +48,12 @@ pub const MAX_SYSTEM_LEN: u32 = 64;
 /// Maximum length (bytes) of the `external_id` value.
 pub const MAX_EXTERNAL_ID_LEN: u32 = 256;
 
+/// Default freshness window (seconds) applied to anchoring proofs when the
+/// registry has no explicit `max_proof_age_seconds` configured (Issue #346).
+/// One hour — long enough to tolerate clock skew and submission latency,
+/// short enough that a superseded credential state cannot be anchored.
+pub const DEFAULT_MAX_PROOF_AGE_SECONDS: u64 = 3_600;
+
 // ── Event topics ─────────────────────────────────────────────────────────────
 
 pub const ANCHOR_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("anc_crt");
@@ -66,6 +72,8 @@ pub enum AnchorKey {
     ReverseAnchor(Bytes),
     /// Total number of anchors ever created (monotonic counter).
     AnchorCount,
+    /// Issue #346: configured maximum age (seconds) for anchoring proofs.
+    MaxProofAgeSeconds,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -111,6 +119,52 @@ fn composite_key(env: &Env, external_id: &Bytes, system: &Bytes) -> Bytes {
     key.append(external_id);
     key.append(system);
     key
+}
+
+// ── Proof freshness configuration (Issue #346) ───────────────────────────────
+
+/// Set the maximum age (in seconds) an anchoring proof may have, measured from
+/// its `proof_timestamp` to the current ledger time. A value of `0` disables
+/// the freshness requirement. Auth for this governance setting is enforced by
+/// the outer wrapper in `lib.rs`.
+pub fn set_max_proof_age(env: &Env, max_age_seconds: u64) {
+    env.storage()
+        .persistent()
+        .set(&AnchorKey::MaxProofAgeSeconds, &max_age_seconds);
+    env.storage().persistent().extend_ttl(
+        &AnchorKey::MaxProofAgeSeconds,
+        crate::VAULT_TTL_THRESHOLD,
+        crate::VAULT_TTL_LEDGERS,
+    );
+}
+
+/// The configured maximum proof age in seconds, or
+/// [`DEFAULT_MAX_PROOF_AGE_SECONDS`] if none has been set.
+pub fn max_proof_age_seconds(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<AnchorKey, u64>(&AnchorKey::MaxProofAgeSeconds)
+        .unwrap_or(DEFAULT_MAX_PROOF_AGE_SECONDS)
+}
+
+/// Returns `true` if a proof stamped at `proof_timestamp` is still fresh enough
+/// to anchor at the current ledger time.
+///
+/// A proof is rejected when it is older than the configured window, or when it
+/// is dated in the future (beyond a one-window skew tolerance). A configured
+/// window of `0` accepts any non-future timestamp.
+pub fn proof_is_fresh(env: &Env, proof_timestamp: u64) -> bool {
+    let now = env.ledger().timestamp();
+    let max_age = max_proof_age_seconds(env);
+
+    // Reject clearly future-dated proofs (allow up to one window of skew).
+    if proof_timestamp > now.saturating_add(max_age) {
+        return false;
+    }
+    if max_age == 0 {
+        return true;
+    }
+    now.saturating_sub(proof_timestamp) <= max_age
 }
 
 // ── Core functions ────────────────────────────────────────────────────────────
@@ -197,6 +251,27 @@ pub fn create_credential_anchor(
     );
 
     true
+}
+
+/// Anchor `credential_id` while enforcing the proof-freshness requirement
+/// (Issue #346).
+///
+/// `proof_timestamp` is the time the off-chain anchoring proof was produced.
+/// The call is rejected (returns `false`) when that proof is older than the
+/// configured `max_proof_age_seconds` window, preventing stale or superseded
+/// credential states from being anchored. On a fresh proof this behaves
+/// exactly like [`create_credential_anchor`].
+pub fn anchor_credential(
+    env: &Env,
+    credential_id: u64,
+    external_id: Bytes,
+    system: Bytes,
+    proof_timestamp: u64,
+) -> bool {
+    if !proof_is_fresh(env, proof_timestamp) {
+        return false;
+    }
+    create_credential_anchor(env, credential_id, external_id, system)
 }
 
 /// Remove the anchor for `(external_id, system)` from `credential_id`.

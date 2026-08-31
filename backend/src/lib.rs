@@ -6,8 +6,12 @@ pub mod batch_conditional_completion;
 pub mod batching;
 pub mod bulkhead;
 pub mod cache;
+<<<<<<< HEAD
+pub mod cache_recovery;
+=======
 pub mod cache_partition;
 pub mod cdc_lag;
+>>>>>>> origin/main
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;

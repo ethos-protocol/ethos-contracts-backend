@@ -36,6 +36,9 @@ pub const RECOVERY_CODE_COUNT: u32 = 5;
 pub const RECOVERY_MAX_ATTEMPTS: u32 = 5;
 pub const RECOVERY_ATTEMPT_WINDOW_SECONDS: u64 = 3600;
 
+/// A whole share of ownership, expressed in basis points (10_000 = 100%).
+const TOTAL_BASIS_POINTS: u64 = 10_000;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -179,7 +182,7 @@ pub struct DelegationHistoryEntry {
 pub struct FractionalOwnership {
     pub sbt_id: u64,
     pub holders: Vec<Address>,
-    pub fractions: Vec<u64>, // Each fraction is in basis points (0-10000), sum = 10000
+    pub fractions: Vec<u64>, // Each fraction is in basis points (0-10000), sum = 10_000
     pub created_at: u64,
 }
 
@@ -433,7 +436,7 @@ impl SbtContract {
         for fraction in fractions.iter() {
             total = total.saturating_add(*fraction);
         }
-        if total != 10000 {
+        if total != TOTAL_BASIS_POINTS {
             panic_with_error!(&env, SbtError::InvalidFractionSum);
         }
 
@@ -1124,10 +1127,44 @@ impl SbtContract {
     }
 
     fn push_ownership_history(env: &Env, sbt_id: u64, entry: OwnershipHistoryEntry) {
+        if let Err(err) = Self::try_push_ownership_history(env, sbt_id, entry) {
+            panic_with_error!(env, err);
+        }
+    }
+
+    /// Non-panicking variant of [`push_ownership_history`]. Returns
+    /// `InvalidFractionSum` instead of aborting when the shares recorded
+    /// across a token's history would exceed 100% (`TOTAL_BASIS_POINTS`),
+    /// and commits nothing in that case. Used by tests to assert that
+    /// over-allocation leaves the history untouched.
+    fn try_push_ownership_history(
+        env: &Env,
+        sbt_id: u64,
+        entry: OwnershipHistoryEntry,
+    ) -> Result<(), SbtError> {
         let mut history = Self::load_ownership_history(env, sbt_id);
+
+        // Guard against over-allocation: the sum of shares recorded across all
+        // history rows for a token must never exceed 100% (TOTAL_BASIS_POINTS).
+        // Creation seeds the history with rows summing to exactly 10_000 bps;
+        // any sequence that would push the recorded total above that is
+        // malformed and rejected before a single row is written.
+        let mut total: u64 = 0;
+        for existing in history.iter() {
+            total = total.saturating_add(existing.fraction);
+            if total > TOTAL_BASIS_POINTS {
+                return Err(SbtError::InvalidFractionSum);
+            }
+        }
+        total = total.saturating_add(entry.fraction);
+        if total > TOTAL_BASIS_POINTS {
+            return Err(SbtError::InvalidFractionSum);
+        }
+
         history.push_back(entry);
         env.storage()
             .instance()
             .set(&DataKey::OwnershipHistory(sbt_id), &history);
+        Ok(())
     }
 }

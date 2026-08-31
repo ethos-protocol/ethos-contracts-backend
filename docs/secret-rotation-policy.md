@@ -6,14 +6,19 @@ usable only until it is rotated out and the grace period expires.
 
 ## Secret types and default schedules
 
-| Secret type           | Rotation interval | Grace period | Auto-rotate |
-|-----------------------|-------------------|--------------|-------------|
-| `api_key`             | 90 days           | 24 hours     | disabled    |
-| `database_password`   | 30 days           | 2 hours      | disabled    |
-| `encryption_key`      | 365 days          | 48 hours     | disabled    |
-| `jwt_secret`          | 30 days           | 1 hour       | disabled    |
-| `webhook_secret`      | 90 days           | 24 hours     | disabled    |
-| `reminders_api_key`   | 90 days           | 24 hours     | disabled    |
+| Secret type           | Rotation interval | Grace period | Max token lifetime | Auto-rotate |
+|-----------------------|-------------------|--------------|---------------------|-------------|
+| `api_key`             | 90 days           | 24 hours     | 0 (n/a)             | disabled    |
+| `database_password`   | 30 days           | 2 hours      | 0 (n/a)             | disabled    |
+| `encryption_key`      | 365 days          | 48 hours     | 0 (n/a)             | disabled    |
+| `jwt_secret`          | 30 days           | 192 hours    | 168 hours           | disabled    |
+| `webhook_secret`      | 90 days           | 24 hours     | 0 (n/a)             | disabled    |
+| `reminders_api_key`   | 90 days           | 24 hours     | 0 (n/a)             | disabled    |
+
+`jwt_secret`'s grace period is 192 hours, not the 24 hours you might expect
+from the other types — see
+[Grace period vs. token lifetime](#grace-period-vs-token-lifetime) below for
+why.
 
 Default policies are seeded automatically on first startup.  They can be
 overridden via the REST API.
@@ -26,6 +31,26 @@ to drain before the old value is invalidated.
 
 The grace period start and end time are recorded in `secret_rotation_logs`
 so operators can see exactly when a period is active.
+
+## Grace period vs. token lifetime
+
+Each policy also carries `max_token_lifetime_hours`: the longest-lived
+session or token ever issued using that secret. `grace_period_hours` **must
+exceed** `max_token_lifetime_hours` — otherwise a token minted just before
+rotation could still be in active use after the old secret is fully
+invalidated, forcing a valid session to re-authenticate mid-use.
+
+`PUT /api/secret-rotation/policies/:secret_type` rejects any configuration
+that violates this invariant (`validate_grace_period_overlap` in
+`backend/src/secret_rotation.rs`), and `seed_default_policies` refuses to
+seed a default that would violate it. `jwt_secret` is the type this matters
+for in practice: JWTs signed with it live for up to 168 hours (see
+`DEFAULT_TOKEN_EXPIRY_SECONDS` in `backend/src/handlers.rs`), so its default
+grace period is 192 hours rather than the original 1 hour.
+
+Secret types with no associated session concept (e.g. `database_password`,
+`encryption_key`) default `max_token_lifetime_hours` to `0`, so any positive
+grace period satisfies the invariant.
 
 ## Rotation process
 
@@ -91,10 +116,14 @@ PUT  /api/secret-rotation/policies/:secret_type     — upsert (admin)
 {
   "rotation_interval_days": 90,
   "grace_period_hours": 24,
+  "max_token_lifetime_hours": 0,
   "auto_rotate": false,
   "notify_channels": ["log"]
 }
 ```
+
+`max_token_lifetime_hours` defaults to the existing policy's value (or `0`
+for a brand-new policy) when omitted. `grace_period_hours` must exceed it.
 
 ### Status
 

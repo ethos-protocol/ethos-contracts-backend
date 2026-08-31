@@ -275,4 +275,129 @@ mod tests {
         assert!(!store.remove_rule("does-not-exist", None));
         assert!(store.audit_trail().is_empty());
     }
+
+    // ── Permission inheritance / resolution-order tests (#399) ─────────────
+    //
+    // The ACL resolution order is:
+    //   1. Collect all rules whose subject/resource/action globs match the
+    //      request.
+    //   2. If ANY matching rule has effect=Deny → DENY (deny always wins).
+    //   3. Otherwise → ALLOW (or default-allow when no rules match at all).
+    //
+    // "Inheritance" in this codebase is modelled via wildcard subjects:
+    //   - A rule with subject="*" applies to every principal (base/parent role).
+    //   - A rule with subject="alice" applies only to alice (specific override).
+    //   - A deny on a more-specific subject overrides a wildcard allow, and
+    //     vice-versa (a wildcard deny overrides a specific allow).
+    //
+    // This mirrors a two-level inheritance chain:
+    //   parent role  → wildcard rule  ("*")
+    //   child role   → subject rule   ("alice")
+
+    /// A global allow ("*") combined with a per-user deny: deny wins.
+    /// This exercises the "explicit deny always overrides inherited allow" rule.
+    #[test]
+    fn explicit_deny_overrides_inherited_wildcard_allow() {
+        let store = AclStore::default();
+        // Parent / inherited allow: everyone may GET /api/reports
+        store.add_rule(rule_req("*", "/api/reports", "GET", AclEffect::Allow));
+        // Per-user deny for alice on the same resource
+        store.add_rule(rule_req("alice", "/api/reports", "GET", AclEffect::Deny));
+
+        // alice's explicit deny overrides the wildcard allow
+        assert!(!store.is_allowed("alice", "/api/reports", "GET"));
+        // bob only has the wildcard allow — should be permitted
+        assert!(store.is_allowed("bob", "/api/reports", "GET"));
+    }
+
+    /// A per-user allow does NOT save a principal when a wildcard deny is present.
+    /// A global deny ("*") cannot be escaped by a subject-specific allow.
+    #[test]
+    fn wildcard_deny_overrides_specific_subject_allow() {
+        let store = AclStore::default();
+        // Global deny: nobody may DELETE /api/vaults
+        store.add_rule(rule_req("*", "/api/vaults", "DELETE", AclEffect::Deny));
+        // Per-user allow: alice explicitly granted DELETE
+        store.add_rule(rule_req("alice", "/api/vaults", "DELETE", AclEffect::Allow));
+
+        // Global deny wins even though alice has a specific allow
+        assert!(!store.is_allowed("alice", "/api/vaults", "DELETE"));
+        assert!(!store.is_allowed("bob", "/api/vaults", "DELETE"));
+    }
+
+    /// Two-level inheritance chain:
+    ///   Level 1 (grandparent): wildcard allow for everything
+    ///   Level 2 (parent role): wildcard deny for admin area
+    ///   Level 3 (child role / specific user): explicit allow for one admin path
+    ///
+    /// Expected: deny at level 2 still wins for alice; bob is also denied.
+    #[test]
+    fn two_level_inheritance_deny_beats_allow_at_every_level() {
+        let store = AclStore::default();
+        // Level 1 – everyone may access everything
+        store.add_rule(rule_req("*", "/", "GET", AclEffect::Allow));
+        // Level 2 – no one may access /api/admin
+        store.add_rule(rule_req("*", "/api/admin", "*", AclEffect::Deny));
+        // Level 3 – alice has a targeted allow on /api/admin/users
+        store.add_rule(rule_req(
+            "alice",
+            "/api/admin/users",
+            "GET",
+            AclEffect::Allow,
+        ));
+
+        // Level-2 wildcard deny covers /api/admin/* via prefix matching → alice
+        // is still denied even with the level-3 allow.
+        assert!(!store.is_allowed("alice", "/api/admin/users", "GET"));
+        assert!(!store.is_allowed("bob", "/api/admin/users", "GET"));
+        // Paths outside /api/admin are unaffected by the level-2 deny
+        assert!(store.is_allowed("alice", "/api/vaults", "GET"));
+    }
+
+    /// A role with zero assigned rules falls back to the default-allow behaviour.
+    #[test]
+    fn role_with_no_assigned_rules_defaults_to_allow() {
+        let store = AclStore::default();
+        // Add some rules for other subjects — carol has none
+        store.add_rule(rule_req("alice", "/api/admin", "*", AclEffect::Deny));
+        store.add_rule(rule_req("bob", "/api/reports", "GET", AclEffect::Allow));
+
+        // carol has no rules at all → default allow
+        assert!(store.is_allowed("carol", "/api/vaults", "GET"));
+        assert!(store.is_allowed("carol", "/api/admin", "POST"));
+        assert!(store.is_allowed("carol", "/api/reports", "DELETE"));
+    }
+
+    /// Three-level wildcard inheritance:
+    ///   - Action wildcard ("*") on the parent covers all methods.
+    ///   - Resource wildcard ("*") on the grandparent covers all resources.
+    ///   - Subject wildcard ("*") on the root covers all principals.
+    /// Confirms that a deny propagates correctly through all three wildcard
+    /// dimensions simultaneously.
+    #[test]
+    fn three_level_wildcard_deny_blocks_all_principals_resources_actions() {
+        let store = AclStore::default();
+        // One absolute deny rule
+        store.add_rule(rule_req("*", "*", "*", AclEffect::Deny));
+
+        assert!(!store.is_allowed("anyone", "/any/path", "GET"));
+        assert!(!store.is_allowed("anyone", "/any/path", "POST"));
+        assert!(!store.is_allowed("root", "/api/admin", "DELETE"));
+    }
+
+    /// Removing a deny rule that was "inherited" (wildcard) immediately
+    /// restores access for all principals.
+    #[test]
+    fn removing_inherited_deny_restores_access_for_all_principals() {
+        let store = AclStore::default();
+        let deny = store.add_rule(rule_req("*", "/api/beta", "*", AclEffect::Deny));
+
+        assert!(!store.is_allowed("alice", "/api/beta/feature", "GET"));
+        assert!(!store.is_allowed("bob", "/api/beta/feature", "GET"));
+
+        store.remove_rule(&deny.id, Some("admin".to_string()));
+
+        assert!(store.is_allowed("alice", "/api/beta/feature", "GET"));
+        assert!(store.is_allowed("bob", "/api/beta/feature", "GET"));
+    }
 }

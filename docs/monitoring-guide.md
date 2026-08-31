@@ -1,158 +1,94 @@
-# Monitoring & Alerting Guide
+# Monitoring Guide
 
-This guide covers setting up Prometheus metrics collection and Grafana dashboards for Ethos-Protocol.
+This guide ties together contract health, API availability, and error-rate
+monitoring across `backend/src/metrics.rs`, `backend/src/custom_metrics.rs`,
+and the on-chain `ttl_vault` event streams, so operators can detect issues
+before users report them.
 
-## Overview
+## Architecture
 
-The backend exposes a `/metrics` endpoint in Prometheus text format. Grafana scrapes this to power dashboards and alerting rules.
+```
+ ttl_vault contract events ──> event indexer ──> /metrics (Prometheus text)
+ backend API (metrics.rs, custom_metrics.rs) ──> /metrics (Prometheus text)
+                                                        │
+                                                        ▼
+                                                  Prometheus
+                                                 (monitoring/prometheus.yml)
+                                                        │
+                                            ┌───────────┴───────────┐
+                                            ▼                       ▼
+                                        Grafana                Alertmanager
+                                  (monitoring/grafana-*.json)  (monitoring/alert_rules.yml)
+```
 
-## Metrics Exposed
+## 1. Prometheus metrics collection
 
-| Metric | Type | Description |
+The backend exposes metrics in Prometheus text-exposition format via the
+`Metrics::render()` / custom metrics registry in `backend/src/metrics.rs` and
+`backend/src/custom_metrics.rs`. Key series:
+
+| Metric | Source | Meaning |
 |---|---|---|
-| `ethos_protocol_vaults_total` | Counter | Total vaults created |
-| `ethos_protocol_checkins_total` | Counter | Total check-ins performed |
-| `ethos_protocol_releases_total` | Counter | Total vault releases triggered |
-| `ethos_protocol_active_vaults` | Gauge | Currently active (non-released) vaults |
-| `ethos_protocol_request_errors_total` | Counter | Total API errors by endpoint |
-| `ethos_protocol_contract_paused` | Gauge | 1 if contract is paused, 0 otherwise |
-| `ethos_protocol_http_requests_total` | Counter | HTTP requests by method, path, status |
-| `ethos_protocol_http_request_duration_seconds` | Histogram | HTTP request latency |
-| `ethos_protocol_load_shedding_inflight` | Gauge | Current in-flight request count ([load shedding](./load-shedding.md)) |
-| `ethos_protocol_load_shedding_shed_total` | Counter | Requests shed due to overload |
-| `ethos_protocol_batch_current_size` | Gauge | Current [adaptive batch](./adaptive-batching.md) size |
-| `ethos_protocol_scaling_recommended_replicas` | Gauge | [Predictive scaling](./predictive-scaling.md) replica recommendation |
+| `ethos_protocol_vaults_total` | metrics.rs | Counter of vaults created |
+| `ethos_protocol_checkins_total` | metrics.rs | Counter of check-ins |
+| `ethos_protocol_releases_total` | metrics.rs | Counter of vault releases |
+| `ethos_protocol_active_vaults` | metrics.rs | Gauge of currently active vaults |
+| `ethos_protocol_request_errors_total` | metrics.rs | Counter of API request errors |
+| `ethos_protocol_http_requests_total` | metrics.rs | Counter of all API requests |
+| `ethos_protocol_contract_paused` | metrics.rs | Gauge, 1 if contract is paused |
+| `ethos_protocol_credential_lifecycle_transitions_total` | custom_metrics.rs | Counter of credential lifecycle state transitions |
+| `ethos_protocol_credential_lifecycle_errors_total` | custom_metrics.rs | Counter of failed lifecycle transitions |
+| `ethos_protocol_contract_upgrade_events_total` | event indexer | Counter of on-chain `upgrade()` events observed |
+| `ethos_protocol_http_request_duration_seconds` | custom_metrics.rs | Histogram of API latency |
 
-See [`request-prioritization.md`](./request-prioritization.md),
-[`load-shedding.md`](./load-shedding.md), [`adaptive-batching.md`](./adaptive-batching.md)
-and [`predictive-scaling.md`](./predictive-scaling.md) for the full metric
-lists and configuration for those features.
-
-## Prometheus Setup
-
-### 1. Install Prometheus
+To start local collection:
 
 ```bash
-# Docker
-docker run -d \
-  -p 9090:9090 \
-  -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
-  prom/prometheus
+prometheus --config.file=monitoring/prometheus.yml
 ```
 
-### 2. Configure Scrape Target
+Set `BACKEND_HOST`, `BACKEND_PORT`, `EVENT_INDEXER_HOST`, `EVENT_INDEXER_PORT`,
+and `DEPLOY_ENV` in the environment before starting Prometheus, or edit the
+static targets directly in `monitoring/prometheus.yml`.
 
-`prometheus.yml`:
+## 2. Grafana dashboards
 
-```yaml
-global:
-  scrape_interval: 15s
+Import the following dashboards (Grafana > Dashboards > Import > Upload JSON):
 
-scrape_configs:
-  - job_name: ethos-protocol-backend
-    static_configs:
-      - targets: ['localhost:8080']
-    metrics_path: /metrics
-```
+- `monitoring/grafana-dashboard-vault-activity.json` — vault creation rate,
+  active vault count, check-in and release rates, contract paused state.
+- `monitoring/grafana-dashboard-credential-lifecycle.json` — credential
+  lifecycle transition/error rates, HTTP error rate, and API latency
+  percentiles (p50/p95/p99), covering the "error trends" requirement.
 
-### 3. Verify
+Point the Grafana datasource at the same Prometheus instance configured in
+step 1.
 
-Open `http://localhost:9090` and query `ethos_protocol_vaults_total`.
+## 3. Alerting rules
 
-## Grafana Setup
+`monitoring/alert_rules.yml` defines the following alerts, loaded by
+Prometheus via `rule_files` and routed through Alertmanager:
 
-### 1. Install Grafana
+- `EthosApiDown` — API has not been scraped successfully for 1 minute.
+- `EthosHighErrorRate` — API error rate above 5% for 5 minutes.
+- `EthosHighApiLatencyP99` — p99 API latency above 2s for 5 minutes.
+- `EthosContractPaused` — the `ttl_vault` contract has been paused for 1 minute.
+- `EthosContractUpgradeInProgress` — an `upgrade()` event was observed
+  on-chain in the last 10 minutes.
+- `EthosCredentialLifecycleAnomalies` — more than 10 credential lifecycle
+  transition errors in 15 minutes.
 
-```bash
-docker run -d \
-  -p 3000:3000 \
-  grafana/grafana
-```
+Each alert's `annotations.runbook` links to the matching section of
+[`docs/runbook-alerts.md`](./runbook-alerts.md).
 
-Default credentials: `admin` / `admin`.
+## 4. Wiring an Alertmanager
 
-### 2. Add Prometheus Data Source
+Point Prometheus at an Alertmanager instance (see the `alerting:` block in
+`monitoring/prometheus.yml`) and configure receivers (Slack/PagerDuty/email)
+per your organization's on-call tooling. This guide does not prescribe a
+specific receiver so it stays portable across environments.
 
-1. Go to **Configuration → Data Sources → Add data source**
-2. Select **Prometheus**
-3. Set URL to `http://localhost:9090`
-4. Click **Save & Test**
+## 5. Runbook
 
-### 3. Dashboards
-
-#### Vault Volume
-
-```promql
-# Vault creation rate (per minute)
-rate(ethos_protocol_vaults_total[1m])
-
-# Active vaults
-ethos_protocol_active_vaults
-```
-
-#### Check-In Rate
-
-```promql
-# Check-ins per minute
-rate(ethos_protocol_checkins_total[1m])
-```
-
-#### Error Rate
-
-```promql
-# API error rate
-rate(ethos_protocol_request_errors_total[5m])
-
-# Error ratio
-rate(ethos_protocol_request_errors_total[5m])
-  / rate(ethos_protocol_http_requests_total[5m])
-```
-
-## Alerting Rules
-
-Add to `prometheus.yml` or a separate `alerts.yml`:
-
-```yaml
-groups:
-  - name: ethos-protocol
-    rules:
-      - alert: HighErrorRate
-        expr: |
-          rate(ethos_protocol_request_errors_total[5m])
-            / rate(ethos_protocol_http_requests_total[5m]) > 0.05
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High API error rate (>5%)"
-
-      - alert: BackendDown
-        expr: up{job="ethos-protocol-backend"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Ethos-Protocol backend is unreachable"
-
-      - alert: ContractPaused
-        expr: ethos_protocol_contract_paused == 1
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Ethos-Protocol contract is paused"
-```
-
-### Grafana Alert (UI)
-
-1. Open a panel → **Alert** tab → **Create alert rule**
-2. Set condition, e.g. `WHEN last() OF query(A, 5m, now) IS ABOVE 0.05`
-3. Configure notification channel (email, Slack, PagerDuty)
-
-## Running the Backend
-
-```bash
-cd backend
-cargo run
-# Metrics available at http://localhost:8080/metrics
-```
+See [`docs/runbook-alerts.md`](./runbook-alerts.md) for the step-by-step
+response for each alert above.
