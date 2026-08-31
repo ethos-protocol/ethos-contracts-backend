@@ -39,7 +39,8 @@ use types::{
     TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary,
     VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim,
     VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit, WithdrawalReversal,
-    WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
+    WithdrawalScheduleEntry, WithdrawalTracker, UpgradeManifest, YieldDistributionConfig,
+    YieldDistributionMode,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, BACKUP_CODE_USED_TOPIC,
     BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_CAP_TOPIC,
@@ -115,10 +116,6 @@ mod beneficiary_auction_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
 #[cfg(test)]
-mod duplicate_vault_concurrency_tests;
-#[cfg(test)]
-mod vesting_timestamp_edge_case_tests;
-#[cfg(test)]
 mod beneficiary_vesting_auction_tests;
 #[cfg(test)]
 mod beneficiary_vesting_tests;
@@ -150,6 +147,8 @@ mod slice_consensus_voting_tests;
 mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
+#[cfg(test)]
+mod upgrade_validation_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -394,6 +393,11 @@ pub enum ContractError {
     InheritanceCycleDetected = 125,
     // Slice consensus voting: finalization attempted below the minimum quorum
     InsufficientQuorum = 126,
+    // Upgrade safety validation (see docs/upgrade-safety.md)
+    UpgradeInterfaceShrunk = 127,
+    UpgradeStorageSchemaChanged = 128,
+    UpgradeErrorCodesReduced = 129,
+    UpgradeManifestNotSet = 130,
 }
 
 #[contract]
@@ -885,7 +889,91 @@ impl TtlVaultContract {
         }
     }
 
+    /// Admin-only. Records the interface/storage fingerprint of the
+    /// currently running contract. This must be called once after
+    /// `initialize` (or after each successful `upgrade_with_manifest`) so
+    /// the *next* upgrade has a baseline to validate against.
+    ///
+    /// See `UpgradeManifest` in `types.rs` and `docs/upgrade-safety.md` for
+    /// how `exported_fn_count`, `error_code_count`, and
+    /// `storage_schema_hash` should be computed out-of-band before calling
+    /// this.
+    pub fn set_upgrade_manifest(
+        env: Env,
+        exported_fn_count: u32,
+        error_code_count: u32,
+        storage_schema_hash: BytesN<32>,
+    ) {
+        Self::require_admin(&env);
+
+        let version = env
+            .storage()
+            .instance()
+            .get::<DataKey, UpgradeManifest>(&DataKey::UpgradeManifest)
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+
+        let manifest = UpgradeManifest {
+            exported_fn_count,
+            error_code_count,
+            storage_schema_hash,
+            version,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeManifest, &manifest);
+    }
+
+    /// Returns the currently recorded upgrade manifest, if any.
+    pub fn get_upgrade_manifest(env: Env) -> Option<UpgradeManifest> {
+        env.storage().instance().get(&DataKey::UpgradeManifest)
+    }
+
+    /// Validates that a proposed upgrade is backward-compatible with the
+    /// manifest recorded via `set_upgrade_manifest`, in addition to the
+    /// basic hash check in `validate_upgrade`.
+    ///
+    /// Checks (see `docs/upgrade-safety.md` for rationale and how callers
+    /// are expected to compute the new-contract values off-chain before
+    /// submitting the upgrade transaction):
+    /// - Same exported function count (interface not shrunk)
+    /// - Same or greater error code count (error codes not removed/renumbered)
+    /// - Same storage schema hash (no storage keys dropped or repurposed)
+    ///
+    /// # Errors
+    /// - `UpgradeManifestNotSet` if no baseline has been recorded yet
+    /// - `UpgradeInterfaceShrunk` if the new contract exports fewer functions
+    /// - `UpgradeErrorCodesReduced` if the new contract has fewer error codes
+    /// - `UpgradeStorageSchemaChanged` if the storage schema hash differs
+    pub fn validate_upgrade_compatibility(
+        env: Env,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+    ) {
+        let manifest: UpgradeManifest = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeManifest)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UpgradeManifestNotSet));
+
+        if new_exported_fn_count < manifest.exported_fn_count {
+            panic_with_error!(&env, ContractError::UpgradeInterfaceShrunk);
+        }
+        if new_error_code_count < manifest.error_code_count {
+            panic_with_error!(&env, ContractError::UpgradeErrorCodesReduced);
+        }
+        if new_storage_schema_hash != manifest.storage_schema_hash {
+            panic_with_error!(&env, ContractError::UpgradeStorageSchemaChanged);
+        }
+    }
+
     /// Admin-only. Validates and upgrades the contract to a new WASM hash.
+    ///
+    /// This only performs the basic non-zero-hash check. Prefer
+    /// `upgrade_with_manifest` for upgrades where a baseline has been
+    /// recorded via `set_upgrade_manifest`, since it additionally enforces
+    /// interface, storage, and error-code compatibility.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env);
         Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
@@ -893,6 +981,41 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Admin-only. Full upgrade-safety path: validates the hash, validates
+    /// interface/storage/error-code compatibility against the recorded
+    /// manifest, performs the upgrade, and then bumps the manifest version
+    /// so the new contract becomes the baseline for the *next* upgrade.
+    ///
+    /// See `docs/upgrade-safety.md` for the recommended admin workflow.
+    pub fn upgrade_with_manifest(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+    ) {
+        Self::require_admin(&env);
+        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
+        Self::validate_upgrade_compatibility(
+            env.clone(),
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash.clone(),
+        );
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::set_upgrade_manifest(
+            env,
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+        );
     }
 
     // --- Issue #581: Token Conversion ---

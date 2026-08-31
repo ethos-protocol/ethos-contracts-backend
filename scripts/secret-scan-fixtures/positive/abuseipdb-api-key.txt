@@ -1,0 +1,3 @@
+# Positive fixture for the "abuseipdb-api-key" custom rule (.gitleaks.toml).
+# Fake 80-char hex key in the same shape AbuseIPDB issues, not a real key.
+ABUSEIPDB_API_KEY=ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34

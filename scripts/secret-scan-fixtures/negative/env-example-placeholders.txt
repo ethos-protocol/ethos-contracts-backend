@@ -1,0 +1,14 @@
+# Negative fixture. Empty .env.example-style placeholders carry no secret
+# value, just the variable name, and must not trip any rule.
+
+# AbuseIPDB API key placeholder for backend/src/ip_reputation.rs.
+ABUSEIPDB_API_KEY=
+
+# Firebase Cloud Messaging legacy server key placeholder.
+FCM_SERVER_KEY=
+
+# reCAPTCHA secret key placeholder.
+RECAPTCHA_SECRET_KEY=
+
+# Reminder data encryption secret placeholder.
+REMINDER_ENCRYPTION_SECRET=

@@ -69,6 +69,8 @@ pub enum AppError {
     TwoFactorRequired,
     #[error("2FA not enabled")]
     TwoFactorNotEnabled,
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
     /// Wraps an [`ApiError`] that already carries its own HTTP status and
     /// JSON body shape (e.g. from `audit::authorize_admin`); rendered as-is.
     #[error("{}", .0.message)]
@@ -96,6 +98,7 @@ impl IntoResponse for AppError {
             }
             AppError::TwoFactorRequired => (StatusCode::UNAUTHORIZED, "two_factor_required"),
             AppError::TwoFactorNotEnabled => (StatusCode::BAD_REQUEST, "two_factor_not_enabled"),
+            AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             AppError::Api(_) => unreachable!("handled above"),
         };
         ApiError::new(status, code, self.to_string()).into_response()
