@@ -69,7 +69,7 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["der"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 ring = "0.17"
-signature = "2"
+signature = "3"
 
 [dev-dependencies]
 tokio-test = "0.4"
