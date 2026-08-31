@@ -124,6 +124,8 @@ mod bps_invariant_tests;
 #[cfg(test)]
 mod composition_rules_tests;
 #[cfg(test)]
+mod hibernation_consistency_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
@@ -2934,7 +2936,12 @@ impl TtlVaultContract {
                     }
                 }
                 ReleaseCondition::Oracle(addr) => {
-                    if oracle::query(&env, &addr) {
+                    // Reject stale oracle observations (#343): a read older than
+                    // the configured bound falls back to "condition not met"
+                    // rather than releasing on outdated data.
+                    if oracle::query_checked(&env, &addr, &oracle::OracleConfig::default())
+                        .unwrap_or(false)
+                    {
                         condition_met = true;
                     }
                 }
