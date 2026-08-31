@@ -92,6 +92,28 @@ This glossary defines terms used throughout Ethos-Protocol documentation, code, 
 
 ---
 
+### Slice
+
+**Definition**: A named, weighted subdivision of a **Vault**'s attestor/beneficiary composition used by the slice-layer features (performance weighting, cost tracking, consensus voting, attribute matching). Identified by a `slice_id`.
+
+**Standard term**: Use **"vault slice"** on first mention in a document, then **"slice"** for subsequent references within the same document. Avoid mixing "slice", "vault slice", and "composition" to refer to the same concept within one document — pick one term per document and stay consistent with it.
+
+**Usage**: "The vault slice's attestor weights are recalculated after each performance observation."
+
+**Related**: [Slice Performance-Based Weighting and Rules Engine](slice-performance-and-rules-engine.md), [Slice Reputation Decay](slice-reputation-decay.md), [Implementation Summary: Issues #32, #38, #39, #40](issues-32-38-39-40.md)
+
+---
+
+### Attestor
+
+**Definition**: An address registered to observe, vote on, or validate slice/beneficiary state on behalf of the protocol — e.g., voting on slice modification proposals, contributing performance metrics, or matching against attribute-based search requests.
+
+**Usage**: "Only registered attestors may vote on a slice modification proposal."
+
+**Related**: [Slice Performance-Based Weighting and Rules Engine](slice-performance-and-rules-engine.md), [Implementation Summary: Issues #32, #38, #39, #40](issues-32-38-39-40.md#issue-39-implement-slice-consensus-voting)
+
+---
+
 ## Stellar / Soroban Terms
 
 ### Ledger

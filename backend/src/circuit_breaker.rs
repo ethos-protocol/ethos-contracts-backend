@@ -229,6 +229,41 @@ impl CircuitBreaker {
         }
     }
 
+    /// Execute the main operation with a degraded fallback when the breaker is
+    /// open or the underlying dependency has failed mid-request.
+    ///
+    /// This allows callers to keep serving degraded responses during a Redis
+    /// failover instead of bubbling a 500 back to the client when the breaker is
+    /// already short-circuiting traffic.
+    pub fn call_with_fallback<T, E, F, G>(&self, f: F, fallback: G) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+        G: FnOnce() -> Result<T, E>,
+    {
+        if !self.allow_call() {
+            self.calls_rejected_total.fetch_add(1, Ordering::Relaxed);
+            return fallback().map_err(CircuitBreakerError::Operation);
+        }
+
+        self.calls_allowed_total.fetch_add(1, Ordering::Relaxed);
+        match f() {
+            Ok(value) => {
+                self.on_success();
+                Ok(value)
+            }
+            Err(_err) => {
+                self.on_failure();
+                match fallback() {
+                    Ok(value) => Ok(value),
+                    Err(fallback_err) => {
+                        self.on_failure();
+                        Err(CircuitBreakerError::Operation(fallback_err))
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether a call would currently be allowed through, transitioning
     /// Open -> HalfOpen if the cool-down window has elapsed.
     pub fn allow_call(&self) -> bool {
@@ -663,6 +698,29 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
 
         let _ = cb.call(err_call);
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn call_with_fallback_serves_degraded_response_while_open() {
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            open_duration: Duration::from_millis(1),
+        };
+        let cb = CircuitBreaker::new("redis-cache", cfg);
+
+        let _ = cb.call(err_call);
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let value = cb
+            .call_with_fallback(
+                || Err::<&str, &str>("redis connection dropped"),
+                || Ok("fallback:cache-hit"),
+            )
+            .unwrap();
+
+        assert_eq!(value, "fallback:cache-hit");
         assert_eq!(cb.state(), CircuitState::Open);
     }
 

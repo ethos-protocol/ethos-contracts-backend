@@ -178,6 +178,98 @@ mod tests {
             assert_eq!(count_after, 1, "Count should increment");
         });
     }
+
+    // ── Issue #346: anchoring proof freshness ────────────────────────────────
+
+    use soroban_sdk::testutils::Ledger as _;
+
+    fn activate(env: &Env, credential_id: u64) {
+        credential_lifecycle::init_credential_state(env, credential_id);
+        credential_lifecycle::transition_credential_state(
+            env,
+            credential_id,
+            credential_lifecycle::CredentialState::Active,
+        );
+    }
+
+    #[test]
+    fn test_fresh_proof_is_anchored() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TtlVaultContract);
+        env.ledger().set_timestamp(10_000);
+
+        let external_id = Bytes::from_slice(&env, b"fresh-proof-id");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        env.as_contract(&contract_id, || {
+            activate(&env, 7u64);
+            set_max_proof_age(&env, 3_600);
+
+            // Proof produced 5 minutes ago — well within the window.
+            let ok = anchor_credential(&env, 7u64, external_id.clone(), system.clone(), 9_700);
+            assert!(ok, "fresh proof should anchor");
+            assert_eq!(
+                verify_external_anchor(&env, &external_id, &system),
+                Some(7u64)
+            );
+        });
+    }
+
+    #[test]
+    fn test_expired_proof_is_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TtlVaultContract);
+        env.ledger().set_timestamp(1_000_000);
+
+        let external_id = Bytes::from_slice(&env, b"stale-proof-id");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        env.as_contract(&contract_id, || {
+            activate(&env, 8u64);
+            set_max_proof_age(&env, 3_600);
+
+            // Proof produced ~28 hours ago — far outside the 1-hour window.
+            let rejected =
+                anchor_credential(&env, 8u64, external_id.clone(), system.clone(), 900_000);
+            assert!(!rejected, "expired proof must be rejected");
+            assert_eq!(verify_external_anchor(&env, &external_id, &system), None);
+        });
+    }
+
+    #[test]
+    fn test_future_dated_proof_is_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TtlVaultContract);
+        env.ledger().set_timestamp(50_000);
+
+        let external_id = Bytes::from_slice(&env, b"future-proof-id");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        env.as_contract(&contract_id, || {
+            activate(&env, 9u64);
+            set_max_proof_age(&env, 3_600);
+
+            let rejected =
+                anchor_credential(&env, 9u64, external_id.clone(), system.clone(), 999_999);
+            assert!(!rejected, "future-dated proof must be rejected");
+        });
+    }
+
+    #[test]
+    fn test_default_window_applies_when_unconfigured() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TtlVaultContract);
+        env.ledger().set_timestamp(1_000_000);
+
+        env.as_contract(&contract_id, || {
+            assert_eq!(max_proof_age_seconds(&env), DEFAULT_MAX_PROOF_AGE_SECONDS);
+            assert!(proof_is_fresh(&env, 1_000_000 - 60));
+            assert!(!proof_is_fresh(
+                &env,
+                1_000_000 - DEFAULT_MAX_PROOF_AGE_SECONDS - 1
+            ));
+        });
+    }
 }
 
 /// Tests that exercise the `#[contractimpl]` entry points on

@@ -101,6 +101,82 @@ impl ForecastModel {
 
         Some((level + trend * periods_ahead as f64).max(0.0))
     }
+
+    /// Backtest this model against historical `samples` (oldest first): at
+    /// every point with enough history, forecast `periods_ahead` sampling
+    /// intervals out and compare against the actual sample that arrived at
+    /// that point, accumulating error metrics over every prediction made.
+    /// This validates model accuracy against real traffic before it's
+    /// trusted to drive live scaling decisions.
+    pub fn backtest(&self, samples: &[TrafficSample], periods_ahead: u32) -> BacktestResult {
+        let periods_ahead = periods_ahead.max(1) as usize;
+        let mut errors: Vec<f64> = Vec::new();
+        let mut percentage_errors: Vec<f64> = Vec::new();
+
+        // Need at least 2 samples of history for a trend-aware forecast,
+        // and a known actual value `periods_ahead` samples later to compare
+        // the prediction against.
+        for i in 2..samples.len() {
+            let target_idx = i + periods_ahead - 1;
+            if target_idx >= samples.len() {
+                break;
+            }
+
+            let history = &samples[..i];
+            let Some(predicted) = self.forecast(history, periods_ahead as u32) else {
+                continue;
+            };
+
+            let actual = samples[target_idx].requests as f64;
+            let error = predicted - actual;
+            errors.push(error);
+            if actual > 0.0 {
+                percentage_errors.push((error / actual).abs());
+            }
+        }
+
+        let sample_count = errors.len();
+        if sample_count == 0 {
+            return BacktestResult {
+                sample_count: 0,
+                mean_absolute_error: 0.0,
+                mean_absolute_percentage_error: 0.0,
+                root_mean_squared_error: 0.0,
+            };
+        }
+
+        let mean_absolute_error =
+            errors.iter().map(|e| e.abs()).sum::<f64>() / sample_count as f64;
+        let root_mean_squared_error =
+            (errors.iter().map(|e| e * e).sum::<f64>() / sample_count as f64).sqrt();
+        let mean_absolute_percentage_error = if percentage_errors.is_empty() {
+            0.0
+        } else {
+            percentage_errors.iter().sum::<f64>() / percentage_errors.len() as f64
+        };
+
+        BacktestResult {
+            sample_count,
+            mean_absolute_error,
+            mean_absolute_percentage_error,
+            root_mean_squared_error,
+        }
+    }
+}
+
+/// Error metrics from replaying a `ForecastModel` against historical
+/// traffic via `ForecastModel::backtest`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BacktestResult {
+    /// Number of (prediction, actual) pairs the metrics below are computed over.
+    pub sample_count: usize,
+    /// Mean absolute error between predicted and actual request volume.
+    pub mean_absolute_error: f64,
+    /// Mean absolute percentage error (0.0-1.0+), over periods where actual
+    /// traffic was nonzero.
+    pub mean_absolute_percentage_error: f64,
+    /// Root mean squared error; penalizes large individual misses more than MAE.
+    pub root_mean_squared_error: f64,
 }
 
 /// Bounds and target throughput-per-replica used to translate a forecast
@@ -247,6 +323,13 @@ impl PredictiveScaler {
         }
 
         Some(recommended)
+    }
+
+    /// Backtest the configured `ForecastModel` against this scaler's own
+    /// recorded traffic history, using the configured forecast horizon.
+    pub fn backtest(&self) -> BacktestResult {
+        self.model
+            .backtest(&self.history.samples(), self.config.forecast_periods_ahead)
     }
 
     pub fn metrics(&self) -> ScalingMetrics {

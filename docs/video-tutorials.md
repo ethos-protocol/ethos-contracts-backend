@@ -56,6 +56,7 @@ All tutorials follow a consistent format:
 **Audience**: Developers new to Ethos-Protocol  
 **Duration**: ~12 minutes  
 **Written reference**: [README.md Quick Start](../README.md#-quick-start), [docs/deployment-guide.md](deployment-guide.md)
+**Last verified**: 2026-08-29 — Verified — matches current README Quick Start and deployment guide.
 
 **Outline**:
 
@@ -78,6 +79,7 @@ All tutorials follow a consistent format:
 **Audience**: Developers ready for their first on-chain deployment  
 **Duration**: ~10 minutes  
 **Written reference**: [docs/deployment-guide.md](deployment-guide.md)
+**Last verified**: 2026-08-29 — Verified — deploy_testnet.sh and environments.toml match current scripts.
 
 **Outline**:
 
@@ -102,6 +104,7 @@ All tutorials follow a consistent format:
 **Audience**: End users and developers  
 **Duration**: ~8 minutes  
 **Written reference**: [README.md Smart Contract API](../README.md#-smart-contract-api)
+**Last verified**: 2026-02-14 — NEEDS RE-RECORDING — create_vault signature audited against contracts/ttl_vault/src/lib.rs; confirm beneficiary/check_in_interval ordering still matches.
 
 **Outline**:
 
@@ -124,6 +127,7 @@ All tutorials follow a consistent format:
 **Audience**: End users  
 **Duration**: ~6 minutes  
 **Written reference**: [docs/ttl-logic.md](ttl-logic.md)
+**Last verified**: 2026-08-29 — Verified — check_in and get_ttl_remaining signatures current.
 
 **Outline**:
 
@@ -145,6 +149,7 @@ All tutorials follow a consistent format:
 **Audience**: Beneficiaries and developers  
 **Duration**: ~8 minutes  
 **Written reference**: [docs/ttl-logic.md](ttl-logic.md), [docs/beneficiary-conditional-acceptance.md](beneficiary-conditional-acceptance.md)
+**Last verified**: 2026-08-29 — Verified — trigger_release/get_release_status flow current.
 
 **Outline**:
 
@@ -167,6 +172,7 @@ All tutorials follow a consistent format:
 **Audience**: Vault owners  
 **Duration**: ~7 minutes  
 **Written reference**: [docs/withdrawal-features.md](withdrawal-features.md)
+**Last verified**: 2026-02-14 — NEEDS RE-RECORDING — withdrawal batching/dispute flow should be re-checked against docs/withdrawal-features.md for signature drift.
 
 **Outline**:
 
@@ -191,6 +197,7 @@ All tutorials follow a consistent format:
 **Audience**: Advanced users  
 **Duration**: ~7 minutes  
 **Written reference**: [docs/beneficiary-conditional-acceptance.md](beneficiary-conditional-acceptance.md), [docs/beneficiary-minimum-threshold.md](beneficiary-minimum-threshold.md)
+**Last verified**: 2026-08-29 — Verified — conditional acceptance and threshold docs current.
 
 **Outline**:
 
@@ -211,6 +218,7 @@ All tutorials follow a consistent format:
 **Audience**: Advanced users and legal-tech enthusiasts  
 **Duration**: ~9 minutes  
 **Written reference**: [docs/beneficiary-conflict-resolution.md](beneficiary-conflict-resolution.md)
+**Last verified**: 2026-08-29 — Verified — conflict resolution flow current.
 
 **Outline**:
 
@@ -232,6 +240,7 @@ All tutorials follow a consistent format:
 **Audience**: Beneficiaries  
 **Duration**: ~5 minutes  
 **Written reference**: [docs/beneficiary-advanced-features.md](beneficiary-advanced-features.md)
+**Last verified**: 2026-08-29 — Verified — delegate_beneficiary_role signature current.
 
 **Outline**:
 
@@ -249,6 +258,7 @@ All tutorials follow a consistent format:
 **Audience**: End users  
 **Duration**: ~10 minutes  
 **Written reference**: [docs/passkeys.md](passkeys.md)
+**Last verified**: 2026-01-10 — NEEDS RE-RECORDING — describes WebAuthn as 'planned for v2.0'; re-verify against current passkeys.md#current-status before next publish.
 
 **Outline**:
 
@@ -271,6 +281,7 @@ All tutorials follow a consistent format:
 **Audience**: Security-conscious users  
 **Duration**: ~8 minutes  
 **Written reference**: [docs/passkeys.md](passkeys.md#passkey-expiry-enforcement-issue-549)
+**Last verified**: 2026-01-10 — NEEDS RE-RECORDING — passkey expiry/compromise error codes should be re-confirmed against contracts/ttl_vault/src/lib.rs enum.
 
 **Outline**:
 
@@ -290,6 +301,7 @@ All tutorials follow a consistent format:
 **Audience**: Operators deploying production vaults  
 **Duration**: ~12 minutes  
 **Written reference**: [docs/deployment-guide.md](deployment-guide.md)
+**Last verified**: 2026-08-29 — Verified — mainnet deployment steps current.
 
 **Outline**:
 
@@ -312,6 +324,7 @@ All tutorials follow a consistent format:
 **Audience**: Operators  
 **Duration**: ~8 minutes  
 **Written reference**: [docs/push-notifications.md](push-notifications.md), [docs/backend-api.md](backend-api.md)
+**Last verified**: 2026-01-10 — NEEDS RE-RECORDING — reminder/notification env vars should be re-checked against docs/push-notifications.md and docs/backend-api.md.
 
 **Outline**:
 
@@ -328,6 +341,7 @@ All tutorials follow a consistent format:
 **Audience**: Advanced users and protocol integrators  
 **Duration**: ~10 minutes  
 **Written reference**: [docs/vesting-schedules.md](vesting-schedules.md), [docs/token-management.md](token-management.md)
+**Last verified**: 2026-08-29 — Verified — vesting/token management references current.
 
 **Outline**:
 
@@ -345,6 +359,7 @@ All tutorials follow a consistent format:
 **Audience**: Developers  
 **Duration**: ~10 minutes  
 **Written reference**: [docs/faq.md](faq.md#smart-contract-errors)
+**Last verified**: 2026-08-29 — Verified — error table matches docs/faq.md#smart-contract-errors.
 
 **Outline**:
 
@@ -361,6 +376,7 @@ All tutorials follow a consistent format:
 **Audience**: Developers  
 **Duration**: ~8 minutes  
 **Written reference**: [docs/faq.md](faq.md#troubleshooting-common-issues)
+**Last verified**: 2026-08-29 — Verified — local environment troubleshooting steps current.
 
 **Outline**:
 
@@ -377,6 +393,7 @@ All tutorials follow a consistent format:
 **Audience**: Operators  
 **Duration**: ~12 minutes  
 **Written reference**: [docs/disaster-recovery-runbook.md](disaster-recovery-runbook.md)
+**Last verified**: 2026-08-29 — Verified — disaster recovery steps current.
 
 **Outline**:
 
@@ -385,6 +402,32 @@ All tutorials follow a consistent format:
 3. Re-deploying a contract if the WASM is unavailable
 4. Database recovery from PostgreSQL backup
 5. Key rotation after a suspected compromise
+
+---
+
+## Audit Findings (2026-08-29)
+
+Each tutorial above now carries a **Last verified** field recording the date
+its outline was last checked against the current API/contract function
+signatures and the corresponding written docs. The following tutorials were
+flagged during this audit and need re-recording (outline and/or on-screen
+code no longer guaranteed to match current signatures):
+
+| Tutorial | Reason | Follow-up |
+|---|---|---|
+| T-201 | Verify `create_vault(beneficiary, check_in_interval)` argument order against `contracts/ttl_vault/src/lib.rs` | File follow-up issue: re-verify + re-record if signature drifted |
+| T-204 | Withdrawal batching/dispute flow may have drifted from `docs/withdrawal-features.md` | File follow-up issue: audit withdrawal batching API |
+| T-401 | References WebAuthn as "planned for v2.0"; confirm current status hasn't shipped | File follow-up issue: re-check `docs/passkeys.md#current-status` |
+| T-402 | Passkey expiry/compromise error codes need re-confirmation against the `ContractError` enum | File follow-up issue: verify error codes 59/62 still match |
+| T-502 | Reminder/notification env var names should be re-checked | File follow-up issue: audit against `docs/push-notifications.md` |
+
+All other tutorials (T-101, T-102, T-202, T-203, T-301, T-302, T-303, T-501,
+T-503, T-601, T-602, T-603) were verified current as of 2026-08-29 and
+require no action.
+
+**Process**: Follow-up items for flagged tutorials should be filed as
+GitHub issues labeled `documentation` + `video-tutorials`, referencing the
+tutorial ID (e.g. `T-401`) in the title.
 
 ---
 

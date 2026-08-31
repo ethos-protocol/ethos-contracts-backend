@@ -11,6 +11,7 @@ This guide documents recommended practices for developing, deploying, and operat
 - [Security Best Practices](#security-best-practices)
 - [Configuration Best Practices](#configuration-best-practices)
 - [Testing Best Practices](#testing-best-practices)
+- [Regression Test Policy](#regression-test-policy)
 
 ---
 
@@ -466,38 +467,71 @@ The project includes a fuzz test harness under `contracts/ttl_vault/fuzz/`. Run 
 cargo fuzz run fuzz_target_1
 ```
 
-## Coverage Expectations
+---
 
-`scripts/test.sh` supports generating a code coverage report via
-[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+## Regression Test Policy
 
-```bash
-COVERAGE=1 ./scripts/test.sh
+> **Issue #424** — Slice-failover correctness is safety-critical because a
+> promotion failure can leave a vault with no reachable slice, blocking
+> beneficiary payouts.  The policies below apply to all regression tests, with
+> special emphasis on slice-failover bugs.
+
+### What belongs in a regression test
+
+A regression test must be added for **every bug that is fixed**, regardless of
+severity.  The test:
+
+1. **Names the bug** — the `///` doc-comment on the test function must state
+   what previously failed and, optionally, which issue or PR introduced the fix.
+2. **Reproduces the minimal failure** — the test must fail on the code *before*
+   the fix and pass on the code *after* the fix.
+3. **Lives in the right file**:
+   - `contracts/ttl_vault/src/regression_tests.rs` — general vault bugs
+   - `contracts/ttl_vault/src/slice_failover_tests.rs` — slice-failover bugs
+
+Example format:
+
+```rust
+/// Regression: threshold=1 must fire immediately on the very first failure.
+///
+/// Previously the threshold check used `>` instead of `>=`, so a threshold
+/// of 1 required *two* failures before promotion.  Fixed in PR #212.
+#[test]
+fn regression_threshold_one_activates_on_first_failure() {
+    // ...
+}
 ```
 
-This writes:
+### CI gate (required checks)
 
-- `target/coverage/lcov.info` — machine-readable report, archived as a CI
-  artifact on every run (see the `coverage` job in `.github/workflows/ci.yml`)
-- `target/coverage/html/` — human-readable HTML report for local inspection
+Both files are compiled and run as part of `cargo test --package ttl-vault` in
+the `Run tests` CI step.  This step is a **required branch-protection check**:
+no PR can merge to `main` if any test in either file fails.
 
-**Minimum coverage threshold**
+The required checks to configure in GitHub branch protection settings are:
 
-CI enforces a minimum aggregate line coverage of **70%** (`MIN_COVERAGE`
-env var in `scripts/test.sh`) across `contracts/ttl_vault`. A CI run fails
-if coverage drops below this threshold, which is intended to catch
-under-tested modules before they land on `main`.
+| Check name                            | Enforces                                              |
+|---------------------------------------|-------------------------------------------------------|
+| `Test & Lint / test`                  | All unit tests incl. regression + slice-failover suites |
+| `Test & Lint / wasm-size-check`       | WASM size budget (see [wasm-size-budget.md](wasm-size-budget.md)) |
 
-**Guidance for new/changed files**
+### Slice-failover regression coverage
 
-- New contract logic (`contracts/*/src/**`) should aim for coverage at or
-  above the repo-wide threshold — untested branches in payout, TTL, or
-  auth logic are the highest-risk gaps.
-- Backend service code under `backend/src/` is not yet wired into the
-  coverage gate; when adding coverage there, extend the `--manifest-path`
-  arguments in `scripts/test.sh` rather than creating a parallel script.
-- Prefer adding a focused unit test over inflating coverage with trivial
-  assertions — the threshold is a floor, not a target to game.
-- If a module has a legitimate reason for low coverage (e.g. thin
-  glue code), note it in the PR description rather than lowering the
-  global threshold.
+Every edge-case scenario in the slice-failover mechanism has an explicit
+regression test.  When fixing a new slice-failover bug:
+
+- Add the test to `slice_failover_tests.rs` in the
+  `// ── Regression tests for previously fixed slice-failover bugs` section.
+- The test name must start with `regression_` so it is easily searchable.
+- Do **not** remove or weaken existing regression tests — if the contract API
+  changes, update the test to match the new API while preserving the intent.
+
+### Merge checklist for bug-fix PRs
+
+Before merging any bug-fix PR:
+
+- [ ] Regression test added to the appropriate file
+- [ ] Test fails on the branch *before* the fix (or has a comment explaining
+      why it cannot be easily demonstrated to fail)
+- [ ] Test passes after the fix
+- [ ] CI is green (both `test` and `wasm-size-check` status checks pass)

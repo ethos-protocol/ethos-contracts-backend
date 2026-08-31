@@ -445,6 +445,53 @@ docker-compose restart backend
 
 ---
 
+## Isolation Guarantees
+
+The Playground must never let data cross into production storage or vice
+versa. Isolation is enforced at three layers:
+
+### 1. Network-level isolation
+
+Testnet, standalone, mainnet, and futurenet are physically separate Stellar
+networks — there is no shared ledger between them. The Playground's default
+and hosted configuration targets `testnet` (or `standalone` for local mode)
+as defined in `environments.toml`; it is never configured to point at
+`mainnet`. Because contract storage lives on the network's ledger, a
+playground transaction against testnet cannot read or write mainnet
+contract state — the underlying RPC endpoints and network passphrases
+differ, so there is no code path that could route a playground call to
+production infrastructure.
+
+### 2. Application-level key namespacing
+
+Where the backend caches or partitions data in-process (see
+`backend/src/cache_partition.rs`), playground and production traffic are
+kept in separate named partitions (e.g. `playground` vs `production`),
+using the same tenant-partitioning mechanism used for multi-tenant
+isolation. A key written under the `playground` partition is not
+addressable from the `production` partition, and clearing one partition
+never touches the other. See the isolation tests in
+`backend/src/cache_partition.rs` (`test_playground_writes_never_appear_in_production_reads`
+and `test_production_writes_never_appear_in_playground_reads`).
+
+### 3. CI-enforced config isolation
+
+`scripts/check_playground_isolation.sh` runs in CI (see
+`.github/workflows/ci.yml`) and fails the build if:
+
+- `PLAYGROUND_NETWORK` is set to `mainnet`, or
+- the playground's resolved `rpc_url` or `contract_ttl_vault` in
+  `environments.toml` matches the `[mainnet]` section (guarding against a
+  copy-paste config mistake that would point the playground at production).
+
+### Summary
+
+| Layer | Mechanism | Guarantee |
+|---|---|---|
+| Network | Separate Stellar networks (testnet/standalone vs mainnet) | Playground transactions cannot touch mainnet ledger state |
+| Application | Tenant-partitioned in-process cache/storage keys | Playground reads/writes cannot cross into production's partition |
+| CI | `scripts/check_playground_isolation.sh` | Build fails if playground config is ever pointed at production |
+
 ## Related Documentation
 
 - [docs/video-tutorials.md](video-tutorials.md) — video walkthroughs for each scenario

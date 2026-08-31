@@ -404,6 +404,41 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_open_circuit_uses_fallback_path_during_redis_failover() {
+        use std::sync::Arc;
+
+        use crate::circuit_breaker::{
+            CircuitBreaker, CircuitBreakerConfig, CircuitState,
+        };
+
+        let breaker = CircuitBreaker::new(
+            "redis-cache",
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_duration: std::time::Duration::from_millis(1),
+            },
+        );
+
+        let fallback_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback_called_for_closure = Arc::clone(&fallback_called);
+
+        let _ = breaker.call(|| Err::<(), &str>("redis connection dropped"));
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        let result = breaker.call_with_fallback(
+            || Err::<&str, &str>("redis connection dropped"),
+            || {
+                fallback_called_for_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("fallback:cache-hit")
+            },
+        );
+
+        assert_eq!(result.unwrap(), "fallback:cache-hit");
+        assert!(fallback_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     // ── Failure detection on set ──────────────────────────────────────────────
 
     #[test]

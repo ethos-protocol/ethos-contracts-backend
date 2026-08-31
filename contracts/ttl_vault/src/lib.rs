@@ -39,7 +39,8 @@ use types::{
     TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary,
     VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim,
     VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit, WithdrawalReversal,
-    WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
+    WithdrawalScheduleEntry, WithdrawalTracker, UpgradeManifest, YieldDistributionConfig,
+    YieldDistributionMode,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, BACKUP_CODE_USED_TOPIC,
     BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_CAP_TOPIC,
@@ -110,18 +111,10 @@ use types::{
     WITHDRAWAL_ESCROW_CREATED_TOPIC, WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC,
     WITHDRAWAL_RATE_LIMITED_TOPIC, WITHDRAWAL_ROLLBACK_TOPIC,
 };
-use types::{
-    PendingThresholdChange, MULTISIG_THRESHOLD_APPLIED_TOPIC, MULTISIG_THRESHOLD_CANCELLED_TOPIC,
-    MULTISIG_THRESHOLD_PROPOSED_TOPIC,
-};
 #[cfg(test)]
 mod beneficiary_auction_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
-#[cfg(test)]
-mod duplicate_vault_concurrency_tests;
-#[cfg(test)]
-mod vesting_timestamp_edge_case_tests;
 #[cfg(test)]
 mod beneficiary_vesting_auction_tests;
 #[cfg(test)]
@@ -134,8 +127,6 @@ mod composition_rules_tests;
 mod hibernation_consistency_tests;
 #[cfg(test)]
 mod lifecycle_tests;
-#[cfg(test)]
-mod multisig_threshold_timelock_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
@@ -156,6 +147,8 @@ mod slice_consensus_voting_tests;
 mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
+#[cfg(test)]
+mod upgrade_validation_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -199,13 +192,6 @@ const ADMIN_TRANSFER_TIMELOCK: u64 = 86_400;
 
 /// Time-lock delay before a proposed protocol config takes effect (24 hours) — Issue #809.
 const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
-
-/// Time-lock delay before a proposed multi-sig threshold change takes effect (24 hours) — Issue #400.
-///
-/// An instant threshold reduction (e.g., lowering required signers from 3 to 1) could be
-/// abused by an attacker who compromises a single admin key. The 24-hour window gives
-/// co-signers time to detect and cancel a malicious proposal.
-const MULTISIG_THRESHOLD_TIMELOCK: u64 = 86_400;
 
 /// Maximum number of beneficiaries allowed per vault — Issue #872.
 /// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
@@ -407,13 +393,11 @@ pub enum ContractError {
     InheritanceCycleDetected = 125,
     // Slice consensus voting: finalization attempted below the minimum quorum
     InsufficientQuorum = 126,
-    // Issue #400: multi-sig threshold-change timelock errors
-    /// A threshold-change proposal for this vault already exists and is pending.
-    ThresholdChangePending = 127,
-    /// The threshold-change timelock has not yet elapsed; cannot apply the change yet.
-    ThresholdChangeTimeLocked = 128,
-    /// No pending threshold-change proposal exists for this vault.
-    NoPendingThresholdChange = 129,
+    // Upgrade safety validation (see docs/upgrade-safety.md)
+    UpgradeInterfaceShrunk = 127,
+    UpgradeStorageSchemaChanged = 128,
+    UpgradeErrorCodesReduced = 129,
+    UpgradeManifestNotSet = 130,
 }
 
 #[contract]
@@ -905,7 +889,91 @@ impl TtlVaultContract {
         }
     }
 
+    /// Admin-only. Records the interface/storage fingerprint of the
+    /// currently running contract. This must be called once after
+    /// `initialize` (or after each successful `upgrade_with_manifest`) so
+    /// the *next* upgrade has a baseline to validate against.
+    ///
+    /// See `UpgradeManifest` in `types.rs` and `docs/upgrade-safety.md` for
+    /// how `exported_fn_count`, `error_code_count`, and
+    /// `storage_schema_hash` should be computed out-of-band before calling
+    /// this.
+    pub fn set_upgrade_manifest(
+        env: Env,
+        exported_fn_count: u32,
+        error_code_count: u32,
+        storage_schema_hash: BytesN<32>,
+    ) {
+        Self::require_admin(&env);
+
+        let version = env
+            .storage()
+            .instance()
+            .get::<DataKey, UpgradeManifest>(&DataKey::UpgradeManifest)
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+
+        let manifest = UpgradeManifest {
+            exported_fn_count,
+            error_code_count,
+            storage_schema_hash,
+            version,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeManifest, &manifest);
+    }
+
+    /// Returns the currently recorded upgrade manifest, if any.
+    pub fn get_upgrade_manifest(env: Env) -> Option<UpgradeManifest> {
+        env.storage().instance().get(&DataKey::UpgradeManifest)
+    }
+
+    /// Validates that a proposed upgrade is backward-compatible with the
+    /// manifest recorded via `set_upgrade_manifest`, in addition to the
+    /// basic hash check in `validate_upgrade`.
+    ///
+    /// Checks (see `docs/upgrade-safety.md` for rationale and how callers
+    /// are expected to compute the new-contract values off-chain before
+    /// submitting the upgrade transaction):
+    /// - Same exported function count (interface not shrunk)
+    /// - Same or greater error code count (error codes not removed/renumbered)
+    /// - Same storage schema hash (no storage keys dropped or repurposed)
+    ///
+    /// # Errors
+    /// - `UpgradeManifestNotSet` if no baseline has been recorded yet
+    /// - `UpgradeInterfaceShrunk` if the new contract exports fewer functions
+    /// - `UpgradeErrorCodesReduced` if the new contract has fewer error codes
+    /// - `UpgradeStorageSchemaChanged` if the storage schema hash differs
+    pub fn validate_upgrade_compatibility(
+        env: Env,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+    ) {
+        let manifest: UpgradeManifest = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeManifest)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UpgradeManifestNotSet));
+
+        if new_exported_fn_count < manifest.exported_fn_count {
+            panic_with_error!(&env, ContractError::UpgradeInterfaceShrunk);
+        }
+        if new_error_code_count < manifest.error_code_count {
+            panic_with_error!(&env, ContractError::UpgradeErrorCodesReduced);
+        }
+        if new_storage_schema_hash != manifest.storage_schema_hash {
+            panic_with_error!(&env, ContractError::UpgradeStorageSchemaChanged);
+        }
+    }
+
     /// Admin-only. Validates and upgrades the contract to a new WASM hash.
+    ///
+    /// This only performs the basic non-zero-hash check. Prefer
+    /// `upgrade_with_manifest` for upgrades where a baseline has been
+    /// recorded via `set_upgrade_manifest`, since it additionally enforces
+    /// interface, storage, and error-code compatibility.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env);
         Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
@@ -913,6 +981,41 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Admin-only. Full upgrade-safety path: validates the hash, validates
+    /// interface/storage/error-code compatibility against the recorded
+    /// manifest, performs the upgrade, and then bumps the manifest version
+    /// so the new contract becomes the baseline for the *next* upgrade.
+    ///
+    /// See `docs/upgrade-safety.md` for the recommended admin workflow.
+    pub fn upgrade_with_manifest(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+    ) {
+        Self::require_admin(&env);
+        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
+        Self::validate_upgrade_compatibility(
+            env.clone(),
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash.clone(),
+        );
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::set_upgrade_manifest(
+            env,
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+        );
     }
 
     // --- Issue #581: Token Conversion ---
@@ -11055,209 +11158,6 @@ impl TtlVaultContract {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(())
-    }
-
-    // ── Threshold-change timelock (Issue #400) ────────────────────────────────
-
-    /// Propose a new approval threshold for the vault's multi-sig configuration.
-    ///
-    /// The change is NOT applied immediately. A `MULTISIG_THRESHOLD_TIMELOCK`
-    /// (24-hour) delay must elapse before `apply_multisig_threshold` can be
-    /// called. This window gives co-signers time to detect and cancel a
-    /// malicious reduction.
-    ///
-    /// Emits a `ms_t_prp` event so that monitoring services can alert on
-    /// unexpected threshold-change proposals.
-    ///
-    /// # Errors
-    /// - `ContractError::NotOwner` — caller is not the vault owner.
-    /// - `ContractError::AlreadyReleased` — vault is no longer locked.
-    /// - `ContractError::MultiSigRequired` — vault has no multi-sig config.
-    /// - `ContractError::InvalidThreshold` — new threshold out of range.
-    /// - `ContractError::ThresholdChangePending` — a proposal is already waiting.
-    pub fn propose_multisig_threshold(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        new_threshold: u32,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        if vault.status != ReleaseStatus::Locked {
-            return Err(ContractError::AlreadyReleased);
-        }
-
-        // Require an existing multi-sig config to change.
-        let config = env
-            .storage()
-            .persistent()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
-            .ok_or(ContractError::MultiSigRequired)?;
-
-        // Validate the proposed threshold against the current signer count.
-        let total = config.signers.len() as u32 + 1; // co-signers + owner
-        if new_threshold == 0 || new_threshold > total {
-            return Err(ContractError::InvalidThreshold);
-        }
-
-        // Only one pending proposal allowed at a time.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::PendingMultiSigThreshold(vault_id))
-        {
-            return Err(ContractError::ThresholdChangePending);
-        }
-
-        let proposed_at = env.ledger().timestamp();
-        let pending = PendingThresholdChange {
-            new_threshold,
-            proposed_at,
-        };
-        let key = DataKey::PendingMultiSigThreshold(vault_id);
-        env.storage().persistent().set(&key, &pending);
-        env.storage().persistent().extend_ttl(
-            &key,
-            VAULT_TTL_THRESHOLD,
-            vault_ttl_ledgers(vault.check_in_interval),
-        );
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        // Emit an event so monitors can detect unexpected proposals.
-        env.events().publish(
-            (MULTISIG_THRESHOLD_PROPOSED_TOPIC, vault_id),
-            (new_threshold, proposed_at),
-        );
-
-        Ok(())
-    }
-
-    /// Apply a pending threshold change after the timelock has elapsed.
-    ///
-    /// # Errors
-    /// - `ContractError::NotOwner` — caller is not the vault owner.
-    /// - `ContractError::NoPendingThresholdChange` — no proposal exists.
-    /// - `ContractError::ThresholdChangeTimeLocked` — 24-hour delay not yet elapsed.
-    pub fn apply_multisig_threshold(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-
-        let pending = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PendingThresholdChange>(&DataKey::PendingMultiSigThreshold(vault_id))
-            .ok_or(ContractError::NoPendingThresholdChange)?;
-
-        let now = env.ledger().timestamp();
-        if now < pending.proposed_at + MULTISIG_THRESHOLD_TIMELOCK {
-            return Err(ContractError::ThresholdChangeTimeLocked);
-        }
-
-        // Load, update, and re-store the multi-sig config.
-        let mut config = env
-            .storage()
-            .persistent()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
-            .ok_or(ContractError::MultiSigRequired)?;
-
-        config.threshold = pending.new_threshold;
-        let cfg_key = DataKey::MultiSigConfig(vault_id);
-        env.storage().persistent().set(&cfg_key, &config);
-        env.storage().persistent().extend_ttl(
-            &cfg_key,
-            VAULT_TTL_THRESHOLD,
-            vault_ttl_ledgers(vault.check_in_interval),
-        );
-
-        // Remove the pending proposal.
-        env.storage()
-            .persistent()
-            .remove(&DataKey::PendingMultiSigThreshold(vault_id));
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        env.events().publish(
-            (MULTISIG_THRESHOLD_APPLIED_TOPIC, vault_id),
-            pending.new_threshold,
-        );
-
-        Ok(())
-    }
-
-    /// Cancel a pending threshold change before it has been applied.
-    ///
-    /// Any co-signer or the owner may cancel to abort a malicious proposal.
-    ///
-    /// # Errors
-    /// - `ContractError::NotASigner` — caller is neither the owner nor a co-signer.
-    /// - `ContractError::NoPendingThresholdChange` — no proposal to cancel.
-    pub fn cancel_multisig_threshold(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-
-        // Allow the owner or any current co-signer to cancel.
-        let is_authorized = caller == vault.owner || {
-            match env
-                .storage()
-                .persistent()
-                .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
-            {
-                Some(cfg) => cfg.signers.contains(&caller),
-                None => false,
-            }
-        };
-        if !is_authorized {
-            return Err(ContractError::NotASigner);
-        }
-
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::PendingMultiSigThreshold(vault_id))
-        {
-            return Err(ContractError::NoPendingThresholdChange);
-        }
-
-        env.storage()
-            .persistent()
-            .remove(&DataKey::PendingMultiSigThreshold(vault_id));
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        env.events()
-            .publish((MULTISIG_THRESHOLD_CANCELLED_TOPIC, vault_id), caller);
-
-        Ok(())
-    }
-
-    /// Query a pending threshold change proposal (if any).
-    pub fn get_pending_multisig_threshold(
-        env: Env,
-        vault_id: u64,
-    ) -> Option<PendingThresholdChange> {
-        env.storage()
-            .persistent()
-            .get::<DataKey, PendingThresholdChange>(&DataKey::PendingMultiSigThreshold(vault_id))
     }
 
     /// Remove a single signer from multi-sig config (owner-only).

@@ -102,6 +102,20 @@ pub struct CreateVaultInput {
     pub check_in_interval: i64,
 }
 
+// ── Query guardrails ──────────────────────────────────────────────────────────
+
+/// Maximum nesting depth accepted for an incoming GraphQL query. Queries deeper
+/// than this are rejected *before* execution so a malicious client cannot force
+/// excessive backend work with deeply nested selection sets (including nested
+/// introspection). `async-graphql` enforces this during validation.
+pub const MAX_QUERY_DEPTH: usize = 10;
+
+/// Maximum query complexity (approximate field-resolution cost) accepted before
+/// execution. Every selected field costs 1; this mirrors the additive cost
+/// model in [`crate::cost_estimation`]. Over-limit queries are rejected during
+/// validation with a clear error.
+pub const MAX_QUERY_COMPLEXITY: usize = 500;
+
 // ── Schema context ────────────────────────────────────────────────────────────
 
 pub struct QueryRoot;
@@ -237,6 +251,8 @@ impl MutationRoot {
 /// Build the [`EthosSchema`] with vault and event stores injected as context data.
 pub fn build_schema(vault_store: VaultStore, event_store: EventStore) -> EthosSchema {
     Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .limit_depth(MAX_QUERY_DEPTH)
+        .limit_complexity(MAX_QUERY_COMPLEXITY)
         .data(vault_store)
         .data(event_store)
         .finish()
@@ -259,4 +275,59 @@ pub async fn graphql_handler(
 /// `GET /graphql/playground` — serve the GraphiQL IDE.
 pub async fn graphql_playground() -> impl IntoResponse {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn test_schema() -> EthosSchema {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+        build_schema(vault_store, event_store)
+    }
+
+    #[tokio::test]
+    async fn query_within_depth_limit_succeeds() {
+        // depth: query -> vaults -> vaults -> id  == 3, well under the limit.
+        let resp = test_schema()
+            .execute("{ vaults { vaults { id } total } }")
+            .await;
+        assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    }
+
+    #[tokio::test]
+    async fn query_over_depth_limit_is_rejected() {
+        // Nested introspection chains `ofType` well past MAX_QUERY_DEPTH (10).
+        let deep = "{ __schema { types { fields { type { ofType { ofType { ofType \
+                    { ofType { ofType { ofType { ofType { ofType { ofType \
+                    { name } } } } } } } } } } } } } }";
+        let resp = test_schema().execute(deep).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "expected the query to be rejected for exceeding the depth limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_over_complexity_limit_is_rejected() {
+        // ~100 aliased list sub-selections, each pulling every scalar field —
+        // additive cost blows past MAX_QUERY_COMPLEXITY (500).
+        let mut selections = String::new();
+        for i in 0..100 {
+            selections.push_str(&format!(
+                "a{i}: vaults {{ vaults {{ id owner beneficiary balance checkInInterval \
+                 lastCheckIn createdAt status ttlRemaining }} total page limit }} "
+            ));
+        }
+        let resp = test_schema().execute(format!("{{ {selections} }}")).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "expected the query to be rejected for exceeding the complexity limit"
+        );
+    }
 }

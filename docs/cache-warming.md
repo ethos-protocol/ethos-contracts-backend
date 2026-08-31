@@ -29,11 +29,25 @@ For each tracked vault:
 ### Configuration
 
 ```rust
-const MAX_ACCESS_HISTORY: usize = 100;           // Records per vault
-const FREQUENCY_WINDOW: Duration = 3600s;        // Analysis window
-const MIN_PREFETCH_CONFIDENCE: f64 = 0.7;        // Threshold
-const MAX_PREFETCH_BATCH: usize = 50;            // Max per warming cycle
+const MAX_ACCESS_HISTORY: usize = 100;                 // Records per vault
+const FREQUENCY_WINDOW: Duration = 3600s;              // Analysis window
+const MIN_PREFETCH_CONFIDENCE: f64 = 0.7;              // Threshold
+const MAX_PREFETCH_BATCH: usize = 50;                  // Max candidates per warming cycle
+const DEFAULT_MAX_CONCURRENT_PREFETCHES: usize = 10;   // Max concurrent prefetch execution
 ```
+
+### Prefetch Rate Limiting
+
+`predict_prefetch_targets` can return up to `MAX_PREFETCH_BATCH` (50)
+candidates, already sorted by confidence (predicted access frequency)
+descending. Issuing all of them to the origin store in one burst could spike
+its load, so `warm_cache` executes them in chunks capped at
+`max_concurrent_prefetches` (default 10, configurable via
+`CacheWarmer::with_concurrency_limit`), running each chunk's prefetches
+concurrently via `futures::future::join_all` before moving to the next
+chunk. Because the candidate list is already priority-sorted, the
+highest-confidence targets are always the ones that get through when the
+cap forces some candidates to wait for a later chunk.
 
 ## API
 
@@ -122,9 +136,10 @@ tokio::spawn(async move {
 | Metric | Description |
 |--------|-------------|
 | `total_accesses` | Total vault accesses recorded |
-| `total_prefetches` | Total prefetch attempts |
-| `successful_prefetches` | Prefetches that were actually accessed |
+| `total_prefetches` | Total prefetch attempts issued (the cost of prefetching) |
+| `successful_prefetches` | Prefetch attempts that warmed the cache (hits) |
 | `avg_confidence` | Average prediction confidence across all tracked vaults |
+| `prefetch_hit_rate()` | `successful_prefetches / total_prefetches` — hit rate vs. cost, also exported as `ethos_protocol_cache_warmer_prefetch_hit_rate_percent` via `CacheWarmer::render_prometheus()` alongside the raw counters |
 
 ### Trade-offs
 

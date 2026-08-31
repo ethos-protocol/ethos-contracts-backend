@@ -109,6 +109,36 @@ impl DependencyGraph {
         visited.into_iter().collect()
     }
 
+    /// True if a directed path already exists from `from` to `to` using the
+    /// currently registered edges.
+    pub fn has_path(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return true;
+        }
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier = vec![from.to_string()];
+
+        while let Some(current) = frontier.pop() {
+            for next in self.downstream_of(&current) {
+                if next == to {
+                    return true;
+                }
+                if visited.insert(next.clone()) {
+                    frontier.push(next);
+                }
+            }
+        }
+
+        false
+    }
+
+    /// True if registering `from -> to` would introduce a cycle: either a
+    /// direct self-loop, or a path already exists from `to` back to `from`.
+    pub fn would_create_cycle(&self, from: &str, to: &str) -> bool {
+        from == to || self.has_path(to, from)
+    }
+
     /// Diff this graph against `previous`, returning added/removed edges.
     pub fn diff(&self, previous: &DependencyGraph) -> DependencyChange {
         let added = self
@@ -180,10 +210,14 @@ impl Default for DependencyMapState {
 
 /// `POST /dependencies/discover` — record an observed dependency edge,
 /// detecting and storing any change versus the prior graph snapshot.
+///
+/// Rejects an edge that would introduce a cycle into the graph (directly or
+/// transitively), since a cyclic graph breaks traversal-based tooling like
+/// `impacted_by` and blast-radius analysis.
 pub async fn discover_dependencies(
     State(state): State<Arc<DependencyMapState>>,
     Json(body): Json<DiscoverDependencyRequest>,
-) -> (StatusCode, Json<DiscoveryEvent>) {
+) -> Result<(StatusCode, Json<DiscoveryEvent>), (StatusCode, Json<serde_json::Value>)> {
     let edge = DependencyEdge {
         from: body.from,
         to: body.to,
@@ -191,6 +225,19 @@ pub async fn discover_dependencies(
     };
 
     let mut graph = state.graph.lock().unwrap();
+
+    if graph.would_create_cycle(&edge.from, &edge.to) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!(
+                    "rejecting dependency edge '{}' -> '{}': would introduce a cycle into the dependency graph",
+                    edge.from, edge.to
+                )
+            })),
+        ));
+    }
+
     let previous = graph.clone();
     let is_new = graph.edges.insert(edge.clone());
 
@@ -204,13 +251,13 @@ pub async fn discover_dependencies(
         state.changes.lock().unwrap().push(change);
     }
 
-    (
+    Ok((
         StatusCode::CREATED,
         Json(DiscoveryEvent {
             edge,
             observed_at: Utc::now(),
         }),
-    )
+    ))
 }
 
 /// `GET /dependencies/graph` — return the current graph, with a DOT export
