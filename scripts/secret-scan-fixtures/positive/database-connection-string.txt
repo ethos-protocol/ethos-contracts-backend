@@ -1,0 +1,4 @@
+# Positive fixture for the "database-connection-string-with-credentials"
+# custom rule (.gitleaks.toml). Fake credentials, not a real endpoint.
+REDIS_URL=redis://default:fakepassword123@redis.internal.example:6379/0
+DATABASE_URL=postgres://appuser:S3cretFakeValueNotReal@db.internal.example:5432/ethos

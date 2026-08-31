@@ -6,8 +6,12 @@ pub mod batch_conditional_completion;
 pub mod batching;
 pub mod bulkhead;
 pub mod cache;
+<<<<<<< HEAD
+pub mod captcha;
+=======
 pub mod cache_partition;
 pub mod cdc_lag;
+>>>>>>> origin/main
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
@@ -29,7 +33,11 @@ pub mod graphql;
 pub mod handlers;
 pub mod health;
 pub mod health_routing;
+<<<<<<< HEAD
+pub mod ip_reputation;
+=======
 pub mod incidents;
+>>>>>>> origin/main
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
