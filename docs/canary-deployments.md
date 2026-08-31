@@ -48,21 +48,50 @@ status, and history of progression events.
 Reports the latest observed metrics for the canary's traffic slice:
 
 ```json
-{ "metrics": { "error_rate": 0.004, "latency_p99_ms": 210 } }
+{
+  "metrics": { "error_rate": 0.004, "latency_p99_ms": 210 },
+  "baseline_error_rate": 0.002
+}
 ```
+
+`baseline_error_rate` is the current error rate observed in the *baseline*
+(non-canary) cohort at the same point in time — reporting it on every call is
+what makes the canary-vs-baseline comparison continuous. It's optional; if
+omitted, the deployment keeps using the last baseline error rate it was
+told about (or skips the baseline comparison if none has ever been reported).
 
 This is the metric-based progression and automated-rollback entry point:
 
-- If `error_rate` or `latency_p99_ms` breaches `thresholds`, the deployment
-  is immediately marked `rolled_back` — this is the **automated rollback on
-  errors** behavior.
+- If `error_rate` or `latency_p99_ms` breaches `thresholds` (`max_error_rate` /
+  `max_latency_p99_ms`), the deployment is immediately marked `rolled_back`.
+- **Automatic rollback on error-rate spike relative to baseline**: even if
+  `error_rate` doesn't breach the absolute `max_error_rate` threshold, the
+  deployment is also rolled back once it exceeds the reported
+  `baseline_error_rate` by more than `thresholds.max_error_rate_margin`
+  (default `0.01`, i.e. 1 percentage point). This catches regressions that
+  are only visible relative to what the rest of the fleet is currently
+  experiencing (e.g. during a broader incident where both cohorts' error
+  rates are elevated, but the canary's is meaningfully worse).
 - Otherwise, once the current stage's `min_duration_minutes` has elapsed,
   the deployment advances to the next stage (or `completed` if it was the
   last stage) — this is **metric-based progression**.
 
+Both the triggering condition and the current baseline are recorded in the
+deployment's `history` and returned in `last_baseline_error_rate` /
+`last_metrics` on `GET /deployments/canary/:id`.
+
 A monitoring loop (e.g. reusing the polling pattern in `scheduler.rs`)
-should call this endpoint periodically with live metrics for each active
-canary.
+should call this endpoint periodically with live metrics for both the canary
+and baseline cohorts for each active canary.
+
+### Configuring the auto-rollback margin
+
+`thresholds.max_error_rate_margin` is set per-deployment via
+`POST /deployments/canary` (`thresholds` field), alongside `max_error_rate`
+and `max_latency_p99_ms`. It defaults to `0.01`. Set it tighter for
+high-traffic, low-error-rate services where even a small relative regression
+is significant, and looser for noisy, low-traffic services where baseline
+error rate naturally fluctuates.
 
 ### `POST /deployments/canary/:id/rollback`
 
