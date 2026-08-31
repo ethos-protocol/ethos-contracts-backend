@@ -115,6 +115,10 @@ mod beneficiary_auction_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
 #[cfg(test)]
+mod duplicate_vault_concurrency_tests;
+#[cfg(test)]
+mod vesting_timestamp_edge_case_tests;
+#[cfg(test)]
 mod beneficiary_vesting_auction_tests;
 #[cfg(test)]
 mod beneficiary_vesting_tests;
