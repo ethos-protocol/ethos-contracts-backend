@@ -106,3 +106,36 @@ FcmClient.send() → FCM HTTP v1 API
         ▼
 DeliveryRecord written (sent / failed)
 ```
+
+## Payload Sanitization
+
+All user-controlled string fields (e.g. `vault_id`, `passkey_hash`) are passed
+through `sanitize_notif_field()` before being embedded in FCM notification
+titles, bodies, or `data` payloads. This prevents content-injection attacks on
+notification-rendering engines.
+
+### What is sanitized
+
+| Threat | Mitigation |
+|---|---|
+| HTML/XML injection (`<script>`, `<img onerror=…>`) | HTML tags stripped via state-machine parser |
+| ASCII control characters (null bytes, `\r`, `\n`) | Filtered out entirely |
+| `javascript:` URI scheme | Substring removed (case-insensitive) |
+| Oversized payloads (DoS) | Truncated to `NOTIF_FIELD_MAX_LEN` (128 bytes) at a valid UTF-8 boundary |
+
+### Per-field limits
+
+| Field | Max bytes |
+|---|---|
+| `vault_id` | 128 |
+| `passkey_hash` | 128 |
+
+Fields that exceed the limit are truncated at the nearest valid UTF-8 character
+boundary to avoid splitting multi-byte characters.
+
+### Adding new user-controlled fields
+
+Any new field derived from user input that is included in a notification payload
+**must** be passed through `sanitize_notif_field()` (defined in
+`backend/src/notifications.rs`) before use. Add a regression test for the new
+field in the `notifications::tests` module.

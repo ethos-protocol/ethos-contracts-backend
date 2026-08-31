@@ -2,9 +2,16 @@ pub mod acl;
 pub mod anomaly_detection;
 pub mod audit;
 pub mod backup_validation;
+pub mod batch_conditional_completion;
 pub mod batching;
+pub mod bulkhead;
 pub mod cache;
+<<<<<<< HEAD
 pub mod captcha;
+=======
+pub mod cache_partition;
+pub mod cdc_lag;
+>>>>>>> origin/main
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
@@ -19,14 +26,22 @@ pub mod dlq;
 pub mod error;
 pub mod error_context;
 pub mod event_sourcing;
+pub mod fallback;
 pub mod feature_flags;
 pub mod graphql;
 pub mod handlers;
+pub mod health;
 pub mod health_routing;
+<<<<<<< HEAD
 pub mod ip_reputation;
+=======
+pub mod incidents;
+>>>>>>> origin/main
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
+#[cfg(test)]
+mod migration_rollback_tests;
 pub mod models;
 pub mod multilevel_cache;
 pub mod notifications;
@@ -35,6 +50,7 @@ pub mod priority;
 pub mod profiler;
 pub mod query_cache;
 pub mod replay;
+pub mod request_queue;
 pub mod retention;
 pub mod retry_policy;
 pub mod routes;
@@ -46,6 +62,7 @@ pub mod streaming;
 pub mod templates;
 pub mod timeout_adaptation;
 pub mod timeout_policy;
+pub mod token_revocation;
 pub mod tracing_sampling;
 pub mod two_factor;
 pub mod webauthn;

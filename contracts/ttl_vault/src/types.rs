@@ -94,6 +94,10 @@ pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
 pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
+// Issue #400: threshold-change timelock events
+pub const MULTISIG_THRESHOLD_PROPOSED_TOPIC: Symbol = symbol_short!("ms_t_prp");
+pub const MULTISIG_THRESHOLD_APPLIED_TOPIC: Symbol = symbol_short!("ms_t_app");
+pub const MULTISIG_THRESHOLD_CANCELLED_TOPIC: Symbol = symbol_short!("ms_t_can");
 
 pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
 pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
@@ -392,6 +396,8 @@ pub enum DataKey {
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
+    // Issue #400: pending threshold change (vault_id → PendingThresholdChange)
+    PendingMultiSigThreshold(u64),
     MetadataHistory(u64),
     CustomMetadataHistory(u64),
     OwnerVaultCount(Address),
@@ -1137,6 +1143,21 @@ pub struct MultiSigProposal {
     pub payload: Bytes,
     pub address_payload: Option<Address>,
     pub created_at: u64,
+}
+
+/// Pending threshold change under timelock — Issue #400.
+///
+/// When the vault owner calls `propose_multisig_threshold`, the desired new
+/// threshold is stored here along with the timestamp at which the change was
+/// proposed. The change cannot be applied until
+/// `proposed_at + MULTISIG_THRESHOLD_TIMELOCK` seconds have elapsed.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingThresholdChange {
+    /// The new threshold value that is waiting to take effect.
+    pub new_threshold: u32,
+    /// Unix timestamp (seconds) when this proposal was created.
+    pub proposed_at: u64,
 }
 
 /// Multi-signature operation types
