@@ -265,3 +265,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-492 -->
 - #492: Implement Vault Suspension and Freeze Feature
+
+<!-- handsoff-issue-494 -->
+- #494: Implement Vault Inheritance Chain (Nested Beneficiaries)
