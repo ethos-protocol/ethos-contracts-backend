@@ -265,3 +265,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-497 -->
 - #497: Add Vault Custody Delegation (Proxy Owner)
+
+<!-- handsoff-issue-499 -->
+- #499: Add Passkey Backup Codes Generation
