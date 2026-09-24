@@ -1,0 +1,71 @@
+# Alerting rules for Ethos-Protocol.
+#
+# Metric names correspond to those emitted by backend/src/metrics.rs and
+# backend/src/custom_metrics.rs. Each alert links to the matching section in
+# docs/runbook-alerts.md so on-call has a concrete next action.
+
+groups:
+  - name: ethos-api-health
+    rules:
+      - alert: EthosApiDown
+        expr: up{job="ethos-backend-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ethos-Protocol API is unreachable"
+          description: "Prometheus has failed to scrape {{ $labels.instance }} for 1m. See docs/runbook-alerts.md#ethosapidown"
+          runbook: "docs/runbook-alerts.md#ethosapidown"
+
+      - alert: EthosHighErrorRate
+        expr: |
+          (rate(ethos_protocol_request_errors_total[5m])
+            / clamp_min(rate(ethos_protocol_http_requests_total[5m]), 1))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ethos-Protocol API error rate above 5%"
+          description: "Error rate has been above 5% for 5m on {{ $labels.instance }}. See docs/runbook-alerts.md#ethoshigherrorrate"
+          runbook: "docs/runbook-alerts.md#ethoshigherrorrate"
+
+      - alert: EthosHighApiLatencyP99
+        expr: histogram_quantile(0.99, rate(ethos_protocol_http_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ethos-Protocol API p99 latency above 2s"
+          description: "p99 request latency has exceeded 2s for 5m. See docs/runbook-alerts.md#ethoshighapilatencyp99"
+          runbook: "docs/runbook-alerts.md#ethoshighapilatencyp99"
+
+  - name: ethos-contract-health
+    rules:
+      - alert: EthosContractPaused
+        expr: ethos_protocol_contract_paused == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ttl_vault contract is paused"
+          description: "The on-chain contract has been in a paused state for 1m. See docs/runbook-alerts.md#ethoscontractpaused"
+          runbook: "docs/runbook-alerts.md#ethoscontractpaused"
+
+      - alert: EthosContractUpgradeInProgress
+        expr: increase(ethos_protocol_contract_upgrade_events_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "ttl_vault contract upgrade event observed"
+          description: "An upgrade() call was observed on-chain in the last 10m. Confirm it was authorized. See docs/runbook-alerts.md#ethoscontractupgradeinprogress"
+          runbook: "docs/runbook-alerts.md#ethoscontractupgradeinprogress"
+
+      - alert: EthosCredentialLifecycleAnomalies
+        expr: increase(ethos_protocol_credential_lifecycle_errors_total[15m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated credential lifecycle transition errors"
+          description: "More than 10 credential lifecycle transition errors in 15m. See docs/runbook-alerts.md#ethoscredentiallifecycleanomalies"
+          runbook: "docs/runbook-alerts.md#ethoscredentiallifecycleanomalies"

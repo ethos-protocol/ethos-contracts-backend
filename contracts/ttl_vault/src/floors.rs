@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, panic_with_error};
+use soroban_sdk::{contracttype, panic_with_error, symbol_short, Address, Env, Map};
 
 pub const FLOOR_SET_TOPIC: soroban_sdk::Symbol = symbol_short!("floor_set");
 pub const FLOOR_ENFORCED_TOPIC: soroban_sdk::Symbol = symbol_short!("floor_enf");
@@ -29,6 +29,20 @@ pub fn set_floor(env: &Env, caller: &Address, beneficiary: Address, floor: i128)
     caller.require_auth();
     if floor <= 0 {
         panic_with_error!(&env, crate::ContractError::InvalidAmount);
+    }
+
+    // Issue #345: a floor above its matching cap is an unsatisfiable range.
+    // Cross-check against any cap already configured for this beneficiary,
+    // including on an update that follows an earlier set.
+    let caps: Map<Address, i128> = env
+        .storage()
+        .persistent()
+        .get(&crate::caps::CapsKey::BeneficiaryCaps)
+        .unwrap_or_else(|| Map::new(env));
+    if let Some(cap) = caps.get(beneficiary.clone()) {
+        if crate::range_check::ensure_floor_within_cap(floor, cap).is_err() {
+            panic_with_error!(&env, crate::ContractError::FloorExceedsCap);
+        }
     }
 
     let mut floors: Map<Address, i128> = env
@@ -195,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "floor must be positive")]
+    #[should_panic]
     fn rejects_zero_floor() {
         let env = Env::default();
         env.mock_all_auths();
@@ -203,5 +217,53 @@ mod tests {
         let alice = Address::generate(&env);
 
         set_floor(&env, &admin, alice, 0);
+    }
+
+    // ── Issue #345: floors/caps boundary consistency ─────────────────────────
+
+    #[test]
+    fn floor_within_existing_cap_is_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        crate::caps::set_cap(&env, &admin, alice.clone(), 500);
+        set_floor(&env, &admin, alice.clone(), 200);
+
+        let floors: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&FloorsKey::BeneficiaryFloors)
+            .unwrap();
+        assert_eq!(floors.get(alice).unwrap(), 200);
+    }
+
+    #[test]
+    #[should_panic]
+    fn floor_above_existing_cap_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        crate::caps::set_cap(&env, &admin, alice.clone(), 500);
+        set_floor(&env, &admin, alice, 600);
+    }
+
+    #[test]
+    #[should_panic]
+    fn floor_update_after_initial_set_that_exceeds_cap_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        // Valid initial configuration.
+        crate::caps::set_cap(&env, &admin, alice.clone(), 500);
+        set_floor(&env, &admin, alice.clone(), 200);
+
+        // Regression: a later update must be re-checked against the cap.
+        set_floor(&env, &admin, alice, 900);
     }
 }

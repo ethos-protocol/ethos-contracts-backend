@@ -1,0 +1,4 @@
+# Negative fixture: a PUBLIC key PEM block must not trip the private-key rule.
+-----BEGIN PUBLIC KEY-----
+MIIFAKEPUBKEYFAKEPUBKEYFAKEPUBKEYFAKEPUBKEYFAKEPUBKEYFAKEPUBKEY
+-----END PUBLIC KEY-----

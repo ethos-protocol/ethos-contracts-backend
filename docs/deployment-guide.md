@@ -97,6 +97,58 @@ stellar contract invoke \
 
 For native XLM, use the standard Stellar asset contract address.
 
+## Reproducible Builds
+
+Mainnet WASM artifacts must be byte-for-byte reproducible from source so
+that external auditors can independently verify deployed bytecode matches
+the audited commit.
+
+### Toolchain pinning
+
+`scripts/build.sh` pins the exact `rustc` version (currently `1.96.1`,
+matching the CI toolchain in `.github/workflows/ci.yml`) and warns if the
+active toolchain doesn't match. Install the pinned version with:
+
+```bash
+rustup install 1.96.1
+rustup override set 1.96.1
+```
+
+### What makes the build reproducible
+
+`scripts/build.sh` sets the following before compiling:
+
+- `SOURCE_DATE_EPOCH=0` — normalizes any timestamp embedded by build scripts
+- `CARGO_INCREMENTAL=0` — disables incremental compilation artifacts that
+  can vary between runs
+- `RUSTFLAGS="--remap-path-prefix=$(pwd)=."` — strips the absolute
+  checkout path from embedded debug info, so identical source produces
+  identical output regardless of where it's checked out
+
+After building, `scripts/build.sh` writes SHA-256 hashes of every produced
+`.wasm` file to `target/wasm-hashes.txt`.
+
+### Verifying reproducibility locally
+
+```bash
+rm -rf target && ./scripts/build.sh
+cp target/wasm-hashes.txt /tmp/hashes-a.txt
+
+rm -rf target && ./scripts/build.sh
+diff /tmp/hashes-a.txt target/wasm-hashes.txt
+```
+
+No output from `diff` means the build is reproducible.
+
+### CI enforcement
+
+`.github/workflows/reproducible-build.yml` runs on every push and PR to
+`main`: it builds twice from the same checkout (using separate
+`CARGO_HOME` directories to avoid cache leakage between the two builds),
+diffs the resulting WASM hashes, and fails the job if they differ. A
+failing reproducible-build job should block merge until the
+non-determinism is root-caused — do not silence it by disabling the check.
+
 ## Security Checklist
 
 ### Key Management

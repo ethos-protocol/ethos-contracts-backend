@@ -1,0 +1,67 @@
+name: Reproducible Build Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Kept in sync with scripts/build.sh's EXPECTED_RUST_VERSION and
+  # docs/deployment-guide.md's reproducible build steps.
+  RUST_VERSION: "1.96.1"
+
+jobs:
+  reproducible-build:
+    name: Diff WASM hashes across two independent builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: First build
+        run: |
+          rm -rf target
+          ./scripts/build.sh
+          mkdir -p /tmp/build-a
+          cp target/wasm32-unknown-unknown/release/*.wasm /tmp/build-a/
+          cp target/wasm-hashes.txt /tmp/build-a/
+
+      - name: Second independent build (clean target dir, fresh cargo home)
+        run: |
+          rm -rf target
+          # Use a separate CARGO_HOME to avoid any incremental-build or
+          # registry-cache artifacts leaking between the two builds, which
+          # would make the diff meaningless.
+          export CARGO_HOME="$(mktemp -d)"
+          ./scripts/build.sh
+          mkdir -p /tmp/build-b
+          cp target/wasm32-unknown-unknown/release/*.wasm /tmp/build-b/
+          cp target/wasm-hashes.txt /tmp/build-b/
+
+      - name: Diff WASM hashes
+        run: |
+          echo "Build A hashes:"
+          cat /tmp/build-a/wasm-hashes.txt
+          echo "Build B hashes:"
+          cat /tmp/build-b/wasm-hashes.txt
+
+          # Normalize away the /tmp/build-a vs /tmp/build-b path prefix
+          # before comparing, since only the hash + filename matter.
+          sed 's#/tmp/build-a/##' /tmp/build-a/wasm-hashes.txt | sort > /tmp/a-normalized.txt
+          sed 's#/tmp/build-b/##' /tmp/build-b/wasm-hashes.txt | sort > /tmp/b-normalized.txt
+
+          if ! diff -u /tmp/a-normalized.txt /tmp/b-normalized.txt; then
+            echo ""
+            echo "Non-reproducible build detected: WASM hashes differ between two"
+            echo "independent builds of the same commit. This breaks audit trust —"
+            echo "auditors cannot verify deployed bytecode matches reviewed source."
+            exit 1
+          fi
+
+          echo "Reproducible build verified: hashes match across independent builds."
