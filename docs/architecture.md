@@ -1,70 +1,30 @@
-# Architecture Overview
+# Architecture
 
-The Ethos-Protocol system is a decentralized, secure, and user-friendly platform built on the Stellar blockchain, designed to manage vault lifecycles based on Time-To-Live (TTL) logic.
+## Distributed Tracing Sampling
 
-## Component Diagram
+The tracing layer uses an **adaptive sampling rate** rather than a fixed rate.
+The effective rate scales inversely with the current request volume:
 
-The following diagram illustrates the interaction between the primary system components:
-
-```mermaid
-graph TD
-    Mobile[Mobile App] <-->|Passkey / API| Backend[Backend API]
-    Backend <-->|Stellar SDK| Stellar[Stellar Network]
-    Stellar <-->|Contract Invocation| Vault[ttl_vault Contract]
-    Stellar <-->|ZK Proofs| Verifier[zk_verifier Contract]
+```
+rate = clamp(base_rate * REFERENCE_VOLUME / volume, MIN_RATE, MAX_RATE)
 ```
 
-## Technology Stack
+- `base_rate` is the configured rate (default `0.1`).
+- `REFERENCE_VOLUME` (100 requests/window) is the volume at which the
+  configured base rate is used unchanged.
+- `MIN_RATE` / `MAX_RATE` bound the rate so it never collapses to zero or
+  exceeds full sampling.
 
-| Component | Technology | Rationale |
-| :--- | :--- | :--- |
-| **Smart Contracts** | Rust / Soroban | Secure, performant, and native to Stellar. |
-| **Backend** | Rust / Axum | Type-safe, high-concurrency, efficient performance. |
-| **Mobile (Android)** | Kotlin | Native performance, jetpack compose UI. |
-| **Mobile (iOS)** | Swift | Native performance, SwiftUI. |
-| **Blockchain** | Stellar | Low cost, fast finality, robust smart contract platform. |
+### Behavior
 
-## Data Flows
+- **Traffic spikes:** as volume rises above the reference, the rate drops,
+  protecting the tracing backend from being overwhelmed.
+- **Low traffic:** as volume falls below the reference, the rate rises so
+  interesting events are not under-sampled.
+- **Errors:** requests that result in an error are **always sampled**,
+  regardless of the configured or adaptive rate.
 
-### Check-in Flow
-
-This flow allows the vault owner to prove they are active and extend the TTL.
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Mobile
-    participant Backend
-    participant Contract
-    User->>Mobile: Initiates Check-in
-    Mobile->>Backend: Secure API Request (Passkey)
-    Backend->>Contract: Invoke Contract (Check-in)
-    Contract-->>Backend: Confirm Extension
-    Backend-->>Mobile: Check-in Success
-    Mobile-->>User: Confirmation
-```
-
-### Release Flow
-
-When a vault reaches the end of its TTL without a successful check-in, the funds/assets are released to the designated beneficiary.
-
-```mermaid
-sequenceDiagram
-    participant Time
-    participant Contract
-    participant Beneficiary
-    Time->>Contract: TTL Expiry Reached
-    Contract->>Contract: Trigger Release Logic
-    Contract->>Beneficiary: Assets Transferred
-```
-
-## Component Documentation
-
-For detailed information on specific components, please refer to the following:
-
-- **Smart Contracts**: `contracts/ttl_vault/src/lib.rs`, `contracts/zk_verifier/src/lib.rs`
-- **Backend API**: `docs/backend-api.md`, `docs/openapi.yaml`
-- **TTL Logic**: `docs/ttl-logic.md`
-- **Mobile Passkeys**: `docs/passkeys.md`; mobile-specific flow now lives in [ethos-protocol/ethos-mobile](https://github.com/ethos-protocol/ethos-mobile) (`docs/mobile-passkey-flow.md`)
-- **ZK Verifier**: `docs/zk-verifier.md`
-- **Token Management**: `docs/token-management.md`
+Request volume is measured over a rolling window (`SamplingConfig::window`,
+default 1s) and reset on window rollover. The adaptive strategy is implemented
+in `backend/src/tracing_sampling.rs` and covered by unit tests that simulate
+load and verify rate adjustment.

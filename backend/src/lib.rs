@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod routes;
 pub mod scheduler;
 pub mod templates;
+pub mod tracing_sampling;
 pub mod two_factor;
 pub mod websocket;
 
