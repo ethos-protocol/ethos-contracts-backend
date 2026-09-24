@@ -265,3 +265,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-489 -->
 - #489: Add Vault Metadata and Tags System
+
+<!-- handsoff-issue-490 -->
+- #490: Implement Vault Cloning for Template Creation
