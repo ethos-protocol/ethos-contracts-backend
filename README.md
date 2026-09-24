@@ -268,3 +268,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-494 -->
 - #494: Implement Vault Inheritance Chain (Nested Beneficiaries)
+
+<!-- handsoff-issue-495 -->
+- #495: Add Vault Proof-of-Life Attestation System
