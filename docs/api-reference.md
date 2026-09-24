@@ -86,7 +86,47 @@ Retrieve current reminder preferences for a vault.
 
 ---
 
-## Scheduler Behaviour
+## Request Queue & Backpressure (Issue #866)
+
+The API server queues all Soroban RPC-bound operations through an internal
+bounded channel (`MAX_DEPTH = 256` slots).  When the queue is full, new
+requests are rejected with HTTP 429 until the worker drains enough capacity.
+
+### Realistic Soroban RPC Latency Expectations
+
+| Scenario                        | Typical Latency   | Notes                                      |
+|---------------------------------|-------------------|--------------------------------------------|
+| Testnet — healthy               | 200 – 600 ms      | Expected baseline                          |
+| Testnet — moderate congestion   | 600 ms – 1.5 s    | Submit/retry loop or resource-intensive ops|
+| Testnet — peak congestion       | 1.5 s – 2 s       | Near the documented 2 s ceiling            |
+| Mainnet — healthy               | 200 – 800 ms      | Varies by RPC provider                     |
+| Mainnet — congestion            | up to 2 s         | Upper bound for queue/timeout sizing       |
+
+**Consequences for queue depth:**
+
+- At 200 ms average latency the worker processes ~5 items/second.
+  With a `MAX_DEPTH` of 256 the queue absorbs ~51 seconds of burst before
+  backpressure kicks in.
+- At 2 s average latency throughput drops to ~0.5 items/second.
+  The same 256-slot queue fills in ~512 seconds of sustained overload.
+
+### Backpressure Response
+
+When the queue is at capacity the server returns:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+
+{
+  "error": "request queue full (backpressure active)",
+  "retry_after_ms": 500
+}
+```
+
+Clients should honour `retry_after_ms` and apply exponential back-off.
+
+---
 
 The background scheduler polls every 60 seconds. For each vault with stored preferences it:
 

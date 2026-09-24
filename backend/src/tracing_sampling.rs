@@ -1,179 +1,485 @@
-//! Adaptive distributed tracing sampling.
-//!
-//! A fixed sampling rate can overwhelm the tracing backend during traffic
-//! spikes while under-sampling interesting events during quiet periods. This
-//! module provides an adaptive sampler whose effective rate scales inversely
-//! with the current request volume, while always sampling errors.
-
+/// Request tracing with sampling for Ethos-Protocol backend.
+///
+/// # Overview
+///
+/// Full distributed tracing of every request is expensive at high throughput.
+/// This module provides a configurable sampling layer that gates which requests
+/// receive trace spans, with three complementary strategies:
+///
+/// - **Head-based sampling**: The sampling decision is made at the very start of
+///   the request, before any work is done.  A random number is compared against
+///   a configured rate (`0.0`–`1.0`).
+/// - **Adaptive sampling**: The sample rate automatically decreases when the
+///   server is under load (estimated via request-per-second tracking) so
+///   tracing overhead stays bounded.
+/// - **Always-on for errors**: Requests that result in 4xx/5xx responses are
+///   always traced regardless of the sampling rate, ensuring errors are never
+///   silently dropped from traces.
+///
+/// # Configuration
+///
+/// | Environment variable | Default | Description |
+/// |---|---|---|
+/// | `TRACE_SAMPLE_RATE` | `0.1` | Baseline fraction of requests to trace (0.0–1.0) |
+/// | `TRACE_ADAPTIVE` | `true` | Enable adaptive rate reduction under load |
+/// | `TRACE_ADAPTIVE_HIGH_RPS` | `500` | RPS threshold above which rate is halved |
+/// | `TRACE_ALWAYS_ERRORS` | `true` | Always trace requests that produce errors |
+/// | `TRACE_ENABLED` | `true` | Master toggle for tracing |
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use ethos_protocol_backend::tracing_sampling::{SamplingConfig, TraceSampler};
+///
+/// let sampler = TraceSampler::from_env();
+///
+/// // In a Tower middleware or axum extractor:
+/// if sampler.should_sample() {
+///     // attach tracing span …
+/// }
+/// ```
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Configuration for the adaptive sampler.
-#[derive(Debug, Clone, Copy)]
-pub struct AdaptiveSamplingConfig {
-    /// Sampling rate applied when traffic is at or below `low_volume_rps`.
-    pub max_rate: f64,
-    /// Sampling rate applied when traffic is at or above `high_volume_rps`.
-    pub min_rate: f64,
-    /// Request volume (requests per second) considered "low".
-    pub low_volume_rps: f64,
-    /// Request volume (requests per second) considered "high".
-    pub high_volume_rps: f64,
-    /// Window over which request volume is measured.
-    pub window: Duration,
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+/// Sampling strategy configuration.
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    /// Baseline probability of sampling a request (0.0 = never, 1.0 = always).
+    pub sample_rate: f64,
+    /// Whether adaptive rate adjustment is enabled.
+    pub adaptive: bool,
+    /// Requests-per-second above which the effective rate is halved.
+    pub adaptive_high_rps: f64,
+    /// Always emit a trace for requests that produce an HTTP error response.
+    pub always_trace_errors: bool,
+    /// Master toggle — when `false` no requests are sampled.
+    pub enabled: bool,
 }
 
-impl Default for AdaptiveSamplingConfig {
+impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
-            max_rate: 1.0,
-            min_rate: 0.01,
-            low_volume_rps: 10.0,
-            high_volume_rps: 1000.0,
-            window: Duration::from_secs(1),
+            sample_rate: 0.1,
+            adaptive: true,
+            adaptive_high_rps: 500.0,
+            always_trace_errors: true,
+            enabled: true,
         }
     }
 }
 
-/// Adaptive sampler that tracks request volume and derives a sampling rate.
-#[derive(Debug)]
-pub struct AdaptiveSampler {
-    config: AdaptiveSamplingConfig,
-    window_start: Instant,
-    window_requests: AtomicU64,
-    /// Last computed rate, stored as bits for lock-free reads.
-    last_rate_bits: AtomicU64,
-}
-
-impl AdaptiveSampler {
-    pub fn new(config: AdaptiveSamplingConfig) -> Self {
+impl SamplingConfig {
+    /// Build from environment variables, falling back to defaults.
+    pub fn from_env() -> Self {
         Self {
-            last_rate_bits: AtomicU64::new(config.max_rate.to_bits()),
+            sample_rate: std::env::var("TRACE_SAMPLE_RATE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|r| r.clamp(0.0, 1.0))
+                .unwrap_or(0.1),
+            adaptive: std::env::var("TRACE_ADAPTIVE")
+                .ok()
+                .map(|v| v.to_lowercase() != "false" && v != "0")
+                .unwrap_or(true),
+            adaptive_high_rps: std::env::var("TRACE_ADAPTIVE_HIGH_RPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500.0),
+            always_trace_errors: std::env::var("TRACE_ALWAYS_ERRORS")
+                .ok()
+                .map(|v| v.to_lowercase() != "false" && v != "0")
+                .unwrap_or(true),
+            enabled: std::env::var("TRACE_ENABLED")
+                .ok()
+                .map(|v| v.to_lowercase() != "false" && v != "0")
+                .unwrap_or(true),
+        }
+    }
+}
+
+// ── RPS tracker (for adaptive sampling) ───────────────────────────────────────
+
+/// Sliding-window request-rate estimator using a simple 1-second bucket.
+#[derive(Debug)]
+struct RpsTracker {
+    /// Number of requests counted in the current bucket.
+    count: AtomicU64,
+    /// Start of the current 1-second window.
+    window_start: std::sync::Mutex<Instant>,
+    /// Smoothed RPS estimate.
+    smoothed_rps: std::sync::Mutex<f64>,
+}
+
+impl RpsTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: AtomicU64::new(0),
+            window_start: std::sync::Mutex::new(Instant::now()),
+            smoothed_rps: std::sync::Mutex::new(0.0),
+        })
+    }
+
+    /// Record one request and return the current smoothed RPS estimate.
+    fn tick(&self) -> f64 {
+        let now = Instant::now();
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let elapsed = {
+            let start = self.window_start.lock().unwrap();
+            now.duration_since(*start)
+        };
+
+        if elapsed >= Duration::from_secs(1) {
+            // Bucket expired — compute rate for this window.
+            let rate = count as f64 / elapsed.as_secs_f64();
+
+            // Exponential moving average (alpha = 0.3).
+            let mut smoothed = self.smoothed_rps.lock().unwrap();
+            *smoothed = 0.3 * rate + 0.7 * (*smoothed);
+
+            // Reset bucket.
+            self.count.store(0, Ordering::Relaxed);
+            let mut start = self.window_start.lock().unwrap();
+            *start = now;
+
+            *smoothed
+        } else {
+            *self.smoothed_rps.lock().unwrap()
+        }
+    }
+}
+
+// ── TraceSampler ──────────────────────────────────────────────────────────────
+
+/// The main sampling engine.  Cheap to clone (inner state behind `Arc`).
+#[derive(Clone, Debug)]
+pub struct TraceSampler {
+    config: SamplingConfig,
+    rps: Arc<RpsTracker>,
+    /// Total requests evaluated.
+    pub total_evaluated: Arc<AtomicU64>,
+    /// Total requests that were sampled (trace was started).
+    pub total_sampled: Arc<AtomicU64>,
+}
+
+impl TraceSampler {
+    /// Create a sampler from an explicit [`SamplingConfig`].
+    pub fn new(config: SamplingConfig) -> Self {
+        Self {
             config,
-            window_start: Instant::now(),
-            window_requests: AtomicU64::new(0),
+            rps: RpsTracker::new(),
+            total_evaluated: Arc::new(AtomicU64::new(0)),
+            total_sampled: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Records an incoming request and returns the current effective rate.
-    pub fn record_request(&mut self) -> f64 {
-        self.window_requests.fetch_add(1, Ordering::Relaxed);
-        self.refresh_rate()
+    /// Create a sampler from environment variables.
+    pub fn from_env() -> Self {
+        Self::new(SamplingConfig::from_env())
     }
 
-    /// Returns the current effective sampling rate without recording a request.
-    pub fn current_rate(&self) -> f64 {
-        f64::from_bits(self.last_rate_bits.load(Ordering::Relaxed))
-    }
-
-    /// Recomputes the rate if the measurement window has elapsed.
-    fn refresh_rate(&mut self) -> f64 {
-        let elapsed = self.window_start.elapsed();
-        if elapsed < self.config.window {
-            return self.current_rate();
+    /// Compute the effective sample rate, applying adaptive reduction when
+    /// the server is under high load.
+    pub fn effective_rate(&self) -> f64 {
+        if !self.config.enabled {
+            return 0.0;
         }
 
-        let requests = self.window_requests.swap(0, Ordering::Relaxed);
-        self.window_start = Instant::now();
-        let rps = requests as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
-        let rate = self.rate_for_volume(rps);
-        self.last_rate_bits.store(rate.to_bits(), Ordering::Relaxed);
-        rate
+        let mut rate = self.config.sample_rate;
+
+        if self.config.adaptive {
+            let current_rps = *self.rps.smoothed_rps.lock().unwrap();
+            if current_rps >= self.config.adaptive_high_rps {
+                // Halve the rate under high load to reduce overhead.
+                rate *= 0.5;
+            }
+        }
+
+        rate.clamp(0.0, 1.0)
     }
 
-    /// Computes the sampling rate for a given request volume.
+    /// Head-based sampling decision for a new request.
     ///
-    /// The rate scales inversely with volume: it is `max_rate` at or below
-    /// `low_volume_rps`, `min_rate` at or above `high_volume_rps`, and
-    /// interpolated linearly in between.
-    pub fn rate_for_volume(&self, rps: f64) -> f64 {
-        let cfg = &self.config;
-        if rps <= cfg.low_volume_rps {
-            return cfg.max_rate;
-        }
-        if rps >= cfg.high_volume_rps {
-            return cfg.min_rate;
-        }
-        let span = cfg.high_volume_rps - cfg.low_volume_rps;
-        let position = (rps - cfg.low_volume_rps) / span;
-        cfg.max_rate + (cfg.min_rate - cfg.max_rate) * position
-    }
+    /// Records an RPS tick, increments counters, and returns `true` if the
+    /// request should be traced.
+    pub fn should_sample(&self) -> bool {
+        self.rps.tick();
+        self.total_evaluated.fetch_add(1, Ordering::Relaxed);
 
-    /// Decides whether a request should be sampled.
-    ///
-    /// Errors are always sampled regardless of the adaptive rate.
-    pub fn should_sample(&self, is_error: bool) -> bool {
-        if is_error {
-            return true;
-        }
-        let rate = self.current_rate();
-        if rate >= 1.0 {
-            return true;
-        }
-        if rate <= 0.0 {
+        if !self.config.enabled {
             return false;
         }
-        // Deterministic pseudo-random decision derived from the rate.
-        let threshold = (rate * u64::MAX as f64) as u64;
-        let sample = self.window_requests.load(Ordering::Relaxed);
-        sample.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) < threshold
+
+        let rate = self.effective_rate();
+        let sample = pseudo_random_f64() < rate;
+
+        if sample {
+            self.total_sampled.fetch_add(1, Ordering::Relaxed);
+        }
+
+        sample
+    }
+
+    /// Build the tracing span for a sampled request, carrying the correlation
+    /// id (issue #349) so every log line and child span emitted while the
+    /// request is handled is tagged with `request_id` and can be joined against
+    /// job and message-queue records for the same request.
+    ///
+    /// `request_id` is the value assigned at ingress by
+    /// `error_context::correlation_id_middleware` (`X-Request-Id`).
+    pub fn request_span(&self, request_id: &str, method: &str, path: &str) -> tracing::Span {
+        tracing::info_span!(
+            "sampled_request",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            sampled = true,
+        )
+    }
+
+    /// Force a trace for an error response, regardless of sample rate.
+    ///
+    /// Returns `true` if `always_trace_errors` is on (and tracing is enabled).
+    pub fn should_sample_error(&self) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        if self.config.always_trace_errors {
+            self.total_sampled.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            self.should_sample()
+        }
+    }
+
+    /// Render sampling metrics in Prometheus text format.
+    pub fn render_metrics(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+
+        let evaluated = self.total_evaluated.load(Ordering::Relaxed);
+        let sampled = self.total_sampled.load(Ordering::Relaxed);
+        let rate = self.effective_rate();
+
+        let _ = writeln!(
+            out,
+            "# HELP ethos_trace_requests_evaluated_total Requests evaluated for sampling"
+        );
+        let _ = writeln!(out, "# TYPE ethos_trace_requests_evaluated_total counter");
+        let _ = writeln!(out, "ethos_trace_requests_evaluated_total {evaluated}");
+
+        let _ = writeln!(
+            out,
+            "# HELP ethos_trace_requests_sampled_total Requests that were traced"
+        );
+        let _ = writeln!(out, "# TYPE ethos_trace_requests_sampled_total counter");
+        let _ = writeln!(out, "ethos_trace_requests_sampled_total {sampled}");
+
+        let _ = writeln!(
+            out,
+            "# HELP ethos_trace_effective_sample_rate Current effective sample rate"
+        );
+        let _ = writeln!(out, "# TYPE ethos_trace_effective_sample_rate gauge");
+        let _ = writeln!(out, "ethos_trace_effective_sample_rate {rate:.4}");
+
+        out
     }
 }
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// A fast, thread-safe pseudo-random float in [0, 1).
+///
+/// Uses the current thread's stack address mixed with a nanosecond timestamp
+/// as entropy.  This is intentionally *not* cryptographically secure — it just
+/// needs to distribute sampling decisions pseudo-randomly.
+fn pseudo_random_f64() -> f64 {
+    use std::time::SystemTime;
+
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+
+    // Mix with thread-local stack address for additional entropy per thread.
+    let addr = &nanos as *const _ as u64;
+    let mixed = nanos as u64 ^ addr.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+
+    // Map to [0, 1).
+    (mixed & 0x000F_FFFF_FFFF_FFFF) as f64 / (0x0010_0000_0000_0000u64 as f64)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sampler() -> AdaptiveSampler {
-        AdaptiveSampler::new(AdaptiveSamplingConfig {
-            max_rate: 1.0,
-            min_rate: 0.01,
-            low_volume_rps: 10.0,
-            high_volume_rps: 1000.0,
-            window: Duration::from_millis(1),
-        })
+    #[test]
+    fn test_config_defaults() {
+        let cfg = SamplingConfig::default();
+        assert!((cfg.sample_rate - 0.1).abs() < f64::EPSILON);
+        assert!(cfg.adaptive);
+        assert!(cfg.always_trace_errors);
+        assert!(cfg.enabled);
     }
 
     #[test]
-    fn rate_is_max_at_low_volume() {
-        let s = sampler();
-        assert_eq!(s.rate_for_volume(0.0), 1.0);
-        assert_eq!(s.rate_for_volume(10.0), 1.0);
+    fn test_config_from_env() {
+        std::env::set_var("TRACE_SAMPLE_RATE", "0.5");
+        std::env::set_var("TRACE_ADAPTIVE", "false");
+        std::env::set_var("TRACE_ADAPTIVE_HIGH_RPS", "1000");
+        std::env::set_var("TRACE_ALWAYS_ERRORS", "false");
+
+        let cfg = SamplingConfig::from_env();
+        assert!((cfg.sample_rate - 0.5).abs() < f64::EPSILON);
+        assert!(!cfg.adaptive);
+        assert!((cfg.adaptive_high_rps - 1000.0).abs() < f64::EPSILON);
+        assert!(!cfg.always_trace_errors);
+
+        std::env::remove_var("TRACE_SAMPLE_RATE");
+        std::env::remove_var("TRACE_ADAPTIVE");
+        std::env::remove_var("TRACE_ADAPTIVE_HIGH_RPS");
+        std::env::remove_var("TRACE_ALWAYS_ERRORS");
     }
 
     #[test]
-    fn rate_is_min_at_high_volume() {
-        let s = sampler();
-        assert_eq!(s.rate_for_volume(1000.0), 0.01);
-        assert_eq!(s.rate_for_volume(5000.0), 0.01);
+    fn test_sample_rate_clamp() {
+        std::env::set_var("TRACE_SAMPLE_RATE", "2.5");
+        let cfg = SamplingConfig::from_env();
+        assert!((cfg.sample_rate - 1.0).abs() < f64::EPSILON);
+        std::env::remove_var("TRACE_SAMPLE_RATE");
     }
 
     #[test]
-    fn rate_scales_inversely_with_volume() {
-        let s = sampler();
-        let low = s.rate_for_volume(100.0);
-        let mid = s.rate_for_volume(500.0);
-        let high = s.rate_for_volume(900.0);
-        assert!(low > mid, "rate should decrease as volume grows");
-        assert!(mid > high, "rate should decrease as volume grows");
-    }
-
-    #[test]
-    fn errors_are_always_sampled() {
-        let s = sampler();
-        assert!(s.should_sample(true));
-    }
-
-    #[test]
-    fn adaptive_rate_adjusts_under_simulated_load() {
-        let mut s = sampler();
-        // Simulate a burst of traffic within the window.
-        for _ in 0..2000 {
-            s.record_request();
+    fn test_disabled_never_samples() {
+        let cfg = SamplingConfig {
+            enabled: false,
+            sample_rate: 1.0,
+            ..Default::default()
+        };
+        let sampler = TraceSampler::new(cfg);
+        for _ in 0..100 {
+            assert!(!sampler.should_sample());
         }
-        std::thread::sleep(Duration::from_millis(5));
-        let rate = s.record_request();
-        assert!(rate < 1.0, "rate should drop under high load, got {rate}");
-        assert!(rate >= 0.01, "rate should not drop below min, got {rate}");
+        assert_eq!(sampler.total_sampled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_always_sample_rate_one() {
+        let cfg = SamplingConfig {
+            sample_rate: 1.0,
+            adaptive: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let sampler = TraceSampler::new(cfg);
+        for _ in 0..20 {
+            assert!(sampler.should_sample());
+        }
+    }
+
+    #[test]
+    fn test_never_sample_rate_zero() {
+        let cfg = SamplingConfig {
+            sample_rate: 0.0,
+            adaptive: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let sampler = TraceSampler::new(cfg);
+        for _ in 0..100 {
+            assert!(!sampler.should_sample());
+        }
+    }
+
+    #[test]
+    fn test_error_always_sampled() {
+        let cfg = SamplingConfig {
+            sample_rate: 0.0,
+            adaptive: false,
+            always_trace_errors: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let sampler = TraceSampler::new(cfg);
+        // Even with 0% rate, errors should be sampled.
+        assert!(sampler.should_sample_error());
+    }
+
+    #[test]
+    fn test_evaluated_counter_increments() {
+        let sampler = TraceSampler::new(SamplingConfig::default());
+        for _ in 0..10 {
+            sampler.should_sample();
+        }
+        assert_eq!(sampler.total_evaluated.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn test_render_metrics_contains_keys() {
+        let sampler = TraceSampler::new(SamplingConfig {
+            sample_rate: 1.0,
+            adaptive: false,
+            ..Default::default()
+        });
+        sampler.should_sample();
+        let out = sampler.render_metrics();
+        assert!(out.contains("ethos_trace_requests_evaluated_total"));
+        assert!(out.contains("ethos_trace_requests_sampled_total"));
+        assert!(out.contains("ethos_trace_effective_sample_rate"));
+    }
+
+    #[test]
+    fn test_effective_rate_adaptive_high_rps() {
+        let cfg = SamplingConfig {
+            sample_rate: 0.8,
+            adaptive: true,
+            adaptive_high_rps: 0.0, // threshold set to 0 so it always triggers
+            enabled: true,
+            ..Default::default()
+        };
+        let sampler = TraceSampler::new(cfg);
+
+        // Manually set smoothed RPS above threshold.
+        {
+            let mut rps = sampler.rps.smoothed_rps.lock().unwrap();
+            *rps = 1000.0;
+        }
+
+        // With 0 threshold and 0.8 rate, effective should be halved to 0.4.
+        let rate = sampler.effective_rate();
+        assert!((rate - 0.4).abs() < 1e-9, "expected ~0.4, got {rate}");
+    }
+
+    #[test]
+    fn test_request_span_carries_correlation_id() {
+        // With a subscriber active the span is enabled and its metadata is
+        // observable; assert the correlation-id field is declared on it.
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let sampler = TraceSampler::new(SamplingConfig::default());
+            let span = sampler.request_span("req-abc-123", "GET", "/api/vaults/1/reminders");
+            let meta = span
+                .metadata()
+                .expect("span should be enabled under a subscriber");
+            assert!(meta.fields().field("request_id").is_some());
+            assert_eq!(meta.name(), "sampled_request");
+        });
+    }
+
+    #[test]
+    fn test_rps_tracker_tick() {
+        let tracker = RpsTracker::new();
+        // Ticking increments the count.
+        for _ in 0..5 {
+            tracker.tick();
+        }
+        // The count should be at most 5 (may have rolled over if > 1 second elapsed).
+        let count = tracker.count.load(Ordering::Relaxed);
+        assert!(count <= 5);
     }
 }
