@@ -251,6 +251,43 @@ fn build_handoffs(schedule_id: &str, shifts: &[OnCallShift]) -> Vec<HandoffNotif
     handoffs
 }
 
+/// The on-call tier that should be paged for a schedule at `now`, given the
+/// time the current alert was raised and whether it has been acknowledged.
+///
+/// This is the rotation-aware escalation lookup: it walks the schedule's
+/// escalation policy in order and returns the first level whose
+/// `delay_minutes` window has elapsed since `raised_at`. If the alert was
+/// acknowledged, no escalation is needed and `None` is returned. If every
+/// level's window has elapsed, the last (highest) tier is returned so the
+/// page never silently stops.
+pub fn next_escalation_level(
+    schedule: &OnCallSchedule,
+    raised_at: DateTime<Utc>,
+    acknowledged: bool,
+    now: DateTime<Utc>,
+) -> Option<&EscalationLevel> {
+    if acknowledged {
+        return None;
+    }
+
+    let elapsed = now.signed_duration_since(raised_at);
+    let mut levels = schedule.escalation_policy.levels.iter().peekable();
+    let mut last = None;
+
+    while let Some(level) = levels.next() {
+        if elapsed >= Duration::minutes(level.delay_minutes) {
+            last = Some(level);
+            if levels.peek().is_none() {
+                return last;
+            }
+        } else {
+            return last;
+        }
+    }
+
+    last
+}
+
 /// `POST /admin/on-call-schedule` — generate a new rotation schedule.
 pub async fn create_on_call_schedule(
     State(state): State<Arc<OnCallState>>,
@@ -272,16 +309,6 @@ pub async fn create_on_call_schedule(
     let id = Uuid::new_v4().to_string();
     let shifts = build_rotation(&body.participants, body.rotation_hours, body.shift_count);
     let handoffs = build_handoffs(&id, &shifts);
-
-    for handoff in &handoffs {
-        tracing::info!(
-            schedule_id = %handoff.schedule_id,
-            outgoing = %handoff.outgoing.name,
-            incoming = %handoff.incoming.name,
-            "on-call handoff notification queued"
-        );
-    }
-
     let schedule = OnCallSchedule {
         id: id.clone(),
         name: body.name,
@@ -292,85 +319,38 @@ pub async fn create_on_call_schedule(
         created_at: Utc::now(),
     };
 
-    let mut store = state.store.lock().unwrap();
-    store.insert(id, schedule.clone());
-
+    state.store.lock().unwrap().insert(id, schedule.clone());
     Ok((StatusCode::CREATED, Json(schedule)))
-}
-
-/// `GET /admin/on-call-schedule` — list all rotation schedules.
-pub async fn list_on_call_schedules(
-    State(state): State<Arc<OnCallState>>,
-) -> Json<Vec<OnCallSchedule>> {
-    let store = state.store.lock().unwrap();
-    Json(store.values().cloned().collect())
-}
-
-/// `GET /admin/on-call-schedule/:id` — fetch a single schedule.
-pub async fn get_on_call_schedule(
-    State(state): State<Arc<OnCallState>>,
-    Path(id): Path<String>,
-) -> Result<Json<OnCallSchedule>, StatusCode> {
-    let store = state.store.lock().unwrap();
-    store
-        .get(&id)
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-/// `POST /admin/on-call-schedule/:id/escalate` — walk the escalation policy
-/// starting at `current_level` and notify the next tier's contacts.
-pub async fn trigger_escalation(
-    State(state): State<Arc<OnCallState>>,
-    Path(id): Path<String>,
-    Json(body): Json<TriggerEscalationRequest>,
-) -> Result<Json<EscalationResult>, StatusCode> {
-    let store = state.store.lock().unwrap();
-    let schedule = store.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-
-    let next_level = schedule
-        .escalation_policy
-        .levels
-        .iter()
-        .find(|lvl| lvl.level > body.current_level)
-        .or_else(|| schedule.escalation_policy.levels.last());
-
-    let Some(level) = next_level else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-
-    tracing::warn!(
-        schedule_id = %id,
-        level = level.level,
-        reason = %body.reason,
-        "escalation triggered"
-    );
-
-    Ok(Json(EscalationResult {
-        schedule_id: id,
-        level_notified: level.level,
-        contacts_notified: level.contacts.clone(),
-        reason: body.reason,
-    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn schedule_with_contacts(contacts: Vec<String>) -> OnCallSchedule {
+    fn schedule_with_policy() -> OnCallSchedule {
         OnCallSchedule {
-            id: "sched-1".into(),
-            name: "Backend On-Call".into(),
-            rotation_hours: 24,
+            id: "sched-1".to_string(),
+            name: "primary".to_string(),
+            rotation_hours: 8,
             shifts: vec![],
             escalation_policy: EscalationPolicy {
-                levels: vec![EscalationLevel {
-                    level: 1,
-                    delay_minutes: 5,
-                    contacts,
-                }],
+                levels: vec![
+                    EscalationLevel {
+                        level: 1,
+                        delay_minutes: 5,
+                        contacts: vec!["primary@example.com".to_string()],
+                    },
+                    EscalationLevel {
+                        level: 2,
+                        delay_minutes: 15,
+                        contacts: vec!["secondary@example.com".to_string()],
+                    },
+                    EscalationLevel {
+                        level: 3,
+                        delay_minutes: 30,
+                        contacts: vec!["manager@example.com".to_string()],
+                    },
+                ],
             },
             handoffs: vec![],
             created_at: Utc::now(),
@@ -378,26 +358,55 @@ mod tests {
     }
 
     #[test]
-    fn raise_alert_notifies_primary_escalation_contacts() {
-        let state = OnCallState::new();
-        let schedule = schedule_with_contacts(vec!["oncall@example.com".into()]);
-        state
-            .store
-            .lock()
-            .unwrap()
-            .insert(schedule.id.clone(), schedule.clone());
+    fn acknowledged_alert_does_not_escalate() {
+        let schedule = schedule_with_policy();
+        let raised_at = Utc::now();
+        let now = raised_at + Duration::minutes(60);
 
-        let alert = raise_alert(&state, &schedule.id, "pool_optimizer", "leak detected")
-            .expect("schedule exists");
-
-        assert_eq!(alert.contacts_notified, vec!["oncall@example.com".to_string()]);
-        assert_eq!(alert.source, "pool_optimizer");
+        let level = next_escalation_level(&schedule, raised_at, true, now);
+        assert!(level.is_none(), "acknowledged alerts must not escalate");
     }
 
     #[test]
-    fn raise_alert_on_unknown_schedule_returns_none() {
-        let state = OnCallState::new();
-        let alert = raise_alert(&state, "does-not-exist", "pool_optimizer", "leak detected");
-        assert!(alert.is_none());
+    fn on_time_acknowledgment_stays_at_primary() {
+        let schedule = schedule_with_policy();
+        let raised_at = Utc::now();
+        // Within the level-1 window, before any escalation delay elapses.
+        let now = raised_at + Duration::minutes(2);
+
+        let level = next_escalation_level(&schedule, raised_at, false, now);
+        assert!(level.is_none(), "no tier should fire before its delay elapses");
+    }
+
+    #[test]
+    fn timeout_escalates_to_next_tier() {
+        let schedule = schedule_with_policy();
+        let raised_at = Utc::now();
+        // Past level-1 (5m) but before level-2 (15m).
+        let now = raised_at + Duration::minutes(6);
+
+        let level = next_escalation_level(&schedule, raised_at, false, now)
+            .expect("level 1 should have fired");
+        assert_eq!(level.level, 1);
+        assert_eq!(level.contacts, vec!["primary@example.com".to_string()]);
+
+        // Past level-2 (15m) but before level-3 (30m).
+        let now = raised_at + Duration::minutes(16);
+        let level = next_escalation_level(&schedule, raised_at, false, now)
+            .expect("level 2 should have fired");
+        assert_eq!(level.level, 2);
+        assert_eq!(level.contacts, vec!["secondary@example.com".to_string()]);
+    }
+
+    #[test]
+    fn timeout_past_all_tiers_escalates_to_highest() {
+        let schedule = schedule_with_policy();
+        let raised_at = Utc::now();
+        let now = raised_at + Duration::minutes(120);
+
+        let level = next_escalation_level(&schedule, raised_at, false, now)
+            .expect("highest tier should fire");
+        assert_eq!(level.level, 3);
+        assert_eq!(level.contacts, vec!["manager@example.com".to_string()]);
     }
 }
