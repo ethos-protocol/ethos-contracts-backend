@@ -105,3 +105,56 @@ fn test_grace_period_default_allows_immediate_release() {
     client.trigger_release(&vault_id);
     assert_eq!(client.get_vault(&vault_id).status, ReleaseStatus::Released);
 }
+
+#[test]
+fn test_check_in_during_grace_period_resets_ttl() {
+    let (env, owner, beneficiary, _admin, _token_address, client) = setup();
+
+    // Set grace period to 100 seconds
+    let mut config = client.get_protocol_config();
+    config.release_grace_period_seconds = 100;
+    client.propose_protocol_config(&config);
+
+    // fast forward 24 hours (86400 seconds) to apply protocol config
+    env.ledger().set_timestamp(env.ledger().timestamp() + 86400);
+    client.apply_protocol_config();
+
+    // Create vault with check-in interval of 500 seconds
+    let interval = 500u64;
+    let vault_id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    let deposit_amount = 100_000i128;
+    client.deposit(&owner, &vault_id, &deposit_amount);
+
+    // Initial check in to reset the timestamp
+    let mut now = env.ledger().timestamp() + 10;
+    env.ledger().set_timestamp(now);
+    client.check_in(&vault_id, &owner, &None);
+
+    // Fast forward to expiry (now + 500)
+    now += 500;
+    env.ledger().set_timestamp(now);
+
+    // Owner checks in during the grace period; this should reset the TTL
+    client.check_in(&vault_id, &owner, &None);
+
+    // Immediately after check-in, release should be blocked (TTL reset)
+    let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::GracePeriodActive as u32));
+
+    // Fast forward to the new expiry (now + 500)
+    now += 500;
+    env.ledger().set_timestamp(now);
+
+    // Still within the new grace period, release should be blocked
+    let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::GracePeriodActive as u32));
+
+    // Fast forward past the new grace period
+    now += 100;
+    env.ledger().set_timestamp(now);
+
+    // Release should now succeed
+    client.trigger_release(&vault_id);
+    assert_eq!(client.get_vault(&vault_id).status, ReleaseStatus::Released);
+}
