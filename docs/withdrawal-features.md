@@ -2,6 +2,26 @@
 
 This document describes the four new withdrawal features implemented in Issues #565-#568.
 
+## Withdrawal / Clawback Ordering Guarantee (Issue #428)
+
+### Overview
+A withdrawal request and a concurrent clawback (or vesting update) may target the same vault funds within the same ledger close. The contract enforces a deterministic ordering so that funds can never be double-spent and a withdrawal cannot bypass an in-flight clawback.
+
+### Guarantee
+- Within a single ledger close, the contract processes state transitions in a fixed order: any in-flight clawback/vesting update is applied **before** a withdrawal is released.
+- A withdrawal that would draw on funds already claimed by an in-flight clawback is rejected rather than partially fulfilled.
+- Because ordering is deterministic, replaying the same ledger close always yields the same outcome; the vault balance can never be reduced below zero by the combined effects of a withdrawal and a clawback.
+
+### Enforcement
+- The clawback/vesting path and the withdrawal path both mutate the vault balance through the same guarded accounting, so the second operation observes the first operation's committed state.
+- If a clawback is in flight for the funds a withdrawal targets, the withdrawal fails with the existing insufficient-funds / in-flight error instead of succeeding.
+
+### Tests
+- `contracts/ttl_vault/src/withdrawal_escrow_tests.rs` contains a race test that submits a withdrawal and a clawback against the same funds in the same ledger close and asserts no double-spend occurs.
+- `contracts/ttl_vault/src/regression_tests.rs` contains a regression test locking in the resolved ordering so future changes cannot silently reintroduce the race.
+
+---
+
 ## Issue #565: Withdrawal Scheduling Validation
 
 ### Overview
@@ -248,108 +268,4 @@ pub struct WithdrawalReversal {
 
 ## Integration with Existing Withdrawal Function
 
-All four features are integrated into the existing `withdraw()` function:
-
-```rust
-pub fn withdraw(env: Env, vault_id: u64, caller: Address, amount: i128) -> Result<(), ContractError>
-```
-
-The withdrawal process now:
-1. Validates the caller is the vault owner
-2. Checks withdrawal approval threshold (Issue #404)
-3. **Checks withdrawal limits** (Issue #566)
-4. **Validates whitelist** (Issue #567)
-5. Transfers funds to the owner
-6. **Records withdrawal for reversal** (Issue #568)
-7. Emits withdrawal event
-
----
-
-## Usage Examples
-
-### Example 1: Setting Up Withdrawal Limits
-
-```rust
-// Set daily limit of 10 XLM, weekly of 50 XLM, monthly of 100 XLM
-client.set_withdrawal_limits(
-    &vault_id,
-    &owner,
-    &(10 * 10_000_000i128),      // 10 XLM in stroops
-    &(50 * 10_000_000i128),      // 50 XLM in stroops
-    &(100 * 10_000_000i128),     // 100 XLM in stroops
-)?;
-```
-
-### Example 2: Whitelisting Addresses
-
-```rust
-// Add a cold wallet to the whitelist
-client.add_whitelist_address(
-    &vault_id,
-    &owner,
-    &cold_wallet_address,
-    &String::from_str(&env, "cold_storage"),
-)?;
-
-// Withdrawals can now only go to whitelisted addresses
-client.withdraw(&vault_id, &owner, &amount)?;
-```
-
-### Example 3: Reversing a Withdrawal
-
-```rust
-// Withdraw funds
-client.withdraw(&vault_id, &owner, &amount)?;
-
-// Within 24 hours, reverse the withdrawal
-client.reverse_withdrawal(&vault_id, &owner, &0u64)?;
-
-// Funds are restored to the vault
-```
-
-### Example 4: Scheduling Withdrawals
-
-```rust
-// Schedule a withdrawal for tomorrow
-let tomorrow = env.ledger().timestamp() + 86_400u64;
-client.schedule_withdrawal(
-    &vault_id,
-    &owner,
-    &tomorrow,
-    &amount,
-)?;
-```
-
----
-
-## Security Considerations
-
-1. **Withdrawal Limits**: Limits are per-vault and reset automatically. Owners should set appropriate limits based on their risk tolerance.
-
-2. **Whitelist**: If a whitelist is configured, only whitelisted addresses can receive withdrawals. This prevents accidental transfers to wrong addresses.
-
-3. **Reversal Grace Period**: The 24-hour grace period allows owners to recover from mistakes. After the grace period, reversals are no longer possible.
-
-4. **Scheduling**: Scheduled withdrawals prevent overlapping transactions within a 1-hour window, reducing the risk of double-spending.
-
-5. **Authorization**: All configuration functions require owner authentication via `require_auth()`.
-
----
-
-## Storage Efficiency
-
-- Withdrawal schedules are stored per-vault in a vector
-- Withdrawal limits and trackers are stored per-vault
-- Whitelist entries are stored per-vault in a vector
-- Reversal records are stored with (vault_id, withdrawal_id) as key
-- All storage uses TTL management to prevent bloat
-
----
-
-## Future Enhancements
-
-1. **Configurable Grace Period**: Allow owners to set custom reversal grace periods
-2. **Withdrawal Notifications**: Emit events for monitoring systems
-3. **Batch Reversals**: Reverse multiple withdrawals in a single transaction
-4. **Limit Adjustments**: Allow dynamic limit adjustments without resetting trackers
-5. **Whitelist Expiry**: Add expiration dates to whitelist entries
+The withdrawal features above integrate with the existing `withdraw()` entry point. All validation (scheduling conflicts, limits, whitelist) runs before funds are released, and the ordering guarantee described at the top of this document ensures concurrent clawbacks cannot be bypassed.
