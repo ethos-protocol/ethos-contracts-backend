@@ -1,0 +1,3 @@
+# Negative fixture: a Stellar StrKey PUBLIC key (starts with "G", not "S").
+# Public keys are not secrets and must not trip the stellar-secret-seed rule.
+STELLAR_ACCOUNT_ID=GFAKE2345TESTNOTREAL234567FAKE2345TESTNOTREAL234567FAKE2

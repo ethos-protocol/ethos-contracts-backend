@@ -14,13 +14,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_LIMIT_MSG_PER_SEC: u32 = 10;
 
-struct MessageRateLimiter {
+pub(crate) struct MessageRateLimiter {
     count: u32,
     window_start: Instant,
 }
 
 impl MessageRateLimiter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             count: 0,
             window_start: Instant::now(),
@@ -28,7 +28,7 @@ impl MessageRateLimiter {
     }
 
     /// Returns false when the per-second limit is exceeded.
-    fn check_and_count(&mut self) -> bool {
+    pub(crate) fn check_and_count(&mut self) -> bool {
         let now = Instant::now();
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.count = 0;
@@ -276,6 +276,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string(), "v2".to_string()],
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, &secret);
@@ -292,6 +293,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string()],
             exp: 1000, // long expired
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, &secret);
@@ -306,6 +308,7 @@ mod tests {
             sub: "user123".to_string(),
             vault_ids: vec!["v1".to_string()],
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            jti: None,
         };
         let token = make_test_token(&claims, &secret);
         let result = validate_ws_token(&token, b"wrong-secret");

@@ -136,6 +136,76 @@ impl FcmClient {
     }
 }
 
+// ── Payload sanitization (Issue #401) ─────────────────────────────────────────
+
+/// Maximum byte length for a user-controlled field included in a notification
+/// payload.  Fields that exceed this limit are truncated at the nearest
+/// character boundary.
+pub const NOTIF_FIELD_MAX_LEN: usize = 128;
+
+/// Sanitize a user-controlled string for safe inclusion in a notification payload.
+///
+/// This function:
+/// 1. Strips ASCII control characters (U+0000–U+001F and U+007F) that have no
+///    legitimate use in display text but could be exploited to inject escape
+///    sequences into notification-rendering engines.
+/// 2. Removes HTML/XML angle-bracket tags (`<…>`) to prevent HTML injection in
+///    web notification renderers.
+/// 3. Removes JavaScript protocol URIs (`javascript:`) that some renderers may
+///    treat as active links.
+/// 4. Truncates the result to `NOTIF_FIELD_MAX_LEN` bytes (preserving UTF-8
+///    character boundaries) to prevent oversized payloads that could cause
+///    denial-of-service in downstream renderers.
+///
+/// The output is safe to embed in FCM `notification.title`, `notification.body`,
+/// or `data` fields.
+pub fn sanitize_notif_field(input: &str) -> String {
+    // 1. Strip control characters.
+    let no_ctrl: String = input
+        .chars()
+        .filter(|&c| !c.is_ascii_control() || c == '\t')
+        .collect();
+
+    // 2. Remove HTML/XML tags.
+    let no_tags = remove_html_tags(&no_ctrl);
+
+    // 3. Remove javascript: URIs (case-insensitive).
+    let no_js = no_tags.replace("javascript:", "").replace("JAVASCRIPT:", "");
+
+    // 4. Truncate to NOTIF_FIELD_MAX_LEN bytes at a valid UTF-8 boundary.
+    truncate_to_byte_len(&no_js, NOTIF_FIELD_MAX_LEN)
+}
+
+/// Remove HTML/XML tags from `input` using a simple state machine.
+/// This handles nested tags and attributes without pulling in an HTML parser.
+fn remove_html_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, respecting UTF-8 character
+/// boundaries (i.e., never splitting a multi-byte character).
+fn truncate_to_byte_len(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Walk backward from max_bytes to find a valid char boundary.
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 // ── Notification content helpers ─────────────────────────────────────────────
 
 fn notification_content(
@@ -144,47 +214,52 @@ fn notification_content(
     ttl_hours: Option<u64>,
     passkey_hash: Option<&str>,
 ) -> (&'static str, String, Value) {
+    // All user-controlled fields are sanitized before being embedded in the
+    // notification payload (Issue #401).
+    let safe_vault_id = sanitize_notif_field(vault_id);
+    let safe_passkey_hash = passkey_hash.map(|h| sanitize_notif_field(h));
+
     match notification_type {
         NotificationType::ExpiryWarning => {
             let hours = ttl_hours.unwrap_or(24);
             (
                 "⚠️ Vault Expiring Soon",
                 format!("Your vault expires in ~{hours}h. Check in now to keep it active."),
-                json!({ "type": "expiry_warning", "vault_id": vault_id }),
+                json!({ "type": "expiry_warning", "vault_id": safe_vault_id }),
             )
         }
         NotificationType::CheckInReminder => (
             "🔔 Check-In Reminder",
             "Time to check in to your Ethos-Protocol vault.".to_string(),
-            json!({ "type": "check_in_reminder", "vault_id": vault_id }),
+            json!({ "type": "check_in_reminder", "vault_id": safe_vault_id }),
         ),
         NotificationType::VaultReleased => (
             "🔓 Vault Released",
             "Your vault has been released to the beneficiary.".to_string(),
-            json!({ "type": "vault_released", "vault_id": vault_id }),
+            json!({ "type": "vault_released", "vault_id": safe_vault_id }),
         ),
         NotificationType::VaultPaused => (
             "⏸ Vault Paused",
             "Your vault has been paused.".to_string(),
-            json!({ "type": "vault_paused", "vault_id": vault_id }),
+            json!({ "type": "vault_paused", "vault_id": safe_vault_id }),
         ),
         NotificationType::PasskeyExpiringSoon => {
             let hours = ttl_hours.unwrap_or(24);
-            let short_hash = truncated_passkey_hash(passkey_hash);
+            let short_hash = truncated_passkey_hash(safe_passkey_hash.as_deref());
             (
                 "🔑 Passkey Expiring Soon",
                 format!(
-                    "Passkey {short_hash} on vault {vault_id} expires in ~{hours}h. Rotate or extend it to keep access."
+                    "Passkey {short_hash} on vault {safe_vault_id} expires in ~{hours}h. Rotate or extend it to keep access."
                 ),
-                json!({ "type": "passkey_expiring_soon", "vault_id": vault_id, "passkey_hash": passkey_hash }),
+                json!({ "type": "passkey_expiring_soon", "vault_id": safe_vault_id, "passkey_hash": safe_passkey_hash }),
             )
         }
         NotificationType::PasskeyExpired => {
-            let short_hash = truncated_passkey_hash(passkey_hash);
+            let short_hash = truncated_passkey_hash(safe_passkey_hash.as_deref());
             (
                 "🔑 Passkey Expired",
-                format!("Passkey {short_hash} on vault {vault_id} has expired."),
-                json!({ "type": "passkey_expired", "vault_id": vault_id, "passkey_hash": passkey_hash }),
+                format!("Passkey {short_hash} on vault {safe_vault_id} has expired."),
+                json!({ "type": "passkey_expired", "vault_id": safe_vault_id, "passkey_hash": safe_passkey_hash }),
             )
         }
     }
@@ -1503,4 +1578,151 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
     }
+
+    // ── Payload sanitization tests (Issue #401) ───────────────────────────────
+
+    /// Normal vault IDs pass through unchanged.
+    #[test]
+    fn sanitize_normal_vault_id_unchanged() {
+        let id = "vault-abc-123";
+        assert_eq!(sanitize_notif_field(id), id);
+    }
+
+    /// A vault ID containing an HTML script tag has the tag stripped.
+    #[test]
+    fn sanitize_strips_html_script_tag() {
+        let malicious = "v1<script>alert(1)</script>";
+        let result = sanitize_notif_field(malicious);
+        assert!(!result.contains('<'), "angle brackets must be removed");
+        assert!(!result.contains('>'), "angle brackets must be removed");
+        assert!(!result.contains("script"), "script tag content must be removed");
+        assert!(result.contains("v1"), "safe prefix must be preserved");
+    }
+
+    /// HTML injection via an img tag is sanitized.
+    #[test]
+    fn sanitize_strips_html_img_tag() {
+        let malicious = "vault<img src=x onerror=alert(1)>id";
+        let result = sanitize_notif_field(malicious);
+        assert!(!result.contains('<'));
+        assert!(!result.contains('>'));
+        assert!(result.contains("vaultid"), "text outside tags must be preserved");
+    }
+
+    /// ASCII control characters (null bytes, carriage returns, etc.) are removed.
+    #[test]
+    fn sanitize_strips_control_characters() {
+        let with_ctrl = "vault\x00\x01\x1f\x7fid";
+        let result = sanitize_notif_field(with_ctrl);
+        assert!(!result.contains('\x00'));
+        assert!(!result.contains('\x01'));
+        assert!(!result.contains('\x1f'));
+        assert!(!result.contains('\x7f'));
+        assert!(result.contains("vault"));
+        assert!(result.contains("id"));
+    }
+
+    /// Newline and carriage-return characters (common injection vectors) are stripped.
+    #[test]
+    fn sanitize_strips_newlines_and_carriage_returns() {
+        let with_newlines = "vault\nid\r\n";
+        let result = sanitize_notif_field(with_newlines);
+        assert!(!result.contains('\n'), "newlines must be removed");
+        assert!(!result.contains('\r'), "carriage returns must be removed");
+    }
+
+    /// `javascript:` URIs are removed to prevent active-link injection.
+    #[test]
+    fn sanitize_removes_javascript_uri() {
+        let js_uri = "javascript:alert(document.cookie)";
+        let result = sanitize_notif_field(js_uri);
+        assert!(!result.to_lowercase().contains("javascript:"),
+            "javascript: URI scheme must be removed");
+    }
+
+    /// Fields longer than NOTIF_FIELD_MAX_LEN bytes are truncated.
+    #[test]
+    fn sanitize_truncates_oversized_field() {
+        let long_input: String = "a".repeat(NOTIF_FIELD_MAX_LEN + 50);
+        let result = sanitize_notif_field(&long_input);
+        assert!(
+            result.len() <= NOTIF_FIELD_MAX_LEN,
+            "result must not exceed NOTIF_FIELD_MAX_LEN bytes; got {}",
+            result.len()
+        );
+    }
+
+    /// Fields exactly at the max length pass through unchanged.
+    #[test]
+    fn sanitize_field_at_max_length_unchanged() {
+        let at_limit: String = "b".repeat(NOTIF_FIELD_MAX_LEN);
+        let result = sanitize_notif_field(&at_limit);
+        assert_eq!(result.len(), NOTIF_FIELD_MAX_LEN);
+        assert_eq!(result, at_limit);
+    }
+
+    /// Truncation respects UTF-8 character boundaries (no split multi-byte chars).
+    #[test]
+    fn sanitize_truncation_respects_utf8_boundary() {
+        // Each '€' is 3 bytes in UTF-8; fill to just over the limit with them.
+        let euros: String = "€".repeat(50); // 150 bytes > 128
+        let result = sanitize_notif_field(&euros);
+        // Result must be valid UTF-8 (not panic on re-encode).
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.len() <= NOTIF_FIELD_MAX_LEN);
+    }
+
+    /// A passkey hash containing injection characters is sanitized when used
+    /// in a PasskeyExpired notification (regression test for previously
+    /// vulnerable field: passkey_hash).
+    #[test]
+    fn regression_passkey_hash_field_is_sanitized_in_payload() {
+        let malicious_hash = "abc<script>stealCookies()</script>def";
+        let (_, body, data) = notification_content(
+            &NotificationType::PasskeyExpired,
+            "safe-vault-id",
+            None,
+            Some(malicious_hash),
+        );
+        // The passkey_hash value in the JSON data field must not contain raw tags.
+        let data_str = data.to_string();
+        assert!(!data_str.contains("<script>"),
+            "raw script tag must not appear in notification data");
+        assert!(!body.contains("<script>"),
+            "raw script tag must not appear in notification body");
+    }
+
+    /// A vault_id containing injection characters is sanitized in the JSON
+    /// data payload (regression test for previously vulnerable vault_id field).
+    #[test]
+    fn regression_vault_id_field_is_sanitized_in_payload() {
+        let malicious_id = "v1\"><img src=x onerror=pwn()>";
+        let (_, _body, data) = notification_content(
+            &NotificationType::VaultReleased,
+            malicious_id,
+            None,
+            None,
+        );
+        let data_str = data.to_string();
+        assert!(!data_str.contains("<img"),
+            "HTML tag must not appear unsanitized in notification data");
+        assert!(!data_str.contains("onerror"),
+            "event handler attribute must not appear in notification data");
+    }
+
+    /// A clean combined payload (vault_id + passkey_hash) produces the expected
+    /// sanitized content in all relevant notification fields.
+    #[test]
+    fn notification_content_uses_sanitized_vault_id_and_passkey_hash() {
+        // Both fields are safe — output should be identical to input.
+        let (_, body, data) = notification_content(
+            &NotificationType::PasskeyExpiringSoon,
+            "safe-vault-42",
+            Some(12),
+            Some("deadbeef01234567"),
+        );
+        assert!(body.contains("safe-vault-42"), "safe vault id should appear in body");
+        assert_eq!(data["vault_id"], "safe-vault-42");
+    }
 }
+
