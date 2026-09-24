@@ -268,3 +268,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-490 -->
 - #490: Implement Vault Cloning for Template Creation
+
+<!-- handsoff-issue-491 -->
+- #491: Add Configurable Check-In Intervals per Vault
