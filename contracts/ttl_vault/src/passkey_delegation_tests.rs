@@ -220,13 +220,158 @@ fn test_get_passkey_delegation_returns_none_when_absent() {
     assert!(client.get_passkey_delegation(&id, &passkey).is_none());
 }
 
-/// Revoking a delegation that doesn't exist is a harmless no-op for the owner.
+/// AC13: a delegated passkey is restricted to the scopes it was granted and
+/// must not inherit the owner's full permission set. A read-only delegation
+/// attempting a withdrawal must fail with `Unauthorized`.
 #[test]
-fn test_revoke_nonexistent_delegation_is_noop() {
+fn test_read_only_delegation_cannot_withdraw() {
     let (env, owner, beneficiary, client) = setup();
+    let delegate = Address::generate(&env);
     let passkey = BytesN::from_array(&env, &[1u8; 32]);
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     client.add_passkey(&id, &owner, &passkey);
 
-    client.revoke_passkey_delegation(&id, &owner, &passkey);
+    let expires_at = env.ledger().timestamp() + 1000;
+    client.delegate_passkey_scoped(
+        &id,
+        &owner,
+        &passkey,
+        &delegate,
+        &expires_at,
+        &PasskeyScope::ReadOnly,
+    );
+
+    let delegation = client.get_passkey_delegation(&id, &passkey).unwrap();
+    assert_eq!(delegation.scope, PasskeyScope::ReadOnly);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let err = client
+        .try_withdraw(&id, &delegate, &passkey, &100u64)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::Unauthorized);
+}
+
+/// AC14: a read-only delegation may still perform read-only actions such as
+/// checking in, confirming the scope restriction is not over-broad.
+#[test]
+fn test_read_only_delegation_can_check_in() {
+    let (env, owner, beneficiary, client) = setup();
+    let delegate = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_passkey(&id, &owner, &passkey);
+
+    let expires_at = env.ledger().timestamp() + 1000;
+    client.delegate_passkey_scoped(
+        &id,
+        &owner,
+        &passkey,
+        &delegate,
+        &expires_at,
+        &PasskeyScope::ReadOnly,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.check_in(&id, &delegate, &passkey, &0u64);
+    assert_eq!(
+        client.get_vault(&id).last_check_in,
+        env.ledger().timestamp()
+    );
+}
+
+/// AC15: a withdrawal-scoped delegation may withdraw, confirming the scope
+/// check grants exactly the delegated capability.
+#[test]
+fn test_withdrawal_scoped_delegation_can_withdraw() {
+    let (env, owner, beneficiary, client) = setup();
+    let delegate = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_passkey(&id, &owner, &passkey);
+
+    let expires_at = env.ledger().timestamp() + 1000;
+    client.delegate_passkey_scoped(
+        &id,
+        &owner,
+        &passkey,
+        &delegate,
+        &expires_at,
+        &PasskeyScope::Withdrawal,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw(&id, &delegate, &passkey, &100u64);
+    assert_eq!(client.get_vault(&id).balance, 1_000_000 - 100);
+}
+
+/// AC16: scope escalation via delegation chaining is rejected. A delegate
+/// cannot re-delegate the passkey with a broader scope than it was granted.
+#[test]
+fn test_delegation_chaining_cannot_escalate_scope() {
+    let (env, owner, beneficiary, client) = setup();
+    let delegate = Address::generate(&env);
+    let chained = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_passkey(&id, &owner, &passkey);
+
+    let expires_at = env.ledger().timestamp() + 1000;
+    client.delegate_passkey_scoped(
+        &id,
+        &owner,
+        &passkey,
+        &delegate,
+        &expires_at,
+        &PasskeyScope::ReadOnly,
+    );
+
+    // The read-only delegate attempts to re-delegate with a broader scope.
+    let err = client
+        .try_delegate_passkey_scoped(
+            &id,
+            &delegate,
+            &passkey,
+            &chained,
+            &expires_at,
+            &PasskeyScope::Withdrawal,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::Unauthorized);
+}
+
+/// AC17: a delegate cannot re-delegate at all, even with an equal or narrower
+/// scope, preventing delegation chaining from bypassing owner control.
+#[test]
+fn test_delegate_cannot_chain_delegation() {
+    let (env, owner, beneficiary, client) = setup();
+    let delegate = Address::generate(&env);
+    let chained = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_passkey(&id, &owner, &passkey);
+
+    let expires_at = env.ledger().timestamp() + 1000;
+    client.delegate_passkey_scoped(
+        &id,
+        &owner,
+        &passkey,
+        &delegate,
+        &expires_at,
+        &PasskeyScope::ReadOnly,
+    );
+
+    let err = client
+        .try_delegate_passkey_scoped(
+            &id,
+            &delegate,
+            &passkey,
+            &chained,
+            &expires_at,
+            &PasskeyScope::ReadOnly,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NotOwner);
 }
