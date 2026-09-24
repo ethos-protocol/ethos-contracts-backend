@@ -90,6 +90,33 @@ Recommended workflow:
    output differs from what is committed. A diff means the docs were not
    regenerated after a code change.
 
+## Regeneration workflow
+
+When a change touches a documented module, regenerate the committed
+reference before opening the pull request:
+
+1. Run the generator for each affected module (see the driver above) and
+   write the output to its committed path, e.g. `docs/api-reference.md`.
+2. Review the diff. It should contain only the sections your code change
+   actually affected; anything else means the committed docs were already
+   stale.
+3. Commit the regenerated markdown in the same commit as the code change.
+
+If you forget, CI will tell you: the drift check regenerates the docs and
+fails the build when the output differs from what is committed. The failure
+message names the drifted file and repeats the steps above, so the fix is
+always "regenerate, review, commit" - never a hand edit of the generated
+markdown.
+
+## Drift detection in CI
+
+The `docs-drift` job regenerates the reference into a scratch directory and
+diffs it against the committed copy. It fails the build on any difference,
+with a message pointing back at this section. The check is deterministic:
+the generator emits items in source order and examples in test order, so
+identical input always produces byte-identical output and the diff only
+fires on real drift.
+
 ## Output shape
 
 For a documented function, the rendered section looks like this:

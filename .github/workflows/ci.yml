@@ -9,8 +9,10 @@ name: CI
 #                                         including regression_tests.rs and
 #                                         slice_failover_tests.rs (Issue #424)
 #   • "Test & Lint / wasm-size-check"   ← enforces WASM size budget (Issue #425)
+#   • "Test & Lint / docs-drift-check"  ← regenerates docs and fails on drift
+#                                         against committed docs (Issue #406)
 #
-# Both jobs must be green before any PR can be merged to main.
+# All jobs must be green before any PR can be merged to main.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -107,6 +109,35 @@ jobs:
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
             exit 1
           fi
+
+      # ── Required check (Issue #406) ─────────────────────────────────────────
+      # Regenerates the API reference from the doc generator and diffs it
+      # against the committed docs/api-reference.md. Fails the build on drift
+      # so committed docs can never silently fall out of sync with the code.
+      - name: Check documentation drift
+        id: docs-drift-check
+        run: |
+          set -euo pipefail
+
+          # Regenerate docs into a scratch location (never overwrite the
+          # committed file, so the diff below is meaningful).
+          cargo run --package ttl-vault --bin doc_generator -- \
+            --output /tmp/api-reference.md
+
+          if ! diff -u docs/api-reference.md /tmp/api-reference.md; then
+            echo ""
+            echo "❌ Documentation drift detected: docs/api-reference.md is out of date."
+            echo ""
+            echo "   The committed docs no longer match the generator's output."
+            echo "   Regenerate them locally and commit the result:"
+            echo ""
+            echo "     cargo run --package ttl-vault --bin doc_generator -- --output docs/api-reference.md"
+            echo ""
+            echo "   See docs/documentation-generation.md for the full workflow."
+            exit 1
+          fi
+
+          echo "✅ Committed docs match the generator output."
 
       # ── Required check (Issue #425) ─────────────────────────────────────────
       # Builds the contract as WASM and enforces the size budgets defined in
