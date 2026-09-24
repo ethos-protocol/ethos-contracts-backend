@@ -342,3 +342,66 @@ Example: 5% penalty, no grace period, 3 late installments of 100 each:
 | `set_vest` | `(start_time, interval, num_installments, total_amount, cliff_period)` | Schedule attached |
 | `clm_vest` | `(beneficiary, amount, installments_unlocked)` | Installment claimed (one event per beneficiary) |
 | `clif_rch` | `(timestamp,)` | First claim after cliff period is reached (emitted once per schedule) |
+
+## Timestamp Edge Cases
+
+All vesting timestamps are **UNIX seconds stored as `u64`**. There are no
+calendar conversions, no timezone adjustments, and no special handling for leap
+years. Every boundary is a plain arithmetic comparison against
+`env.ledger().timestamp()`.
+
+### Exact boundary semantics (≥, not >)
+
+The contract uses `>=` for all availability checks:
+
+- An installment is **unlocked** when `now >= start_time + n * interval`.
+- The cliff is **reached** when `now >= start_time + cliff_period`.
+
+This means the first second of any window is always valid. Off-by-one mistakes
+(using `>` instead of `>=`) would silently delay claims by one second — these
+tests confirm the inclusive boundary is upheld.
+
+### Leap-year boundary crossing
+
+A schedule whose interval is exactly one regular year (`31_536_000 s =
+365 × 86_400`) will cross a leap day in leap years. Because the contract does
+no calendar arithmetic, this is transparent: `start + interval` produces a
+well-defined UNIX timestamp regardless of whether a Feb 29 falls in the
+interval. The amount distributed per installment is unaffected.
+
+Year lengths for reference:
+
+| Year type   | Seconds     |
+|-------------|-------------|
+| Regular (365 days) | 31_536_000 |
+| Leap (366 days)    | 31_622_400 |
+
+Both constants can be used directly as `interval` values. There is no
+"correct" choice — the schedule will behave identically because the contract
+never converts seconds to calendar units.
+
+### Large timestamps (near u32::MAX)
+
+Schedule fields (`start_time`, `interval`, `cliff_period`) are all `u64`.
+Timestamps near `u32::MAX` (~4.3 billion seconds ≈ year 2106) are valid and
+must not cause integer overflow. No explicit overflow handling is required
+because the arithmetic is purely additive and bounded by `u64::MAX`.
+
+### Test Coverage
+
+`contracts/ttl_vault/src/vesting_timestamp_edge_case_tests.rs` covers:
+
+| Test | Edge case validated |
+|------|---------------------|
+| `test_installment_claimable_at_exact_start_timestamp` | `now == start_time` → immediately claimable (inclusive boundary) |
+| `test_nothing_claimable_one_second_before_start` | `now == start_time - 1` → error |
+| `test_claim_succeeds_at_exact_cliff_boundary` | `now == start_time + cliff_period` exactly → succeeds |
+| `test_claim_fails_one_second_before_cliff_boundary` | `now == start_time + cliff_period - 1` → `CliffNotReached` |
+| `test_installment_claimable_at_exact_interval_boundary` | `now == start_time + n * interval` exactly → succeeds |
+| `test_no_installment_one_second_before_interval_boundary` | `now == start_time + n * interval - 1` → error |
+| `test_vesting_interval_crossing_leap_year_2000` | 1-year interval spanning Feb 29 2000 → correct claim sequence |
+| `test_vesting_interval_uses_leap_year_length` | Leap-year-length interval (31_622_400 s) → correct total |
+| `test_cliff_spanning_leap_year_boundary` | Cliff of one leap year crossing Feb 29 → boundary respected |
+| `test_multi_year_schedule_spanning_year_2000_leap` | 4-year schedule from Y2K → all installments correct, total = vault balance |
+| `test_zero_cliff_claimable_from_epoch_zero` | `cliff_period = 0, start_time = 0` → claimable at Unix epoch |
+| `test_large_unix_timestamp_no_overflow` | `start_time ≈ u32::MAX` → no overflow panic |
