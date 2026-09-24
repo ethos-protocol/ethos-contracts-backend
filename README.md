@@ -261,5 +261,7 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 - The WebAuthn/Passkey standards community
 - Everyone building toward self-sovereign financial tools
 
+## Handsoff notes
 
-
+<!-- handsoff-issue-492 -->
+- #492: Implement Vault Suspension and Freeze Feature
