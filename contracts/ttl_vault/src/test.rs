@@ -6699,3 +6699,119 @@ fn test_trigger_release_with_50_beneficiaries() {
     assert!(token_client.balance(&addresses[49]) >= per_beneficiary);
 }
 
+// ============================================================
+// Issue #516: Check-in Delegation, Proof-of-Work, TTL Prediction, Batch Validation
+// ============================================================
+
+#[test]
+fn test_check_in_delegate_basic_flow() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+
+    let delegate = Address::generate(&env);
+
+    assert!(!client.is_check_in_delegate_pub(&vault_id, &delegate));
+
+    client.add_check_in_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert!(client.is_check_in_delegate_pub(&vault_id, &delegate));
+
+    let delegates = client.get_check_in_delegates(&vault_id);
+    assert_eq!(delegates.len(), 1);
+    assert_eq!(delegates.get(0).unwrap(), delegate);
+}
+
+#[test]
+fn test_check_in_delegate_can_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let delegate = Address::generate(&env);
+    client.add_check_in_delegate(&vault_id, &owner, &delegate).unwrap();
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+    env.ledger().with_mut(|l| l.timestamp += 10);
+
+    client.check_in(&vault_id, &delegate, &passkey_hash).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in > pre_check_in);
+}
+
+#[test]
+fn test_check_in_with_pow_valid_hash() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in_with_pow(&vault_id, &owner, &passkey_hash, &0u64, &0u32).unwrap();
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_expired_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let expiry = env.ledger().timestamp() + 100;
+    client.set_passkey_expiry(&vault_id, &owner, &passkey_hash, &expiry).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    let err = client.try_check_in_with_pow(&vault_id, &owner, &passkey_hash, &0u64, &0u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InvalidPasskey as u32));
+}
+
+#[test]
+fn test_batch_check_in_validates_all_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pk_hash1 = BytesN::<32>::random(&env);
+    let pk_hash2 = BytesN::<32>::random(&env);
+
+    client.add_passkey(&vault1, &owner, &pk_hash1).unwrap();
+    client.add_passkey(&vault2, &owner, &pk_hash2).unwrap();
+
+    let mut vault_ids = soroban_sdk::Vec::new(&env);
+    vault_ids.push_back(vault1);
+    vault_ids.push_back(vault2);
+
+    let mut passphrases = soroban_sdk::Vec::new(&env);
+    passphrases.push_back(pk_hash1);
+    passphrases.push_back(pk_hash2);
+
+    client.batch_check_in_v2(&vault_ids, &owner, &passphrases).unwrap();
+
+    assert_eq!(client.get_vault(&vault1).status, ReleaseStatus::Locked);
+    assert_eq!(client.get_vault(&vault2).status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_ttl_prediction_records_history() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let history = client.get_check_in_history(&vault_id);
+    assert!(history.len() >= 2);
+}
+
