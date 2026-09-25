@@ -7027,3 +7027,53 @@ fn test_pool_check_in_updates_all_vaults() {
     assert!(v2_after >= v2_before);
 }
 
+// ============================================================
+// Issue #519: Beneficiary Delegation Chain
+// ============================================================
+
+#[test]
+fn test_beneficiary_delegation_chain_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegate1 = Address::generate(&env);
+    let delegate2 = Address::generate(&env);
+
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate1).unwrap();
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate2).unwrap();
+
+    let chain = client.get_beneficiary_delegation_chain(&vault_id);
+    assert_eq!(chain.len(), 2);
+}
+
+#[test]
+fn test_beneficiary_delegation_chain_removal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegate = Address::generate(&env);
+
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert_eq!(client.get_beneficiary_delegation_chain(&vault_id).len(), 1);
+
+    client.remove_beneficiary_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert_eq!(client.get_beneficiary_delegation_chain(&vault_id).len(), 0);
+}
+
+#[test]
+fn test_beneficiary_delegation_chain_order_preserved() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegates: alloc::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
+
+    for delegate in &delegates {
+        client.add_beneficiary_delegate(&vault_id, &owner, delegate).unwrap();
+    }
+
+    let chain = client.get_beneficiary_delegation_chain(&vault_id);
+    for (i, addr) in chain.iter().enumerate() {
+        assert_eq!(addr, delegates[i]);
+    }
+}
+
