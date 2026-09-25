@@ -37,6 +37,15 @@ const DEFAULT_Z_THRESHOLD: f64 = 3.0;
 /// duplicate/false-positive alert storms from a single sustained anomaly.
 const ALERT_COOLDOWN_SECONDS: i64 = 60;
 
+/// Suppression entry for pattern-based allowlisting.
+#[derive(Debug, Clone, Serialize)]
+pub struct Suppression {
+    pub id: u64,
+    pub pattern: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// Running (Welford) baseline statistics for one metric.
 #[derive(Debug, Clone, Serialize)]
 pub struct Baseline {
@@ -121,6 +130,8 @@ struct Inner {
     baselines: HashMap<String, Baseline>,
     alerts: Vec<Alert>,
     last_alert_at: HashMap<String, DateTime<Utc>>,
+    suppressions: HashMap<u64, Suppression>,
+    suppression_counter: u64,
 }
 
 /// Shared anomaly-detection state: one baseline per metric plus the
@@ -196,6 +207,42 @@ impl AnomalyStore {
             .get(metric)
             .cloned()
     }
+
+    pub fn suppress_anomaly(&self, pattern: &str, expires_at: Option<DateTime<Utc>>) -> u64 {
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        inner.suppression_counter += 1;
+        let id = inner.suppression_counter;
+
+        let suppression = Suppression {
+            id,
+            pattern: pattern.to_string(),
+            created_at: Utc::now(),
+            expires_at,
+        };
+
+        inner.suppressions.insert(id, suppression);
+        id
+    }
+
+    pub fn get_suppressions(&self) -> Vec<Suppression> {
+        let inner = self.inner.read().expect("anomaly lock poisoned");
+        let now = Utc::now();
+        inner
+            .suppressions
+            .values()
+            .filter(|s| s.expires_at.is_none() || s.expires_at.unwrap() > now)
+            .cloned()
+            .collect()
+    }
+
+    pub fn remove_suppression(&self, id: u64) -> bool {
+        self.inner
+            .write()
+            .expect("anomaly lock poisoned")
+            .suppressions
+            .remove(&id)
+            .is_some()
+    }
 }
 
 /// `POST /anomaly/observe` - feed a metric observation into the detector.
@@ -269,5 +316,68 @@ mod tests {
         for _ in 0..50 {
             assert!(store.observe("steady_metric", 42.0).is_none());
         }
+    }
+
+    // Issue #540: Anomaly Suppression and Allowlisting Tests
+    #[test]
+    fn suppress_anomaly_creates_suppression_entry() {
+        let store = AnomalyStore::default();
+        let id = store.suppress_anomaly("cpu_spike_*", None);
+        assert!(id > 0, "suppression ID should be positive");
+
+        let suppressions = store.get_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].id, id);
+        assert_eq!(suppressions[0].pattern, "cpu_spike_*");
+    }
+
+    #[test]
+    fn suppress_anomaly_with_expiry() {
+        let store = AnomalyStore::default();
+        let future = Utc::now() + Duration::hours(1);
+        let id = store.suppress_anomaly("memory_leak_*", Some(future));
+
+        let suppressions = store.get_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].expires_at, Some(future));
+    }
+
+    #[test]
+    fn expired_suppressions_are_filtered() {
+        let store = AnomalyStore::default();
+        let past = Utc::now() - Duration::hours(1);
+        let future = Utc::now() + Duration::hours(1);
+
+        store.suppress_anomaly("old_pattern_*", Some(past));
+        store.suppress_anomaly("new_pattern_*", Some(future));
+
+        let suppressions = store.get_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].pattern, "new_pattern_*");
+    }
+
+    #[test]
+    fn remove_suppression_by_id() {
+        let store = AnomalyStore::default();
+        let id1 = store.suppress_anomaly("pattern1_*", None);
+        let id2 = store.suppress_anomaly("pattern2_*", None);
+
+        assert!(store.remove_suppression(id1));
+        let suppressions = store.get_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].id, id2);
+    }
+
+    #[test]
+    fn bulk_suppression_for_similar_patterns() {
+        let store = AnomalyStore::default();
+        let patterns = vec!["cpu_spike_*", "cpu_high_*", "cpu_anomaly_*"];
+
+        for pattern in patterns {
+            store.suppress_anomaly(pattern, None);
+        }
+
+        let suppressions = store.get_suppressions();
+        assert_eq!(suppressions.len(), 3);
     }
 }
