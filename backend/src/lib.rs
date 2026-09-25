@@ -31,6 +31,7 @@ pub mod handlers;
 pub mod health;
 pub mod health_routing;
 pub mod incidents;
+pub mod job_queue;
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
