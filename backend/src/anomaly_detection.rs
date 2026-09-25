@@ -46,6 +46,14 @@ pub struct Suppression {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Correlation tracking between anomalies.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalyCorrelation {
+    pub anomaly_id: String,
+    pub correlated_ids: Vec<String>,
+    pub correlation_strength: f64,
+}
+
 /// Running (Welford) baseline statistics for one metric.
 #[derive(Debug, Clone, Serialize)]
 pub struct Baseline {
@@ -132,6 +140,7 @@ struct Inner {
     last_alert_at: HashMap<String, DateTime<Utc>>,
     suppressions: HashMap<u64, Suppression>,
     suppression_counter: u64,
+    correlations: HashMap<String, AnomalyCorrelation>,
 }
 
 /// Shared anomaly-detection state: one baseline per metric plus the
@@ -242,6 +251,33 @@ impl AnomalyStore {
             .suppressions
             .remove(&id)
             .is_some()
+    }
+
+    pub fn get_correlated_anomalies(&self, anomaly_id: &str) -> Vec<String> {
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .correlations
+            .get(anomaly_id)
+            .map(|c| c.correlated_ids.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn add_correlation(&self, anomaly_id: &str, correlated_id: &str, strength: f64) {
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let correlation = inner
+            .correlations
+            .entry(anomaly_id.to_string())
+            .or_insert_with(|| AnomalyCorrelation {
+                anomaly_id: anomaly_id.to_string(),
+                correlated_ids: Vec::new(),
+                correlation_strength: strength,
+            });
+
+        if !correlation.correlated_ids.contains(&correlated_id.to_string()) {
+            correlation.correlated_ids.push(correlated_id.to_string());
+        }
+        correlation.correlation_strength = strength.max(correlation.correlation_strength);
     }
 }
 
@@ -379,5 +415,82 @@ mod tests {
 
         let suppressions = store.get_suppressions();
         assert_eq!(suppressions.len(), 3);
+    }
+
+    // Issue #541: Anomaly Correlation Detection Tests
+    #[test]
+    fn add_correlation_between_anomalies() {
+        let store = AnomalyStore::default();
+        let alert1 = store.observe("cpu_pct", 10.0);
+        let alert2 = store.observe("memory_pct", 20.0);
+
+        if let (Some(a1), Some(a2)) = (alert1, alert2) {
+            for v in [10.1, 10.2, 10.0, 9.9] {
+                store.observe("cpu_pct", v);
+            }
+            let spike = store.observe("cpu_pct", 100.0);
+            if let Some(spike_alert) = spike {
+                store.add_correlation(&spike_alert.id, &a1.id, 0.95);
+                let correlated = store.get_correlated_anomalies(&spike_alert.id);
+                assert!(correlated.contains(&a1.id));
+            }
+        }
+    }
+
+    #[test]
+    fn correlation_scoring_tracks_strength() {
+        let store = AnomalyStore::default();
+        let id1 = "anomaly_1".to_string();
+        let id2 = "anomaly_2".to_string();
+
+        store.add_correlation(&id1, &id2, 0.75);
+        let correlated = store.get_correlated_anomalies(&id1);
+        assert_eq!(correlated.len(), 1);
+        assert!(correlated.contains(&id2));
+    }
+
+    #[test]
+    fn get_correlated_anomalies_returns_vec() {
+        let store = AnomalyStore::default();
+        let id1 = "anomaly_1";
+        let id2 = "anomaly_2";
+        let id3 = "anomaly_3";
+
+        store.add_correlation(id1, id2, 0.8);
+        store.add_correlation(id1, id3, 0.9);
+
+        let correlated = store.get_correlated_anomalies(id1);
+        assert_eq!(correlated.len(), 2);
+        assert!(correlated.contains(&id2.to_string()));
+        assert!(correlated.contains(&id3.to_string()));
+    }
+
+    #[test]
+    fn grouping_correlated_anomalies() {
+        let store = AnomalyStore::default();
+
+        for i in 0..5 {
+            let id = format!("anomaly_{}", i);
+            for j in (i+1)..5 {
+                let related_id = format!("anomaly_{}", j);
+                store.add_correlation(&id, &related_id, 0.8 + (j - i) as f64 * 0.05);
+            }
+        }
+
+        let correlated = store.get_correlated_anomalies("anomaly_0");
+        assert!(correlated.len() > 0);
+    }
+
+    #[test]
+    fn no_duplicate_correlations() {
+        let store = AnomalyStore::default();
+        let id1 = "anomaly_1";
+        let id2 = "anomaly_2";
+
+        store.add_correlation(id1, id2, 0.8);
+        store.add_correlation(id1, id2, 0.9);
+
+        let correlated = store.get_correlated_anomalies(id1);
+        assert_eq!(correlated.len(), 1);
     }
 }
