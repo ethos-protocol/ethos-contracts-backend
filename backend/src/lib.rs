@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod analytics;
 pub mod anomaly_detection;
 pub mod audit;
 pub mod backup_validation;
