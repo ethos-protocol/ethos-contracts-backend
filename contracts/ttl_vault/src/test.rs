@@ -6815,3 +6815,132 @@ fn test_ttl_prediction_records_history() {
     assert!(history.len() >= 2);
 }
 
+// ============================================================
+// Issue #517: Geographic Check-in, Accelerated TTL Decay, Rate Limiting, TTL Borrowing
+// ============================================================
+
+#[test]
+fn test_check_in_with_geo_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let pre_balance = client.get_vault(&vault_id).last_check_in;
+
+    client.check_in_with_geo(
+        &vault_id,
+        &owner,
+        &passkey_hash,
+        &40_000_000i64,
+        &(-74_000_000i64),
+        &"US"
+    ).unwrap();
+
+    let post_balance = client.get_vault(&vault_id).last_check_in;
+    assert!(post_balance >= pre_balance);
+}
+
+#[test]
+fn test_check_in_with_geo_records_location() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in_with_geo(
+        &vault_id,
+        &owner,
+        &passkey_hash,
+        &40_000_000i64,
+        &(-74_000_000i64),
+        &"US"
+    ).unwrap();
+
+    let geo_log = client.get_geo_checkin_log(&vault_id);
+    assert!(geo_log.len() > 0);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_reduces_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+
+    client.accelerate_ttl_decay(&vault_id, &owner, &100u64).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in < pre_check_in);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_respects_minimum() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let err = client.try_accelerate_ttl_decay(&vault_id, &owner, &200u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InsufficientTtlToAccelerate as u32));
+}
+
+#[test]
+fn test_rate_limiting_enforces_cooldown() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.set_min_checkin_cooldown(&owner, &60u64).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 30);
+
+    let err = client.try_check_in(&vault_id, &owner, &passkey_hash).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::CheckInTooFrequent as u32));
+}
+
+#[test]
+fn test_rate_limiting_allows_after_cooldown() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.set_min_checkin_cooldown(&owner, &60u64).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 70);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_borrow_ttl_transfers_remaining_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let borrower_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let lender_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let borrower_before = client.get_vault(&borrower_id).last_check_in;
+    let lender_before = client.get_vault(&lender_id).last_check_in;
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &100u64).unwrap();
+
+    let borrower_after = client.get_vault(&borrower_id).last_check_in;
+    let lender_after = client.get_vault(&lender_id).last_check_in;
+
+    assert!(borrower_after > borrower_before);
+    assert!(lender_after < lender_before);
+}
+
+#[test]
+fn test_borrow_ttl_rejects_insufficient_lender_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let borrower_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let lender_id = client.create_vault(&owner, &beneficiary, &50u64, &None);
+
+    let err = client.try_borrow_ttl(&borrower_id, &lender_id, &owner, &100u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InsufficientBalance as u32));
+}
+
