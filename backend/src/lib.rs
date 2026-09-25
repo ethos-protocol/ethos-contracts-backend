@@ -27,6 +27,7 @@ pub mod error_context;
 pub mod event_sourcing;
 pub mod fallback;
 pub mod feature_flags;
+pub mod fraud_detection;
 pub mod graphql;
 pub mod handlers;
 pub mod health;
