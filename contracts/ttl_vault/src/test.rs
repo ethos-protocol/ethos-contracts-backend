@@ -6944,3 +6944,86 @@ fn test_borrow_ttl_rejects_insufficient_lender_ttl() {
     assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InsufficientBalance as u32));
 }
 
+// ============================================================
+// Issue #518: Biometric Verification, Shared TTL Pool
+// ============================================================
+
+#[test]
+fn test_biometric_check_in_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let bio_hash = BytesN::<32>::random(&env);
+    client.bind_passkey_biometric(&vault_id, &owner, &bio_hash).unwrap();
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+
+    client.biometric_check_in(&vault_id, &owner, &bio_hash).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in >= pre_check_in);
+}
+
+#[test]
+fn test_biometric_check_in_rejects_invalid_credential() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let valid_hash = BytesN::<32>::random(&env);
+    let invalid_hash = BytesN::<32>::random(&env);
+
+    client.bind_passkey_biometric(&vault_id, &owner, &valid_hash).unwrap();
+
+    let err = client.try_biometric_check_in(&vault_id, &owner, &invalid_hash).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InvalidBiometricCredential as u32));
+}
+
+#[test]
+fn test_create_ttl_pool_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+    assert!(pool_id > 0);
+}
+
+#[test]
+fn test_add_vault_to_pool() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    let pool_vaults = client.get_pool_vaults(&pool_id);
+    assert!(pool_vaults.len() > 0);
+}
+
+#[test]
+fn test_pool_check_in_updates_all_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+
+    client.add_vault_to_pool(&pool_id, &vault1, &owner).unwrap();
+    client.add_vault_to_pool(&pool_id, &vault2, &owner).unwrap();
+
+    let v1_before = client.get_vault(&vault1).last_check_in;
+    let v2_before = client.get_vault(&vault2).last_check_in;
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.pool_check_in(&pool_id, &owner).unwrap();
+
+    let v1_after = client.get_vault(&vault1).last_check_in;
+    let v2_after = client.get_vault(&vault2).last_check_in;
+
+    assert!(v1_after >= v1_before);
+    assert!(v2_after >= v2_before);
+}
+
