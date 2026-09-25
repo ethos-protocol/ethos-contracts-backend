@@ -148,6 +148,14 @@ mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
 #[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
+#[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
+mod withdrawal_notification_confirmation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
