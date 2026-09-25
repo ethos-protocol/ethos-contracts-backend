@@ -63,6 +63,15 @@ pub struct StreamEvent {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Feedback entry for model improvement.
+#[derive(Debug, Clone, Serialize)]
+pub struct Feedback {
+    pub id: String,
+    pub anomaly_id: String,
+    pub is_true_positive: bool,
+    pub submitted_at: DateTime<Utc>,
+}
+
 /// Running (Welford) baseline statistics for one metric.
 #[derive(Debug, Clone, Serialize)]
 pub struct Baseline {
@@ -151,6 +160,7 @@ struct Inner {
     suppression_counter: u64,
     correlations: HashMap<String, AnomalyCorrelation>,
     stream_events: Vec<StreamEvent>,
+    feedback_entries: Vec<Feedback>,
 }
 
 /// Shared anomaly-detection state: one baseline per metric plus the
@@ -318,6 +328,40 @@ impl AnomalyStore {
             .expect("anomaly lock poisoned")
             .stream_events
             .clone()
+    }
+
+    pub fn submit_feedback(&self, anomaly_id: &str, is_true_positive: bool) -> String {
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let feedback_id = Uuid::new_v4().to_string();
+
+        let feedback = Feedback {
+            id: feedback_id.clone(),
+            anomaly_id: anomaly_id.to_string(),
+            is_true_positive,
+            submitted_at: Utc::now(),
+        };
+
+        inner.feedback_entries.push(feedback);
+        feedback_id
+    }
+
+    pub fn get_feedback(&self) -> Vec<Feedback> {
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .feedback_entries
+            .clone()
+    }
+
+    pub fn get_feedback_for_anomaly(&self, anomaly_id: &str) -> Vec<Feedback> {
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .feedback_entries
+            .iter()
+            .filter(|f| f.anomaly_id == anomaly_id)
+            .cloned()
+            .collect()
     }
 }
 
@@ -588,5 +632,102 @@ mod tests {
         let (_, event2) = store.process_stream_event("metric", 2.0);
 
         assert!(event2.timestamp >= event1.timestamp);
+    }
+
+    // Issue #543: Anomaly Feedback Loop for Model Improvement Tests
+    #[test]
+    fn submit_feedback_for_anomaly() {
+        let store = AnomalyStore::default();
+        let anomaly_id = "alert_123";
+
+        let feedback_id = store.submit_feedback(anomaly_id, true);
+        assert!(!feedback_id.is_empty());
+
+        let feedback = store.get_feedback_for_anomaly(anomaly_id);
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0].anomaly_id, anomaly_id);
+        assert!(feedback[0].is_true_positive);
+    }
+
+    #[test]
+    fn track_true_positives_and_false_positives() {
+        let store = AnomalyStore::default();
+        let anomaly_id = "alert_456";
+
+        store.submit_feedback(anomaly_id, true);
+        store.submit_feedback(anomaly_id, false);
+        store.submit_feedback(anomaly_id, true);
+
+        let feedback = store.get_feedback_for_anomaly(anomaly_id);
+        assert_eq!(feedback.len(), 3);
+        let true_positives = feedback.iter().filter(|f| f.is_true_positive).count();
+        assert_eq!(true_positives, 2);
+    }
+
+    #[test]
+    fn feedback_collection_for_improvement() {
+        let store = AnomalyStore::default();
+
+        for i in 0..10 {
+            let anomaly_id = format!("alert_{}", i);
+            let is_positive = i % 2 == 0;
+            store.submit_feedback(&anomaly_id, is_positive);
+        }
+
+        let all_feedback = store.get_feedback();
+        assert_eq!(all_feedback.len(), 10);
+    }
+
+    #[test]
+    fn feedback_timestamps_recorded() {
+        let store = AnomalyStore::default();
+        let now = Utc::now();
+
+        store.submit_feedback("alert_789", true);
+        let feedback = store.get_feedback();
+
+        assert_eq!(feedback.len(), 1);
+        assert!(feedback[0].submitted_at >= now);
+    }
+
+    #[test]
+    fn model_versioning_with_feedback_epochs() {
+        let store = AnomalyStore::default();
+
+        let anomaly1 = "alert_v1_1";
+        let anomaly2 = "alert_v1_2";
+        let anomaly3 = "alert_v2_1";
+
+        store.submit_feedback(anomaly1, true);
+        store.submit_feedback(anomaly2, false);
+        store.submit_feedback(anomaly3, true);
+
+        let feedback_v1: Vec<_> = store
+            .get_feedback()
+            .iter()
+            .filter(|f| f.anomaly_id.starts_with("alert_v1"))
+            .collect();
+
+        assert_eq!(feedback_v1.len(), 2);
+    }
+
+    #[test]
+    fn performance_tracking_with_feedback() {
+        let store = AnomalyStore::default();
+
+        let mut true_count = 0;
+        let mut false_count = 0;
+
+        for i in 0..100 {
+            let anomaly_id = format!("perf_alert_{}", i);
+            let is_tp = i % 3 != 0;
+            store.submit_feedback(&anomaly_id, is_tp);
+            if is_tp { true_count += 1; } else { false_count += 1; }
+        }
+
+        let feedback = store.get_feedback();
+        assert_eq!(feedback.len(), 100);
+        let actual_tp = feedback.iter().filter(|f| f.is_true_positive).count();
+        assert_eq!(actual_tp, true_count);
     }
 }
