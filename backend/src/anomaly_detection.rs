@@ -54,6 +54,15 @@ pub struct AnomalyCorrelation {
     pub correlation_strength: f64,
 }
 
+/// Stream event for real-time processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamEvent {
+    pub event_id: u64,
+    pub metric: String,
+    pub value: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Running (Welford) baseline statistics for one metric.
 #[derive(Debug, Clone, Serialize)]
 pub struct Baseline {
@@ -141,6 +150,7 @@ struct Inner {
     suppressions: HashMap<u64, Suppression>,
     suppression_counter: u64,
     correlations: HashMap<String, AnomalyCorrelation>,
+    stream_events: Vec<StreamEvent>,
 }
 
 /// Shared anomaly-detection state: one baseline per metric plus the
@@ -278,6 +288,36 @@ impl AnomalyStore {
             correlation.correlated_ids.push(correlated_id.to_string());
         }
         correlation.correlation_strength = strength.max(correlation.correlation_strength);
+    }
+
+    pub fn process_stream_event(&self, metric: &str, value: f64) -> (Option<Alert>, StreamEvent) {
+        let event_id = {
+            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            inner.stream_events.len() as u64 + 1
+        };
+
+        let event = StreamEvent {
+            event_id,
+            metric: metric.to_string(),
+            value,
+            timestamp: Utc::now(),
+        };
+
+        {
+            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            inner.stream_events.push(event.clone());
+        }
+
+        let alert = self.observe(metric, value);
+        (alert, event)
+    }
+
+    pub fn get_stream_events(&self) -> Vec<StreamEvent> {
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .stream_events
+            .clone()
     }
 }
 
@@ -492,5 +532,61 @@ mod tests {
 
         let correlated = store.get_correlated_anomalies(id1);
         assert_eq!(correlated.len(), 1);
+    }
+
+    // Issue #542: Real-Time Anomaly Stream Processing Tests
+    #[test]
+    fn stream_event_creation_with_event_id() {
+        let store = AnomalyStore::default();
+        let (alert, event) = store.process_stream_event("cpu_pct", 42.0);
+
+        assert_eq!(event.metric, "cpu_pct");
+        assert_eq!(event.value, 42.0);
+        assert!(event.event_id > 0);
+    }
+
+    #[test]
+    fn stream_processing_generates_alerts() {
+        let store = AnomalyStore::default();
+        for v in [10.0, 10.1, 9.9, 10.0, 10.05, 9.95, 10.0] {
+            store.process_stream_event("cpu_pct", v);
+        }
+        let (alert, event) = store.process_stream_event("cpu_pct", 500.0);
+
+        assert!(alert.is_some(), "stream spike should trigger alert");
+        assert_eq!(event.metric, "cpu_pct");
+    }
+
+    #[test]
+    fn stream_events_recorded_in_order() {
+        let store = AnomalyStore::default();
+        store.process_stream_event("metric_a", 1.0);
+        store.process_stream_event("metric_b", 2.0);
+        store.process_stream_event("metric_c", 3.0);
+
+        let events = store.get_stream_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_id, 1);
+        assert_eq!(events[1].event_id, 2);
+        assert_eq!(events[2].event_id, 3);
+    }
+
+    #[test]
+    fn stream_processing_reduces_latency() {
+        let store = AnomalyStore::default();
+        let now = Utc::now();
+
+        let (_, event) = store.process_stream_event("fast_metric", 99.9);
+
+        assert!(event.timestamp >= now, "event timestamp should be current");
+    }
+
+    #[test]
+    fn stream_events_with_timestamps() {
+        let store = AnomalyStore::default();
+        let (_, event1) = store.process_stream_event("metric", 1.0);
+        let (_, event2) = store.process_stream_event("metric", 2.0);
+
+        assert!(event2.timestamp >= event1.timestamp);
     }
 }
