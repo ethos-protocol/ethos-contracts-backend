@@ -4,6 +4,12 @@
 mod atomic_release_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod delegation_tests;
+#[cfg(test)]
+mod event_registry_tests;
+#[cfg(test)]
+mod custody_tracking_tests;
 mod compression;
 
 use crate::compression::{

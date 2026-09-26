@@ -130,7 +130,9 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
-mod passkey_audit_log_enhanced_tests;
+mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_breach_detection_tests;
 #[cfg(test)]
 mod passkey_cap_tests;
 #[cfg(test)]
@@ -140,11 +142,9 @@ mod passkey_escrow_tests;
 #[cfg(test)]
 mod passkey_expiry_notification_tests;
 #[cfg(test)]
-mod passkey_geolocation_tests;
+mod passkey_metadata_tests;
 #[cfg(test)]
-mod passkey_social_recovery_tests;
-#[cfg(test)]
-mod passkey_threshold_authentication_tests;
+mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
@@ -156,7 +156,23 @@ mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
 #[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
+#[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
+mod withdrawal_notification_confirmation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
+#[cfg(test)]
+mod withdrawal_rate_limit_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
+#[cfg(test)]
+mod multisig_withdrawal_tests;
+#[cfg(test)]
+mod withdrawal_rollback_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.

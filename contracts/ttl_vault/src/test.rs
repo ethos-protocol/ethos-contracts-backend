@@ -6699,3 +6699,381 @@ fn test_trigger_release_with_50_beneficiaries() {
     assert!(token_client.balance(&addresses[49]) >= per_beneficiary);
 }
 
+// ============================================================
+// Issue #516: Check-in Delegation, Proof-of-Work, TTL Prediction, Batch Validation
+// ============================================================
+
+#[test]
+fn test_check_in_delegate_basic_flow() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+
+    let delegate = Address::generate(&env);
+
+    assert!(!client.is_check_in_delegate_pub(&vault_id, &delegate));
+
+    client.add_check_in_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert!(client.is_check_in_delegate_pub(&vault_id, &delegate));
+
+    let delegates = client.get_check_in_delegates(&vault_id);
+    assert_eq!(delegates.len(), 1);
+    assert_eq!(delegates.get(0).unwrap(), delegate);
+}
+
+#[test]
+fn test_check_in_delegate_can_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let delegate = Address::generate(&env);
+    client.add_check_in_delegate(&vault_id, &owner, &delegate).unwrap();
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+    env.ledger().with_mut(|l| l.timestamp += 10);
+
+    client.check_in(&vault_id, &delegate, &passkey_hash).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in > pre_check_in);
+}
+
+#[test]
+fn test_check_in_with_pow_valid_hash() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in_with_pow(&vault_id, &owner, &passkey_hash, &0u64, &0u32).unwrap();
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_expired_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let expiry = env.ledger().timestamp() + 100;
+    client.set_passkey_expiry(&vault_id, &owner, &passkey_hash, &expiry).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    let err = client.try_check_in_with_pow(&vault_id, &owner, &passkey_hash, &0u64, &0u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InvalidPasskey as u32));
+}
+
+#[test]
+fn test_batch_check_in_validates_all_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pk_hash1 = BytesN::<32>::random(&env);
+    let pk_hash2 = BytesN::<32>::random(&env);
+
+    client.add_passkey(&vault1, &owner, &pk_hash1).unwrap();
+    client.add_passkey(&vault2, &owner, &pk_hash2).unwrap();
+
+    let mut vault_ids = soroban_sdk::Vec::new(&env);
+    vault_ids.push_back(vault1);
+    vault_ids.push_back(vault2);
+
+    let mut passphrases = soroban_sdk::Vec::new(&env);
+    passphrases.push_back(pk_hash1);
+    passphrases.push_back(pk_hash2);
+
+    client.batch_check_in_v2(&vault_ids, &owner, &passphrases).unwrap();
+
+    assert_eq!(client.get_vault(&vault1).status, ReleaseStatus::Locked);
+    assert_eq!(client.get_vault(&vault2).status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_ttl_prediction_records_history() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let history = client.get_check_in_history(&vault_id);
+    assert!(history.len() >= 2);
+}
+
+// ============================================================
+// Issue #517: Geographic Check-in, Accelerated TTL Decay, Rate Limiting, TTL Borrowing
+// ============================================================
+
+#[test]
+fn test_check_in_with_geo_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    let pre_balance = client.get_vault(&vault_id).last_check_in;
+
+    client.check_in_with_geo(
+        &vault_id,
+        &owner,
+        &passkey_hash,
+        &40_000_000i64,
+        &(-74_000_000i64),
+        &"US"
+    ).unwrap();
+
+    let post_balance = client.get_vault(&vault_id).last_check_in;
+    assert!(post_balance >= pre_balance);
+}
+
+#[test]
+fn test_check_in_with_geo_records_location() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.check_in_with_geo(
+        &vault_id,
+        &owner,
+        &passkey_hash,
+        &40_000_000i64,
+        &(-74_000_000i64),
+        &"US"
+    ).unwrap();
+
+    let geo_log = client.get_geo_checkin_log(&vault_id);
+    assert!(geo_log.len() > 0);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_reduces_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+
+    client.accelerate_ttl_decay(&vault_id, &owner, &100u64).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in < pre_check_in);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_respects_minimum() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let err = client.try_accelerate_ttl_decay(&vault_id, &owner, &200u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InsufficientTtlToAccelerate as u32));
+}
+
+#[test]
+fn test_rate_limiting_enforces_cooldown() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.set_min_checkin_cooldown(&owner, &60u64).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 30);
+
+    let err = client.try_check_in(&vault_id, &owner, &passkey_hash).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::CheckInTooFrequent as u32));
+}
+
+#[test]
+fn test_rate_limiting_allows_after_cooldown() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let passkey_hash = BytesN::<32>::random(&env);
+    client.add_passkey(&vault_id, &owner, &passkey_hash).unwrap();
+
+    client.set_min_checkin_cooldown(&owner, &60u64).unwrap();
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 70);
+
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_borrow_ttl_transfers_remaining_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let borrower_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let lender_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let borrower_before = client.get_vault(&borrower_id).last_check_in;
+    let lender_before = client.get_vault(&lender_id).last_check_in;
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &100u64).unwrap();
+
+    let borrower_after = client.get_vault(&borrower_id).last_check_in;
+    let lender_after = client.get_vault(&lender_id).last_check_in;
+
+    assert!(borrower_after > borrower_before);
+    assert!(lender_after < lender_before);
+}
+
+#[test]
+fn test_borrow_ttl_rejects_insufficient_lender_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let borrower_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let lender_id = client.create_vault(&owner, &beneficiary, &50u64, &None);
+
+    let err = client.try_borrow_ttl(&borrower_id, &lender_id, &owner, &100u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InsufficientBalance as u32));
+}
+
+// ============================================================
+// Issue #518: Biometric Verification, Shared TTL Pool
+// ============================================================
+
+#[test]
+fn test_biometric_check_in_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let bio_hash = BytesN::<32>::random(&env);
+    client.bind_passkey_biometric(&vault_id, &owner, &bio_hash).unwrap();
+
+    let pre_check_in = client.get_vault(&vault_id).last_check_in;
+
+    client.biometric_check_in(&vault_id, &owner, &bio_hash).unwrap();
+
+    let post_check_in = client.get_vault(&vault_id).last_check_in;
+    assert!(post_check_in >= pre_check_in);
+}
+
+#[test]
+fn test_biometric_check_in_rejects_invalid_credential() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let valid_hash = BytesN::<32>::random(&env);
+    let invalid_hash = BytesN::<32>::random(&env);
+
+    client.bind_passkey_biometric(&vault_id, &owner, &valid_hash).unwrap();
+
+    let err = client.try_biometric_check_in(&vault_id, &owner, &invalid_hash).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InvalidBiometricCredential as u32));
+}
+
+#[test]
+fn test_create_ttl_pool_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+    assert!(pool_id > 0);
+}
+
+#[test]
+fn test_add_vault_to_pool() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    let pool_vaults = client.get_pool_vaults(&pool_id);
+    assert!(pool_vaults.len() > 0);
+}
+
+#[test]
+fn test_pool_check_in_updates_all_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault1 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let pool_id = client.create_pool(&owner).unwrap();
+
+    client.add_vault_to_pool(&pool_id, &vault1, &owner).unwrap();
+    client.add_vault_to_pool(&pool_id, &vault2, &owner).unwrap();
+
+    let v1_before = client.get_vault(&vault1).last_check_in;
+    let v2_before = client.get_vault(&vault2).last_check_in;
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.pool_check_in(&pool_id, &owner).unwrap();
+
+    let v1_after = client.get_vault(&vault1).last_check_in;
+    let v2_after = client.get_vault(&vault2).last_check_in;
+
+    assert!(v1_after >= v1_before);
+    assert!(v2_after >= v2_before);
+}
+
+// ============================================================
+// Issue #519: Beneficiary Delegation Chain
+// ============================================================
+
+#[test]
+fn test_beneficiary_delegation_chain_basic() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegate1 = Address::generate(&env);
+    let delegate2 = Address::generate(&env);
+
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate1).unwrap();
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate2).unwrap();
+
+    let chain = client.get_beneficiary_delegation_chain(&vault_id);
+    assert_eq!(chain.len(), 2);
+}
+
+#[test]
+fn test_beneficiary_delegation_chain_removal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegate = Address::generate(&env);
+
+    client.add_beneficiary_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert_eq!(client.get_beneficiary_delegation_chain(&vault_id).len(), 1);
+
+    client.remove_beneficiary_delegate(&vault_id, &owner, &delegate).unwrap();
+    assert_eq!(client.get_beneficiary_delegation_chain(&vault_id).len(), 0);
+}
+
+#[test]
+fn test_beneficiary_delegation_chain_order_preserved() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    let delegates: alloc::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
+
+    for delegate in &delegates {
+        client.add_beneficiary_delegate(&vault_id, &owner, delegate).unwrap();
+    }
+
+    let chain = client.get_beneficiary_delegation_chain(&vault_id);
+    for (i, addr) in chain.iter().enumerate() {
+        assert_eq!(addr, delegates[i]);
+    }
+}
+
