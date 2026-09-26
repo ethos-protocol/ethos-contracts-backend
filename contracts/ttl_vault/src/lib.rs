@@ -5,6 +5,8 @@
 // currently emits them.
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, symbol_short, token, vec, xdr::ToXdr,
     Address, Bytes, BytesN, Env, String, Vec,
@@ -112,6 +114,13 @@ use types::{
     VESTING_ROLLOVER_TOPIC, VESTING_SCHEDULE_ADDED_TOPIC, VESTING_STAGGER_TOPIC,
     WITHDRAWAL_ESCROW_CREATED_TOPIC, WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC,
     WITHDRAWAL_RATE_LIMITED_TOPIC, WITHDRAWAL_ROLLBACK_TOPIC,
+    // Issue #563: cursor pagination
+    BatchCheckInResult, VaultConfigTemplate, VaultPage, VaultSortField,
+    // Issue #560: Merkle history proofs
+    MerkleLeaf, MerkleProof,
+    // New event topics
+    HISTORY_PROOF_TOPIC, HISTORY_ROOT_TOPIC, VAULT_LIST_TOPIC, VAULT_TMPL_REF_TOPIC,
+    VAULT_TMPL_REG_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
