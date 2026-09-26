@@ -996,4 +996,312 @@ mod tests {
         let err = validate_timestamp(Some(&ts)).unwrap_err();
         assert!(err.contains("out of tolerance"));
     }
+
+    #[tokio::test]
+    async fn test_register_webhook_creates_registration() {
+        let state = Arc::new(WebhookState::new());
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+
+        let (status, Json(reg)) = register_webhook(State(state.clone()), Json(req))
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(!reg.id.is_empty());
+        assert!(reg.active);
+
+        let stored = state.store.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored.get(&reg.id).unwrap().url, "https://example.test/hook");
+    }
+
+    #[tokio::test]
+    async fn test_register_webhook_rejects_empty_url() {
+        let state = Arc::new(WebhookState::new());
+        let req = RegisterWebhookRequest {
+            url: "".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+
+        let result = register_webhook(State(state), Json(req)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_returns_all_registrations() {
+        let state = Arc::new(WebhookState::new());
+
+        for i in 0..3 {
+            let req = RegisterWebhookRequest {
+                url: format!("https://example.test/hook-{i}"),
+                vault_id: None,
+                event_types: vec![],
+                secret: None,
+                algorithm: SignatureAlgorithm::Sha256,
+            };
+            let _ = register_webhook(State(state.clone()), Json(req))
+                .await
+                .unwrap();
+        }
+
+        let Json(webhooks) = list_webhooks(State(state)).await;
+        assert_eq!(webhooks.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_delete_webhook_deactivates_registration() {
+        let state = Arc::new(WebhookState::new());
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+
+        let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
+            .await
+            .unwrap();
+
+        let status = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let stored = state.store.lock().unwrap();
+        assert!(!stored.get(&reg.id).unwrap().active);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_webhook_returns_not_found() {
+        let state = Arc::new(WebhookState::new());
+        let status = delete_webhook(State(state), Path("nonexistent".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_event_filters_by_vault_id() {
+        let state = Arc::new(WebhookState::new());
+
+        // Register webhook for vault-1
+        let req1 = RegisterWebhookRequest {
+            url: "https://example.test/hook1".to_string(),
+            vault_id: Some("vault-1".to_string()),
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+        let _ = register_webhook(State(state.clone()), Json(req1))
+            .await
+            .unwrap();
+
+        // Register webhook for vault-2
+        let req2 = RegisterWebhookRequest {
+            url: "https://example.test/hook2".to_string(),
+            vault_id: Some("vault-2".to_string()),
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+        let _ = register_webhook(State(state.clone()), Json(req2))
+            .await
+            .unwrap();
+
+        // Event for vault-1 should match the first webhook
+        let registrations: Vec<WebhookRegistration> = {
+            let store = state.store.lock().unwrap();
+            store
+                .values()
+                .filter(|wh| {
+                    if !wh.active {
+                        return false;
+                    }
+                    if let Some(ref wh_vault) = wh.vault_id {
+                        if *wh_vault != "vault-1" {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].vault_id, Some("vault-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_deliver_event_filters_by_event_type() {
+        let state = Arc::new(WebhookState::new());
+
+        // Register webhook for specific event types
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![WebhookEventType::VaultCreated, WebhookEventType::VaultCheckedIn],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+        let _ = register_webhook(State(state.clone()), Json(req))
+            .await
+            .unwrap();
+
+        // Check that VaultCreated events are included
+        let matching: Vec<WebhookRegistration> = {
+            let store = state.store.lock().unwrap();
+            store
+                .values()
+                .filter(|wh| {
+                    if !wh.active {
+                        return false;
+                    }
+                    if !wh.event_types.is_empty()
+                        && !wh.event_types.contains(&WebhookEventType::VaultCreated)
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(matching.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_verify_webhook_endpoint_accepts_valid_request() {
+        let body = r#"{"amount":100}"#;
+        let secret = "test-secret";
+        let sig = sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256);
+        let ts = ts_now();
+
+        let req = VerifyWebhookRequest {
+            body: body.to_string(),
+            secret: secret.to_string(),
+            signature: sig,
+            timestamp: Some(ts),
+        };
+
+        let (status, Json(result)) = verify_webhook(Json(req)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(result.valid);
+    }
+
+    #[tokio::test]
+    async fn test_verify_webhook_endpoint_rejects_invalid_signature() {
+        let body = r#"{"amount":100}"#;
+        let secret = "test-secret";
+        let sig = sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256);
+        let ts = ts_now();
+
+        let req = VerifyWebhookRequest {
+            body: r#"{"amount":999}"#.to_string(),
+            secret: secret.to_string(),
+            signature: sig,
+            timestamp: Some(ts),
+        };
+
+        let (status, Json(result)) = verify_webhook(Json(req)).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!result.valid);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_event_filtering_respects_active_flag() {
+        let state = Arc::new(WebhookState::new());
+
+        // Register and then deactivate a webhook
+        let req = RegisterWebhookRequest {
+            url: "https://example.test/hook".to_string(),
+            vault_id: None,
+            event_types: vec![],
+            secret: None,
+            algorithm: SignatureAlgorithm::Sha256,
+        };
+        let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
+            .await
+            .unwrap();
+
+        let _ = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
+
+        // Deactivated webhooks should not match
+        let matching: Vec<WebhookRegistration> = {
+            let store = state.store.lock().unwrap();
+            store
+                .values()
+                .filter(|wh| wh.active)
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(matching.len(), 0);
+    }
+
+    #[test]
+    fn test_signature_verification_with_multiple_algorithms() {
+        let body = r#"{"event":"test"}"#;
+        let secret = "key";
+
+        for algo in &[
+            SignatureAlgorithm::Sha256,
+            SignatureAlgorithm::Sha1,
+            SignatureAlgorithm::Sha512,
+        ] {
+            let sig = sign_payload_with_algorithm(body, secret, *algo);
+            let ts = ts_now();
+
+            let result = verify_webhook_signature(body, secret, Some(&sig), Some(&ts));
+            assert!(
+                result.valid,
+                "signature should verify for algorithm {algo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_signature_256_is_always_sha256() {
+        let body = r#"{"test":1}"#;
+        let secret = "key";
+
+        // Even if we sign with SHA512, X-Signature-256 should be SHA256
+        let sig_256 = standard_signature_256(body, secret);
+        let sig_sha256 = sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256);
+
+        assert_eq!(sig_256, sig_sha256);
+        assert!(sig_256.starts_with("sha256="));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_secret_generation() {
+        let state = Arc::new(WebhookState::new());
+
+        for _ in 0..5 {
+            let req = RegisterWebhookRequest {
+                url: format!("https://example.test/hook{}", uuid::Uuid::new_v4()),
+                vault_id: None,
+                event_types: vec![],
+                secret: None,
+                algorithm: SignatureAlgorithm::Sha256,
+            };
+
+            let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
+                .await
+                .unwrap();
+
+            let secret = reg.secret.unwrap();
+            assert!(secret.starts_with("whsec_"), "secret should have whsec_ prefix");
+            assert!(secret.len() > 30, "secret should be long enough");
+        }
+    }
 }

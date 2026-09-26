@@ -4,13 +4,19 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::{HeaderValue, Method, StatusCode},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
+    anomaly_detection::{
+        configure_seasonality, get_baseline, get_investigation_history, get_seasonal_pattern,
+        list_alerts, list_root_causes, list_system_anomalies, observe_metric,
+        record_investigation, set_seasonal_threshold, AnomalyStore,
+    },
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
@@ -403,14 +409,32 @@ async fn main() {
     //     .route("/dashboards/shared/:token", get(get_shared_dashboard))
     //     .with_state(custom_metrics_store);
 
-    // ── Anomaly detection routes ──────────────────────────────────────────
-    // NOTE: Anomaly detection is pending implementation.
-    // let anomaly_store = AnomalyStore::new();
-    // let anomaly_router = Router::new()
-    //     .route("/anomaly/observe", post(observe_metric))
-    //     .route("/anomaly/alerts", get(list_alerts))
-    //     .route("/anomaly/baseline/:metric", get(get_baseline))
-    //     .with_state(anomaly_store);
+    // ── Anomaly detection routes (#544 seasonal, #545 correlation, #546 investigations)
+    let anomaly_store = AnomalyStore::new();
+    let anomaly_router = Router::new()
+        .route("/anomaly/observe", post(observe_metric))
+        .route("/anomaly/alerts", get(list_alerts))
+        .route("/anomaly/baseline/:metric", get(get_baseline))
+        .route(
+            "/anomaly/seasonality",
+            post(configure_seasonality).get(get_seasonal_pattern),
+        )
+        .route("/anomaly/seasonality/threshold", put(set_seasonal_threshold))
+        .route("/anomaly/system", get(list_system_anomalies))
+        .route("/anomaly/root-causes", get(list_root_causes))
+        .route(
+            "/anomaly/investigations/:anomaly_id",
+            post(record_investigation).get(get_investigation_history),
+        )
+        .with_state(anomaly_store);
+
+    // ── AML screening routes (#547) ───────────────────────────────────────
+    let aml_screener = AmlScreener::from_env();
+    let aml_router = Router::new()
+        .route("/aml/check/:address", get(check_address))
+        .route("/aml/flags", post(flag_address).get(list_aml_flags))
+        .route("/aml/flags/:address", delete(unflag_address))
+        .with_state(aml_screener);
 
     // ── Structured log parsing / search routes ───────────────────────────
     // NOTE: Log parsing/search is pending implementation.
@@ -444,7 +468,8 @@ async fn main() {
     let app = build_router(state)
         // .merge(acl_router)
         // .merge(custom_metrics_router)
-        // .merge(anomaly_router)
+        .merge(anomaly_router)
+        .merge(aml_router)
         // .merge(log_router)
         .merge(webauthn_router);
 

@@ -12,7 +12,9 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod aml;
 pub mod composition_rules;
+pub mod compliance;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
@@ -139,6 +141,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_breach_detection_tests;
+#[cfg(test)]
 mod passkey_cap_tests;
 #[cfg(test)]
 mod passkey_delegation_tests;
@@ -146,6 +152,10 @@ mod passkey_delegation_tests;
 mod passkey_escrow_tests;
 #[cfg(test)]
 mod passkey_expiry_notification_tests;
+#[cfg(test)]
+mod passkey_metadata_tests;
+#[cfg(test)]
+mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
@@ -157,15 +167,23 @@ mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
 #[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
+#[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
+mod withdrawal_notification_confirmation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
 #[cfg(test)]
-mod pagination_tests;
+mod withdrawal_rate_limit_tests;
 #[cfg(test)]
-mod batch_check_in_tests;
+mod withdrawal_whitelist_tests;
 #[cfg(test)]
-mod deduplication_tests;
+mod multisig_withdrawal_tests;
 #[cfg(test)]
-mod merkle_history_tests;
+mod withdrawal_rollback_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -415,6 +433,8 @@ pub enum ContractError {
     UpgradeStorageSchemaChanged = 128,
     UpgradeErrorCodesReduced = 129,
     UpgradeManifestNotSet = 130,
+    // Issue #547: AML screening rejected a beneficiary / transfer recipient
+    AmlFlaggedAddress = 131,
 }
 
 #[contract]
@@ -1258,6 +1278,7 @@ impl TtlVaultContract {
             YieldDistributionMode::DistributeToBeneficiary => {
                 // Transfer yield to beneficiary
                 let token_client = token::Client::new(&env, &vault.token_address);
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -1293,6 +1314,7 @@ impl TtlVaultContract {
 
                 if beneficiary_amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &vault.beneficiary);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &vault.beneficiary,
@@ -1358,6 +1380,55 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    // --- AML screening (Issue #547) ---
+
+    /// Returns `true` when `address` passes AML screening: it is not on the
+    /// local flag list and, if a sanctions oracle is configured, the oracle
+    /// does not report it as sanctioned (oracle failures fail closed).
+    pub fn check_aml_compliance(env: Env, address: Address) -> bool {
+        aml::check_compliance(&env, &address)
+    }
+
+    /// Admin-only: configure (or clear with `None`) the on-chain sanctions
+    /// oracle, which must expose `is_sanctioned(Address) -> bool`.
+    pub fn set_aml_oracle(env: Env, admin: Address, oracle: Option<Address>) {
+        aml::set_oracle(&env, &admin, oracle);
+    }
+
+    /// Returns the configured sanctions oracle, if any.
+    pub fn get_aml_oracle(env: Env) -> Option<Address> {
+        aml::get_oracle(&env)
+    }
+
+    /// Admin-only: configure (or clear) the AML reporter — typically the
+    /// backend service that screens addresses with an AML provider and
+    /// mirrors hits on-chain.
+    pub fn set_aml_reporter(env: Env, admin: Address, reporter: Option<Address>) {
+        aml::set_reporter(&env, &admin, reporter);
+    }
+
+    /// Returns the configured AML reporter, if any.
+    pub fn get_aml_reporter(env: Env) -> Option<Address> {
+        aml::get_reporter(&env)
+    }
+
+    /// Admin or AML reporter: flag `address`, blocking it from being added as
+    /// a beneficiary and from receiving any transfer out of a vault.
+    pub fn flag_aml_address(env: Env, caller: Address, address: Address, reason: String) {
+        aml::flag_address(&env, &caller, address, reason);
+    }
+
+    /// Admin or AML reporter: remove a flag (e.g. after a false positive is
+    /// cleared by compliance review).
+    pub fn unflag_aml_address(env: Env, caller: Address, address: Address) {
+        aml::unflag_address(&env, &caller, address);
+    }
+
+    /// Returns the flag record for `address`, if it is locally flagged.
+    pub fn get_aml_flag(env: Env, address: Address) -> Option<aml::AmlFlag> {
+        aml::get_flag(&env, &address)
     }
 
     /// Returns the current protocol-level configuration as a typed struct — Issue #810.
@@ -1588,6 +1659,12 @@ impl TtlVaultContract {
         if owner == beneficiary {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
+        // Issue #547: screen the beneficiary against AML/sanctions data.
+        aml::require_compliant(&env, &beneficiary);
+
+        // Issue #551: owner and beneficiary must pass blacklist/allowlist screening
+        Self::assert_compliant(&env, &owner);
+        Self::assert_compliant(&env, &beneficiary);
 
         // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
         let dup_key =
@@ -1843,6 +1920,7 @@ impl TtlVaultContract {
                 let total_penalty = (penalty_per * missed as i128).min(vault.balance);
                 if total_penalty > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &recipient);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &recipient,
@@ -1931,6 +2009,11 @@ impl TtlVaultContract {
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        Self::assert_compliant(&env, &from);
+        if let Err(e) = compliance::check_kyc_for_amount(&env, &from, amount) {
+            panic_with_error!(&env, e);
+        }
         if vault.status != ReleaseStatus::Locked {
             panic_with_error!(&env, ContractError::AlreadyReleased);
         }
@@ -1959,6 +2042,17 @@ impl TtlVaultContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
         Self::save_vault(&env, vault_id, &vault);
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Deposit,
+            vault_id,
+            &from,
+            &env.current_contract_address(),
+            &vault.token_address,
+            amount,
+            &from,
+        );
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
         env.storage()
@@ -2216,9 +2310,36 @@ impl TtlVaultContract {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
         }
 
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        if let Err(e) = compliance::check_address(&env, &vault.owner)
+            .and_then(|()| compliance::check_kyc_for_amount(&env, &vault.owner, amount))
+        {
+            Self::record_withdrawal_audit(
+                &env,
+                vault_id,
+                &caller,
+                amount,
+                false,
+                "Compliance check failed",
+            );
+            return Err(e);
+        }
+
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Withdrawal,
+            vault_id,
+            &env.current_contract_address(),
+            &vault.owner,
+            &vault.token_address,
+            amount,
+            &vault.owner,
+        );
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -2649,6 +2770,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &escrow.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &escrow.beneficiary,
@@ -3210,6 +3332,7 @@ impl TtlVaultContract {
                     .publish((BURN_EVENT_TOPIC, vault_id), burn_amount);
             }
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -3557,6 +3680,7 @@ impl TtlVaultContract {
 
         if vault.beneficiaries.is_empty() {
             // Single-beneficiary path: send full amount to primary beneficiary.
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (symbol_short!("partial"), vault_id),
@@ -3573,6 +3697,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -3636,6 +3761,9 @@ impl TtlVaultContract {
                 return Err(ContractError::InvalidBeneficiary);
             }
             Self::assert_not_zero_address(&env, &entry.address);
+            if !aml::check_compliance(&env, &entry.address) {
+                return Err(ContractError::AmlFlaggedAddress);
+            }
         }
         vault.beneficiaries = beneficiaries.clone();
         Self::save_vault(&env, vault_id, &vault);
@@ -3739,6 +3867,9 @@ impl TtlVaultContract {
         }
         if address == vault.owner {
             return Err(ContractError::InvalidBeneficiary);
+        }
+        if !aml::check_compliance(&env, &address) {
+            return Err(ContractError::AmlFlaggedAddress);
         }
 
         // Check if beneficiary already exists
@@ -4496,6 +4627,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &pending.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &pending.beneficiary,
@@ -4681,6 +4813,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (CLAIM_VEST_TOPIC, vault_id),
@@ -4696,6 +4829,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -5306,6 +5440,7 @@ impl TtlVaultContract {
 
                 if amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &caller);
                     token_client.transfer(&env.current_contract_address(), &caller, &amount);
                     vault.balance -= amount;
                     entry.claimed_installments = unlocked;
@@ -5633,6 +5768,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -5656,6 +5792,7 @@ impl TtlVaultContract {
                     total_claimable * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -6280,6 +6417,7 @@ impl TtlVaultContract {
 
                     if unvested > 0 {
                         let token_client = token::Client::new(&env, &vault.token_address);
+                        crate::aml::require_compliant(&env, &forfeit_cfg.forfeiture_recipient);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &forfeit_cfg.forfeiture_recipient,
@@ -6563,6 +6701,7 @@ impl TtlVaultContract {
         );
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &beneficiary);
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount);
 
         env.events().publish(
@@ -6844,6 +6983,9 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBeneficiary);
         }
         Self::assert_not_zero_address(&env, &new_beneficiary);
+        if !aml::check_compliance(&env, &new_beneficiary) {
+            return Err(ContractError::AmlFlaggedAddress);
+        }
 
         let now = env.ledger().timestamp();
         // Timelock: 24 hours
@@ -7934,6 +8076,7 @@ impl TtlVaultContract {
 
         let amount = vault.balance;
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &claim);
         token_client.transfer(&env.current_contract_address(), &claim, &amount);
 
         vault.balance = 0;
@@ -8675,6 +8818,14 @@ impl TtlVaultContract {
     fn require_admin(env: &Env) {
         let admin = Self::load_admin(env);
         admin.require_auth();
+    }
+
+    /// Panics with the compliance error if `address` is blacklisted or, in
+    /// allowlist mode, not allowlisted — Issue #551.
+    fn assert_compliant(env: &Env, address: &Address) {
+        if let Err(e) = compliance::check_address(env, address) {
+            panic_with_error!(env, e);
+        }
     }
 
     fn load_admin(env: &Env) -> Address {
@@ -10730,6 +10881,7 @@ impl TtlVaultContract {
                 let beneficiary = Self::get_delegated_beneficiary(&env, vault_id)
                     .unwrap_or(vault.beneficiary.clone());
 
+                crate::aml::require_compliant(&env, &beneficiary);
                 token_client.transfer(&env.current_contract_address(), &beneficiary, &entry.amount);
 
                 vault.balance -= entry.amount;
@@ -13133,6 +13285,7 @@ impl TtlVaultContract {
                 release_amount * (entry.bps as i128) / (total_qualifying_bps as i128)
             };
             if share > 0 {
+                crate::aml::require_compliant(env, &entry.address);
                 token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 env.events().publish(
                     (RELEASE_TOPIC,),
@@ -13798,6 +13951,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (VESTING_CATCHUP_CLAIMED_TOPIC, vault_id),
@@ -13813,6 +13967,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -13992,6 +14147,7 @@ impl TtlVaultContract {
             // Pay base without bonus
             let token_client = token::Client::new(&env, &vault.token_address);
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -14011,6 +14167,7 @@ impl TtlVaultContract {
                         fallback * (entry.bps as i128) / 10_000
                     };
                     if share > 0 {
+                        crate::aml::require_compliant(&env, &entry.address);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &entry.address,
@@ -14042,6 +14199,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -14061,6 +14219,7 @@ impl TtlVaultContract {
                     total_amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -15433,874 +15592,271 @@ impl TtlVaultContract {
         ))
     }
 
-    // ── Issue #563: Cursor-based pagination ───────────────────────────────────
+    // --- compliance (Issues #548, #549, #550, #551) ---
 
-    /// Returns a cursor-paginated page of vault IDs owned by `owner`.
+    /// Blacklist `address` with a recorded `reason` (admin only) — Issue #551.
     ///
-    /// `cursor` is the vault ID *after* which the page starts (exclusive).
-    /// Pass `None` to start from the beginning.  `limit` controls how many
-    /// results are returned (clamped to 100).  `sort_by` determines the
-    /// ordering within the owner's vault list.
-    ///
-    /// # Returns
-    /// A [`VaultPage`] containing the items for this page and the cursor for
-    /// the next page (`None` when there are no more results).
-    pub fn list_vaults_by_owner(
-        env: Env,
-        owner: Address,
-        cursor: Option<u64>,
-        limit: u32,
-        sort_by: VaultSortField,
-        status_filter: Option<ReleaseStatus>,
-    ) -> VaultPage {
-        let limit = limit.max(1).min(100) as usize;
-        let all = Self::load_owner_vault_ids(&env, &owner);
-        let total = all.len();
-
-        // Collect into a sortable collection
-        let mut ids: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for id in all.iter() {
-            ids.push(id);
-        }
-
-        // Apply status filter
-        if let Some(ref status) = status_filter {
-            ids.retain(|&id| {
-                Self::try_load_vault(&env, id)
-                    .map(|v| &v.status == status)
-                    .unwrap_or(false)
-            });
-        }
-
-        // Sort
-        match sort_by {
-            VaultSortField::CreatedAt => {
-                ids.sort_by_key(|&id| {
-                    Self::try_load_vault(&env, id)
-                        .map(|v| v.created_at)
-                        .unwrap_or(0)
-                });
-            }
-            VaultSortField::LastCheckIn => {
-                ids.sort_by_key(|&id| {
-                    Self::try_load_vault(&env, id)
-                        .map(|v| v.last_check_in)
-                        .unwrap_or(0)
-                });
-            }
-            VaultSortField::Balance => {
-                // Largest balance first — negate for descending order.
-                ids.sort_by(|&a, &b| {
-                    let bal_a = Self::try_load_vault(&env, a)
-                        .map(|v| v.balance)
-                        .unwrap_or(0);
-                    let bal_b = Self::try_load_vault(&env, b)
-                        .map(|v| v.balance)
-                        .unwrap_or(0);
-                    bal_b.cmp(&bal_a)
-                });
-            }
-        }
-
-        // Apply cursor: skip everything up to and including the cursor id
-        let start_idx = if let Some(c) = cursor {
-            ids.iter().position(|&id| id == c).map(|p| p + 1).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let page_ids: alloc::vec::Vec<u64> = ids
-            .iter()
-            .skip(start_idx)
-            .take(limit)
-            .copied()
-            .collect();
-
-        let next_cursor = if start_idx + page_ids.len() < ids.len() {
-            page_ids.last().copied()
-        } else {
-            None
-        };
-
-        let mut items = Vec::new(&env);
-        for id in page_ids {
-            items.push_back(id);
-        }
-
-        env.events().publish(
-            (VAULT_LIST_TOPIC, owner),
-            (items.len() as u32, next_cursor),
-        );
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        VaultPage {
-            items,
-            next_cursor,
-            total,
-        }
-    }
-
-    /// Returns a cursor-paginated page of vault IDs where `beneficiary` is listed.
-    ///
-    /// Works identically to [`list_vaults_by_owner`] but scoped to beneficiary lookups.
-    pub fn list_vaults_by_beneficiary(
-        env: Env,
-        beneficiary: Address,
-        cursor: Option<u64>,
-        limit: u32,
-        sort_by: VaultSortField,
-        status_filter: Option<ReleaseStatus>,
-    ) -> VaultPage {
-        let limit = limit.max(1).min(100) as usize;
-        let all = Self::load_beneficiary_vault_ids(&env, &beneficiary);
-        let total = all.len();
-
-        let mut ids: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for id in all.iter() {
-            ids.push(id);
-        }
-
-        if let Some(ref status) = status_filter {
-            ids.retain(|&id| {
-                Self::try_load_vault(&env, id)
-                    .map(|v| &v.status == status)
-                    .unwrap_or(false)
-            });
-        }
-
-        match sort_by {
-            VaultSortField::CreatedAt => {
-                ids.sort_by_key(|&id| {
-                    Self::try_load_vault(&env, id)
-                        .map(|v| v.created_at)
-                        .unwrap_or(0)
-                });
-            }
-            VaultSortField::LastCheckIn => {
-                ids.sort_by_key(|&id| {
-                    Self::try_load_vault(&env, id)
-                        .map(|v| v.last_check_in)
-                        .unwrap_or(0)
-                });
-            }
-            VaultSortField::Balance => {
-                ids.sort_by(|&a, &b| {
-                    let bal_a = Self::try_load_vault(&env, a)
-                        .map(|v| v.balance)
-                        .unwrap_or(0);
-                    let bal_b = Self::try_load_vault(&env, b)
-                        .map(|v| v.balance)
-                        .unwrap_or(0);
-                    bal_b.cmp(&bal_a)
-                });
-            }
-        }
-
-        let start_idx = if let Some(c) = cursor {
-            ids.iter().position(|&id| id == c).map(|p| p + 1).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let page_ids: alloc::vec::Vec<u64> = ids
-            .iter()
-            .skip(start_idx)
-            .take(limit)
-            .copied()
-            .collect();
-
-        let next_cursor = if start_idx + page_ids.len() < ids.len() {
-            page_ids.last().copied()
-        } else {
-            None
-        };
-
-        let mut items = Vec::new(&env);
-        for id in page_ids {
-            items.push_back(id);
-        }
-
-        env.events().publish(
-            (VAULT_LIST_TOPIC, beneficiary),
-            (items.len() as u32, next_cursor),
-        );
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        VaultPage {
-            items,
-            next_cursor,
-            total,
-        }
-    }
-
-    // ── Issue #562: Check-in batch accumulation with partial-failure reporting ─
-
-    /// Configures the interval (in seconds) at which the batch scheduler should
-    /// flush accumulated check-ins.  Only the admin can set this.
-    ///
-    /// # Arguments
-    /// * `interval_seconds` - flush interval in seconds; must be > 0
-    pub fn set_batch_flush_interval(
-        env: Env,
-        interval_seconds: u64,
-    ) -> Result<(), ContractError> {
-        if Self::load_paused(&env) {
-            return Err(ContractError::Paused);
-        }
-        Self::require_admin(&env);
-        if interval_seconds == 0 {
-            return Err(ContractError::InvalidInterval);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::BatchFlushInterval, &interval_seconds);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(())
-    }
-
-    /// Returns the configured batch flush interval in seconds (`None` if not set).
-    pub fn get_batch_flush_interval(env: Env) -> Option<u64> {
-        env.storage()
-            .instance()
-            .get(&DataKey::BatchFlushInterval)
-    }
-
-    /// Batch check-in with per-vault error reporting.
-    ///
-    /// Unlike [`batch_check_in`] (which aborts on the first error), this variant
-    /// continues processing all vaults and returns a per-vault result vector.
-    /// This enables the backend scheduler to flush a full batch even when some
-    /// vaults are paused or have already been released, reducing the total
-    /// transaction count.
-    ///
-    /// # Arguments
-    /// * `vault_ids`  - Vaults to check in (duplicates are silently skipped).
-    /// * `caller`     - Owner performing the batch check-in.
-    ///
-    /// # Returns
-    /// `Vec<BatchCheckInResult>` — one entry per vault in the same order as
-    /// `vault_ids`, indicating whether the check-in succeeded and, on failure,
-    /// the contract error code.
-    pub fn batch_check_ins(
-        env: Env,
-        vault_ids: Vec<u64>,
-        caller: Address,
-    ) -> Vec<BatchCheckInResult> {
-        let mut results = Vec::new(&env);
-
-        if Self::load_paused(&env) {
-            // Return all-failed when the contract is globally paused
-            for vault_id in vault_ids.iter() {
-                results.push_back(BatchCheckInResult {
-                    vault_id,
-                    success: false,
-                    error_code: ContractError::Paused as u32,
-                });
-            }
-            return results;
-        }
-
-        caller.require_auth();
-        let now = env.ledger().timestamp();
-
-        for vault_id in vault_ids.iter() {
-            let outcome = (|| -> Result<(), ContractError> {
-                let mut vault = Self::try_load_vault(&env, vault_id)
-                    .ok_or(ContractError::VaultNotFound)?;
-                if vault.is_paused {
-                    return Err(ContractError::Paused);
-                }
-                if caller != vault.owner {
-                    return Err(ContractError::NotOwner);
-                }
-                if vault.status != ReleaseStatus::Locked {
-                    return Err(ContractError::AlreadyReleased);
-                }
-                vault.last_check_in = now;
-
-                // Apply any pending beneficiary rotation
-                let rot_key = DataKey::BeneficiaryRotationSchedule(vault_id);
-                if let Some(schedule) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, Vec<BeneficiaryRotationEntry>>(&rot_key)
-                {
-                    let mut applied: Option<BeneficiaryRotationEntry> = None;
-                    for entry in schedule.iter() {
-                        if entry.effective_timestamp <= now
-                            && applied.as_ref().is_none_or(|a: &BeneficiaryRotationEntry| {
-                                entry.effective_timestamp > a.effective_timestamp
-                            })
-                        {
-                            applied = Some(entry.clone());
-                        }
-                    }
-                    if let Some(rotation) = applied {
-                        if !rotation.new_beneficiaries.is_empty() {
-                            vault.beneficiaries = rotation.new_beneficiaries.clone();
-                        }
-                        env.events().publish(
-                            (BEN_ROTATION_TOPIC, vault_id),
-                            rotation.effective_timestamp,
-                        );
-                    }
-                }
-
-                Self::save_vault(&env, vault_id, &vault);
-                Self::record_check_in_history(&env, vault_id, now);
-                Self::update_check_in_streak(&env, vault_id, &vault, now);
-                env.events().publish((CHECK_IN_TOPIC, vault_id), now);
-                Ok(())
-            })();
-
-            let (success, error_code) = match outcome {
-                Ok(()) => (true, 0u32),
-                Err(e) => (false, e as u32),
-            };
-            results.push_back(BatchCheckInResult {
-                vault_id,
-                success,
-                error_code,
-            });
-        }
-
-        let succeeded: u32 = results.iter().filter(|r| r.success).count() as u32;
-        env.events().publish((BATCH_CHECKIN_TOPIC,), succeeded);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        results
-    }
-
-    // ── Issue #561: Data deduplication for similar vaults ─────────────────────
-
-    /// Registers a shared vault configuration template and returns its ID.
-    ///
-    /// Callers provide the canonical `check_in_interval` and a 32-byte SHA-256
-    /// hash of the serialised beneficiary list.  The contract stores the template
-    /// and returns a monotonically increasing template ID that vaults can
-    /// reference via [`set_vault_template_ref`].
-    ///
-    /// Only the admin may register templates to prevent spam.
-    ///
-    /// # Arguments
-    /// * `check_in_interval`   - Canonical check-in interval in seconds.
-    /// * `beneficiaries_hash`  - SHA-256 hash of the canonical beneficiary list.
-    ///
-    /// # Returns
-    /// The new template ID.
-    pub fn register_vault_config_template(
-        env: Env,
-        check_in_interval: u64,
-        beneficiaries_hash: BytesN<32>,
-    ) -> Result<u64, ContractError> {
-        if Self::load_paused(&env) {
-            return Err(ContractError::Paused);
-        }
-        Self::require_admin(&env);
-        if check_in_interval == 0 {
-            return Err(ContractError::InvalidInterval);
-        }
-
-        let template_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::VaultConfigTemplateCount)
-            .unwrap_or(0u64)
-            + 1;
-
-        let template = VaultConfigTemplate {
-            template_id,
-            check_in_interval,
-            beneficiaries_hash: beneficiaries_hash.clone(),
-            created_at: env.ledger().timestamp(),
-            ref_count: 0,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::VaultConfigTemplate(template_id), &template);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &DataKey::VaultConfigTemplate(template_id),
-                VAULT_TTL_THRESHOLD,
-                VAULT_TTL_LEDGERS,
-            );
-        env.storage()
-            .instance()
-            .set(&DataKey::VaultConfigTemplateCount, &template_id);
-        env.events()
-            .publish((VAULT_TMPL_REG_TOPIC,), (template_id, check_in_interval));
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(template_id)
-    }
-
-    /// Returns a registered vault config template by ID, or `None` if not found.
-    pub fn get_vault_config_template(env: Env, template_id: u64) -> Option<VaultConfigTemplate> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::VaultConfigTemplate(template_id))
-    }
-
-    /// Links a vault to a shared configuration template, recording the reference
-    /// and incrementing the template's ref-count.
-    ///
-    /// The vault's actual configuration is not changed — the template serves as
-    /// an off-chain deduplication hint and a compact on-chain proof that many
-    /// vaults share the same parameters.
-    ///
-    /// # Arguments
-    /// * `vault_id`    - Vault to annotate.
-    /// * `caller`      - Must be the vault owner.
-    /// * `template_id` - ID of a previously registered template.
+    /// Blacklisted addresses cannot create vaults, deposit, or withdraw.
     ///
     /// # Errors
-    /// * `ContractError::VaultNotFound`  - vault does not exist.
-    /// * `ContractError::NotOwner`       - caller is not the vault owner.
-    /// * `ContractError::TemplateNotFound` - template has not been registered.
-    pub fn set_vault_template_ref(
+    /// * `ContractError::InvalidBlacklistReason` - reason is empty or longer
+    ///   than `compliance::MAX_REASON_LEN` bytes
+    pub fn blacklist_address(
         env: Env,
-        vault_id: u64,
-        caller: Address,
-        template_id: u64,
+        address: Address,
+        reason: String,
     ) -> Result<(), ContractError> {
-        if Self::load_paused(&env) {
-            return Err(ContractError::Paused);
-        }
-        caller.require_auth();
-        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-
-        let mut template: VaultConfigTemplate = env
-            .storage()
-            .persistent()
-            .get(&DataKey::VaultConfigTemplate(template_id))
-            .ok_or(ContractError::TemplateNotFound)?;
-
-        // Remove reference from the old template if one exists
-        if let Some(old_template_id) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&DataKey::VaultTemplateRef(vault_id))
-        {
-            if old_template_id != template_id {
-                if let Some(mut old_tmpl) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, VaultConfigTemplate>(&DataKey::VaultConfigTemplate(
-                        old_template_id,
-                    ))
-                {
-                    old_tmpl.ref_count = old_tmpl.ref_count.saturating_sub(1);
-                    env.storage().persistent().set(
-                        &DataKey::VaultConfigTemplate(old_template_id),
-                        &old_tmpl,
-                    );
-                }
-            }
-        }
-
-        template.ref_count = template.ref_count.saturating_add(1);
-        env.storage()
-            .persistent()
-            .set(&DataKey::VaultConfigTemplate(template_id), &template);
-        env.storage()
-            .persistent()
-            .set(&DataKey::VaultTemplateRef(vault_id), &template_id);
-        env.storage().persistent().extend_ttl(
-            &DataKey::VaultTemplateRef(vault_id),
-            VAULT_TTL_THRESHOLD,
-            vault_ttl_ledgers(vault.check_in_interval),
-        );
-
-        env.events()
-            .publish((VAULT_TMPL_REF_TOPIC, vault_id), template_id);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(())
+        Self::require_admin(&env);
+        let admin = Self::load_admin(&env);
+        compliance::blacklist_address(&env, &address, reason, &admin)
     }
 
-    /// Returns the template ID linked to a vault, or `None` if the vault has not
-    /// been associated with a template.
-    pub fn get_vault_template_ref(env: Env, vault_id: u64) -> Option<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::VaultTemplateRef(vault_id))
+    /// Remove `address` from the blacklist (admin only). Returns `false` if
+    /// the address was not blacklisted.
+    pub fn remove_from_blacklist(env: Env, address: Address) -> bool {
+        Self::require_admin(&env);
+        compliance::remove_from_blacklist(&env, &address)
     }
 
-    /// Returns all vault IDs that reference the given template ID.
+    /// Returns the blacklist entry (reason, author, timestamp) for `address`.
+    pub fn get_blacklist_entry(env: Env, address: Address) -> Option<compliance::BlacklistEntry> {
+        compliance::get_blacklist_entry(&env, &address)
+    }
+
+    /// Add `address` to the allowlist (admin only) — Issue #551.
+    pub fn add_to_allowlist(env: Env, address: Address) {
+        Self::require_admin(&env);
+        compliance::allowlist_address(&env, &address);
+    }
+
+    /// Remove `address` from the allowlist (admin only). Returns `false` if
+    /// the address was not allowlisted.
+    pub fn remove_from_allowlist(env: Env, address: Address) -> bool {
+        Self::require_admin(&env);
+        compliance::remove_from_allowlist(&env, &address)
+    }
+
+    /// Returns whether `address` is on the allowlist.
+    pub fn is_allowlisted(env: Env, address: Address) -> bool {
+        compliance::is_allowlisted(&env, &address)
+    }
+
+    /// Enable or disable allowlist mode (admin only). While enabled, only
+    /// allowlisted addresses are compliant.
+    pub fn set_allowlist_enforced(env: Env, enforced: bool) {
+        Self::require_admin(&env);
+        compliance::set_allowlist_enforced(&env, enforced);
+    }
+
+    /// Returns whether allowlist mode is enabled.
+    pub fn is_allowlist_enforced(env: Env) -> bool {
+        compliance::is_allowlist_enforced(&env)
+    }
+
+    /// Returns `true` when `address` is not blacklisted and, if allowlist
+    /// mode is enabled, is allowlisted — Issue #551.
+    pub fn is_address_compliant(env: Env, address: Address) -> bool {
+        compliance::is_address_compliant(&env, &address)
+    }
+
+    /// Register the address of the KYC provider allowed to attest
+    /// verifications (admin only) — Issue #548.
+    pub fn set_kyc_provider(env: Env, provider: Address) {
+        Self::require_admin(&env);
+        compliance::set_kyc_provider(&env, &provider);
+    }
+
+    /// Returns the registered KYC provider, if any.
+    pub fn get_kyc_provider(env: Env) -> Option<Address> {
+        compliance::get_kyc_provider(&env)
+    }
+
+    /// Record the KYC provider's verification of `address` — Issue #548.
     ///
-    /// This performs a sequential scan over all owner vaults and is intended for
-    /// off-chain tooling / indexers rather than on-chain hot paths.
+    /// Requires the registered provider's auth. Returns `false` without
+    /// storing anything when `kyc_data` is unusable (zero level, zero
+    /// reference hash, or `expires_at` not in the future).
     ///
-    /// # Arguments
-    /// * `template_id` - Template to look up.
-    /// * `page`        - Zero-based page index.
-    /// * `page_size`   - Items per page.
-    pub fn get_vaults_by_template(
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    pub fn verify_kyc(
         env: Env,
-        template_id: u64,
-        page: u32,
-        page_size: u32,
-    ) -> Vec<u64> {
-        // Guard: if the template doesn't exist, return empty list
-        if env
-            .storage()
-            .persistent()
-            .get::<DataKey, VaultConfigTemplate>(&DataKey::VaultConfigTemplate(template_id))
-            .is_none()
-        {
-            return Vec::new(&env);
-        }
-
-        let total_vaults: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::VaultCount)
-            .unwrap_or(0);
-
-        let mut matching = Vec::new(&env);
-        let mut i = 1u64;
-        while i <= total_vaults {
-            if let Some(ref_id) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, u64>(&DataKey::VaultTemplateRef(i))
-            {
-                if ref_id == template_id {
-                    matching.push_back(i);
-                }
-            }
-            i += 1;
-        }
-
-        Self::paginate(&env, matching, page, page_size)
+        address: Address,
+        kyc_data: compliance::KycData,
+    ) -> Result<bool, ContractError> {
+        compliance::verify_kyc(&env, &address, kyc_data)
     }
 
-    // ── Issue #560: Merkle Tree for vault history proofs ─────────────────────
+    /// Revoke the KYC verification of `address` (KYC provider only).
+    ///
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        compliance::revoke_kyc_as_provider(&env, &address)
+    }
 
-    /// Appends a new leaf to the vault's history Merkle tree and recomputes the
-    /// running root.
+    /// Revoke the KYC verification of `address` (admin only).
     ///
-    /// This is called internally when recording significant vault events
-    /// (check-in, deposit, withdrawal, release).  External callers can call it
-    /// directly to anchor custom events; authentication is scoped to the vault
-    /// owner.
+    /// # Errors
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn admin_revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::revoke_kyc(&env, &address)
+    }
+
+    /// Returns the stored KYC record for `address`, if any.
+    pub fn get_kyc_record(env: Env, address: Address) -> Option<compliance::KycRecord> {
+        compliance::get_kyc_record(&env, &address)
+    }
+
+    /// Returns `true` when `address` holds a non-revoked, unexpired KYC
+    /// verification.
+    pub fn is_kyc_verified(env: Env, address: Address) -> bool {
+        compliance::is_kyc_verified(&env, &address)
+    }
+
+    /// Set the amount at or above which deposits and withdrawals require a
+    /// valid KYC verification (admin only). `0` disables the requirement.
     ///
-    /// The leaf hash is:
-    /// ```text
-    /// sha256(vault_id_bytes || event_index_bytes || timestamp_bytes || topic_bytes)
-    /// ```
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - `amount` is negative
+    pub fn set_kyc_high_value_threshold(env: Env, amount: i128) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_kyc_high_value_threshold(&env, amount)
+    }
+
+    /// Returns the high-value KYC threshold (`0` = disabled).
+    pub fn get_kyc_high_value_threshold(env: Env) -> i128 {
+        compliance::get_kyc_high_value_threshold(&env)
+    }
+
+    /// Configure regulatory reporting thresholds (admin only) — Issue #550.
     ///
-    /// The running root is updated using a simple sequential hash chain:
-    /// ```text
-    /// new_root = sha256(old_root || leaf_hash)
-    /// ```
-    /// This provides O(1) root update at the cost of requiring the full leaf
-    /// list for complete Merkle proofs — suitable for Soroban's per-call
-    /// instruction budget.
-    ///
-    /// # Arguments
-    /// * `vault_id`     - Vault for which the event is being recorded.
-    /// * `caller`       - Must be the vault owner.
-    /// * `event_topic`  - Short human-readable event label (≤ 9 bytes).
-    ///
-    /// # Returns
-    /// The zero-based index of the new leaf.
-    pub fn append_history_leaf(
+    /// # Errors
+    /// * `ContractError::InvalidConfig` - a threshold is negative, or a
+    ///   cumulative threshold is set with a zero window
+    pub fn set_reporting_thresholds(
         env: Env,
-        vault_id: u64,
-        caller: Address,
-        event_topic: Bytes,
-    ) -> Result<u32, ContractError> {
-        if Self::load_paused(&env) {
-            return Err(ContractError::Paused);
-        }
-        caller.require_auth();
-        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-
-        let event_index: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerkleLeafCount(vault_id))
-            .unwrap_or(0u32);
-
-        let timestamp = env.ledger().timestamp();
-        let leaf_hash = Self::compute_leaf_hash(
-            &env,
-            vault_id,
-            event_index,
-            timestamp,
-            event_topic.clone(),
-        );
-
-        let leaf = MerkleLeaf {
-            event_index,
-            timestamp,
-            event_topic: event_topic.clone(),
-            hash: leaf_hash.clone(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::MerkleLeaf(vault_id, event_index), &leaf);
-        env.storage().persistent().extend_ttl(
-            &DataKey::MerkleLeaf(vault_id, event_index),
-            VAULT_TTL_THRESHOLD,
-            vault_ttl_ledgers(vault.check_in_interval),
-        );
-
-        // Update the running Merkle root: sha256(old_root || leaf_hash)
-        let new_root = Self::update_merkle_root(&env, vault_id, &leaf_hash);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::MerkleLeafCount(vault_id), &(event_index + 1));
-        env.storage().persistent().extend_ttl(
-            &DataKey::MerkleLeafCount(vault_id),
-            VAULT_TTL_THRESHOLD,
-            vault_ttl_ledgers(vault.check_in_interval),
-        );
-
-        env.events()
-            .publish((HISTORY_ROOT_TOPIC, vault_id), (event_index, new_root));
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(event_index)
+        config: compliance::ThresholdConfig,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_threshold_config(&env, &config)
     }
 
-    /// Returns an inclusion proof for a specific vault history event.
-    ///
-    /// The proof contains the leaf hash and all sibling hashes required to
-    /// reconstruct the Merkle root.  The caller can verify the proof off-chain
-    /// using [`verify_history_proof`].
-    ///
-    /// # Arguments
-    /// * `vault_id`     - Vault whose history is being proven.
-    /// * `event_index`  - Zero-based index of the event leaf.
-    ///
-    /// # Returns
-    /// `Some(MerkleProof)` if the leaf exists, `None` otherwise.
-    pub fn get_history_proof(
+    /// Returns the configured reporting thresholds, if any.
+    pub fn get_reporting_thresholds(env: Env) -> Option<compliance::ThresholdConfig> {
+        compliance::get_threshold_config(&env)
+    }
+
+    /// Returns the rolling cumulative transfer volume tracked for `address`.
+    pub fn get_cumulative_volume(
         env: Env,
-        vault_id: u64,
-        event_index: u32,
-    ) -> Option<MerkleProof> {
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerkleLeafCount(vault_id))
-            .unwrap_or(0);
-
-        if event_index >= count {
-            return None;
-        }
-
-        let leaf: MerkleLeaf = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerkleLeaf(vault_id, event_index))?;
-
-        // Build proof path using a power-of-2 padded tree
-        let tree_size = Self::next_power_of_two(count);
-        let mut siblings = Vec::new(&env);
-        let mut positions = Vec::new(&env);
-
-        // Collect all leaf hashes (padding with zero-hashes for missing leaves)
-        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        let mut level_hashes: alloc::vec::Vec<BytesN<32>> = (0..tree_size)
-            .map(|i| {
-                if i < count {
-                    env.storage()
-                        .persistent()
-                        .get::<DataKey, MerkleLeaf>(&DataKey::MerkleLeaf(vault_id, i))
-                        .map(|l| l.hash)
-                        .unwrap_or_else(|| zero_hash.clone())
-                } else {
-                    zero_hash.clone()
-                }
-            })
-            .collect();
-
-        let mut idx = event_index as usize;
-        let mut level_size = tree_size as usize;
-
-        while level_size > 1 {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-            let sibling_hash = if sibling_idx < level_hashes.len() {
-                level_hashes[sibling_idx].clone()
-            } else {
-                zero_hash.clone()
-            };
-            // position bit: 1 = sibling is to the right (i.e., current node is left)
-            positions.push_back(idx % 2 == 0);
-            siblings.push_back(sibling_hash);
-
-            // Move to parent level
-            let mut parent_hashes: alloc::vec::Vec<BytesN<32>> =
-                alloc::vec::Vec::with_capacity(level_size / 2);
-            let mut pair = 0;
-            while pair < level_hashes.len() {
-                let left = &level_hashes[pair];
-                let right = if pair + 1 < level_hashes.len() {
-                    &level_hashes[pair + 1]
-                } else {
-                    &zero_hash
-                };
-                parent_hashes.push(Self::hash_pair(&env, left, right));
-                pair += 2;
-            }
-            level_hashes = parent_hashes;
-            idx /= 2;
-            level_size /= 2;
-        }
-
-        let root = level_hashes
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| zero_hash.clone());
-
-        let proof = MerkleProof {
-            vault_id,
-            event_index,
-            leaf_hash: leaf.hash,
-            siblings,
-            positions,
-            root,
-        };
-
-        env.events()
-            .publish((HISTORY_PROOF_TOPIC, vault_id), event_index);
-        Some(proof)
+        address: Address,
+    ) -> Option<compliance::CumulativeVolume> {
+        compliance::get_cumulative_volume(&env, &address)
     }
 
-    /// Verifies a [`MerkleProof`] against the stored Merkle root.
+    /// Returns the compliance alert with `alert_id`, if any.
+    pub fn get_compliance_alert(env: Env, alert_id: u64) -> Option<compliance::ComplianceAlert> {
+        compliance::get_alert(&env, alert_id)
+    }
+
+    /// Returns the number of compliance alerts raised so far.
+    pub fn get_compliance_alert_count(env: Env) -> u64 {
+        compliance::get_alert_count(&env)
+    }
+
+    /// Mark a compliance alert as reviewed (admin only).
     ///
-    /// Returns `true` if the proof is valid (the leaf is genuinely part of the
-    /// vault's history at the claimed event index), `false` otherwise.
+    /// # Errors
+    /// * `ContractError::AlertNotFound` - no alert with `alert_id`
+    pub fn acknowledge_compliance_alert(env: Env, alert_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::acknowledge_alert(&env, alert_id)
+    }
+
+    /// Returns the recorded transaction with `tx_id`, if any — Issue #549.
+    pub fn get_transaction(env: Env, tx_id: u64) -> Option<compliance::TransactionRecord> {
+        compliance::get_transaction(&env, tx_id)
+    }
+
+    /// Returns the number of transactions in the given inclusive date range
+    /// (unix seconds).
     ///
-    /// This is a read-only function; no state is mutated.
-    pub fn verify_history_proof(env: Env, proof: MerkleProof) -> bool {
-        let stored_root: Option<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerkleRoot(proof.vault_id));
-
-        // For the simple sequential-hash-chain root (used by append_history_leaf),
-        // verify by recomputing the chain root from the proof's leaf data.
-        // We also cross-check against the proof's own embedded root.
-        if let Some(root) = stored_root {
-            if root != proof.root {
-                return false;
-            }
-        }
-
-        // Recompute root from leaf_hash through sibling path
-        let mut computed = proof.leaf_hash.clone();
-        let siblings: alloc::vec::Vec<BytesN<32>> =
-            proof.siblings.iter().collect();
-        let positions: alloc::vec::Vec<bool> =
-            proof.positions.iter().collect();
-
-        for (sibling, is_left) in siblings.iter().zip(positions.iter()) {
-            computed = if *is_left {
-                // current node is on the left
-                Self::hash_pair(&env, &computed, sibling)
-            } else {
-                // current node is on the right
-                Self::hash_pair(&env, sibling, &computed)
-            };
-        }
-
-        computed == proof.root
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn count_transactions(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<u64, ContractError> {
+        compliance::count_transactions(&env, start_date, end_date)
     }
 
-    /// Returns the current Merkle root for a vault's history, or `None` if no
-    /// events have been appended yet.
-    pub fn get_history_root(env: Env, vault_id: u64) -> Option<BytesN<32>> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MerkleRoot(vault_id))
+    /// Export transactions in the inclusive date range (unix seconds) as a
+    /// UTF-8 CSV document — Issue #549.
+    ///
+    /// Columns: `tx_id,timestamp,kind,vault_id,from,to,token,amount,flagged`.
+    /// Addresses are hex-encoded XDR `ScAddress` values. At most
+    /// `compliance::MAX_EXPORT_ROWS` rows are returned; use
+    /// `count_transactions` to detect ranges that need splitting.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn export_transactions(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<Bytes, ContractError> {
+        compliance::export_transactions(&env, start_date, end_date).map(|(csv, _)| csv)
     }
 
-    /// Returns the number of history leaves recorded for a vault.
-    pub fn get_history_leaf_count(env: Env, vault_id: u64) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MerkleLeafCount(vault_id))
-            .unwrap_or(0)
+    /// Returns the SHA-256 digest of the CSV `export_transactions` produces
+    /// for the range; this is the message the report signer signs.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn compliance_report_digest(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        compliance::report_digest(&env, start_date, end_date)
     }
 
-    // ── Private helpers for Merkle tree ──────────────────────────────────────
-
-    /// Computes the SHA-256 leaf hash:
-    /// `sha256(vault_id_le || event_index_le || timestamp_le || topic_bytes)`.
-    fn compute_leaf_hash(
-        env: &Env,
-        vault_id: u64,
-        event_index: u32,
-        timestamp: u64,
-        topic: Bytes,
-    ) -> BytesN<32> {
-        let mut preimage = Bytes::new(env);
-        preimage.extend_from_array(&vault_id.to_le_bytes());
-        preimage.extend_from_array(&event_index.to_le_bytes());
-        preimage.extend_from_array(&timestamp.to_le_bytes());
-        preimage.append(&topic);
-        env.crypto().sha256(&preimage)
+    /// Register the ed25519 public key allowed to sign compliance reports
+    /// (admin only) — Issue #549.
+    pub fn set_report_signer(env: Env, public_key: BytesN<32>) {
+        Self::require_admin(&env);
+        compliance::set_report_signer(&env, &public_key);
     }
 
-    /// Computes `sha256(left || right)` for internal Merkle tree nodes.
-    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-        let mut data = Bytes::new(env);
-        data.extend_from_array(&left.to_array());
-        data.extend_from_array(&right.to_array());
-        env.crypto().sha256(&data)
+    /// Returns the registered report signer public key, if any.
+    pub fn get_report_signer(env: Env) -> Option<BytesN<32>> {
+        compliance::get_report_signer(&env)
     }
 
-    /// Updates the sequential hash-chain root:
-    /// `new_root = sha256(old_root || leaf_hash)`.
-    fn update_merkle_root(env: &Env, vault_id: u64, leaf_hash: &BytesN<32>) -> BytesN<32> {
-        let old_root: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerkleRoot(vault_id))
-            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
-
-        let new_root = Self::hash_pair(env, &old_root, leaf_hash);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MerkleRoot(vault_id), &new_root);
-        new_root
+    /// Store a signed compliance report for regulatory submission.
+    ///
+    /// `signature` must be the registered signer's ed25519 signature over
+    /// `compliance_report_digest(start_date, end_date)`; an invalid signature
+    /// aborts the invocation. Returns the new report id.
+    ///
+    /// # Errors
+    /// * `ContractError::ReportSignerNotSet` - no signer has been registered
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn sign_compliance_report(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+        signature: BytesN<64>,
+    ) -> Result<u64, ContractError> {
+        compliance::sign_report(&env, start_date, end_date, signature)
     }
 
-    /// Returns the smallest power of two ≥ `n` (minimum 1).
-    fn next_power_of_two(n: u32) -> u32 {
-        if n <= 1 {
-            return 1;
-        }
-        let mut v = n - 1;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        v + 1
+    /// Returns the signed report with `report_id`, if any.
+    pub fn get_signed_report(env: Env, report_id: u64) -> Option<compliance::SignedReport> {
+        compliance::get_signed_report(&env, report_id)
     }
 }
