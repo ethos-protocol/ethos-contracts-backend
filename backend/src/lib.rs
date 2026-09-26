@@ -1,6 +1,11 @@
 pub mod acl;
 pub mod anomaly_detection;
 pub mod audit;
+pub mod lazy_metadata;
+pub mod materialized_views;
+pub mod query_optimizer;
+#[cfg(test)]
+mod property_tests;
 pub mod backup_validation;
 pub mod batch_conditional_completion;
 pub mod batching;
