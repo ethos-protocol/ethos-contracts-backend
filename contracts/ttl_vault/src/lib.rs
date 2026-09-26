@@ -130,6 +130,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_breach_detection_tests;
+#[cfg(test)]
 mod passkey_cap_tests;
 #[cfg(test)]
 mod passkey_delegation_tests;
@@ -137,6 +141,10 @@ mod passkey_delegation_tests;
 mod passkey_escrow_tests;
 #[cfg(test)]
 mod passkey_expiry_notification_tests;
+#[cfg(test)]
+mod passkey_metadata_tests;
+#[cfg(test)]
+mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
