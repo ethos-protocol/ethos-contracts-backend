@@ -12,6 +12,7 @@ use soroban_sdk::{
 
 pub mod aml;
 pub mod composition_rules;
+pub mod compliance;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
@@ -1652,6 +1653,10 @@ impl TtlVaultContract {
         // Issue #547: screen the beneficiary against AML/sanctions data.
         aml::require_compliant(&env, &beneficiary);
 
+        // Issue #551: owner and beneficiary must pass blacklist/allowlist screening
+        Self::assert_compliant(&env, &owner);
+        Self::assert_compliant(&env, &beneficiary);
+
         // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
         let dup_key =
             DataKey::VaultDuplicate(owner.clone(), beneficiary.clone(), check_in_interval);
@@ -1995,6 +2000,11 @@ impl TtlVaultContract {
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        Self::assert_compliant(&env, &from);
+        if let Err(e) = compliance::check_kyc_for_amount(&env, &from, amount) {
+            panic_with_error!(&env, e);
+        }
         if vault.status != ReleaseStatus::Locked {
             panic_with_error!(&env, ContractError::AlreadyReleased);
         }
@@ -2023,6 +2033,17 @@ impl TtlVaultContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
         Self::save_vault(&env, vault_id, &vault);
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Deposit,
+            vault_id,
+            &from,
+            &env.current_contract_address(),
+            &vault.token_address,
+            amount,
+            &from,
+        );
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
         env.storage()
@@ -2280,9 +2301,36 @@ impl TtlVaultContract {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
         }
 
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        if let Err(e) = compliance::check_address(&env, &vault.owner)
+            .and_then(|()| compliance::check_kyc_for_amount(&env, &vault.owner, amount))
+        {
+            Self::record_withdrawal_audit(
+                &env,
+                vault_id,
+                &caller,
+                amount,
+                false,
+                "Compliance check failed",
+            );
+            return Err(e);
+        }
+
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Withdrawal,
+            vault_id,
+            &env.current_contract_address(),
+            &vault.owner,
+            &vault.token_address,
+            amount,
+            &vault.owner,
+        );
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -8761,6 +8809,14 @@ impl TtlVaultContract {
     fn require_admin(env: &Env) {
         let admin = Self::load_admin(env);
         admin.require_auth();
+    }
+
+    /// Panics with the compliance error if `address` is blacklisted or, in
+    /// allowlist mode, not allowlisted — Issue #551.
+    fn assert_compliant(env: &Env, address: &Address) {
+        if let Err(e) = compliance::check_address(env, address) {
+            panic_with_error!(env, e);
+        }
     }
 
     fn load_admin(env: &Env) -> Address {
@@ -15525,5 +15581,273 @@ impl TtlVaultContract {
             primary_slice_id,
             backup_slice_id,
         ))
+    }
+
+    // --- compliance (Issues #548, #549, #550, #551) ---
+
+    /// Blacklist `address` with a recorded `reason` (admin only) — Issue #551.
+    ///
+    /// Blacklisted addresses cannot create vaults, deposit, or withdraw.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidBlacklistReason` - reason is empty or longer
+    ///   than `compliance::MAX_REASON_LEN` bytes
+    pub fn blacklist_address(
+        env: Env,
+        address: Address,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        let admin = Self::load_admin(&env);
+        compliance::blacklist_address(&env, &address, reason, &admin)
+    }
+
+    /// Remove `address` from the blacklist (admin only). Returns `false` if
+    /// the address was not blacklisted.
+    pub fn remove_from_blacklist(env: Env, address: Address) -> bool {
+        Self::require_admin(&env);
+        compliance::remove_from_blacklist(&env, &address)
+    }
+
+    /// Returns the blacklist entry (reason, author, timestamp) for `address`.
+    pub fn get_blacklist_entry(env: Env, address: Address) -> Option<compliance::BlacklistEntry> {
+        compliance::get_blacklist_entry(&env, &address)
+    }
+
+    /// Add `address` to the allowlist (admin only) — Issue #551.
+    pub fn add_to_allowlist(env: Env, address: Address) {
+        Self::require_admin(&env);
+        compliance::allowlist_address(&env, &address);
+    }
+
+    /// Remove `address` from the allowlist (admin only). Returns `false` if
+    /// the address was not allowlisted.
+    pub fn remove_from_allowlist(env: Env, address: Address) -> bool {
+        Self::require_admin(&env);
+        compliance::remove_from_allowlist(&env, &address)
+    }
+
+    /// Returns whether `address` is on the allowlist.
+    pub fn is_allowlisted(env: Env, address: Address) -> bool {
+        compliance::is_allowlisted(&env, &address)
+    }
+
+    /// Enable or disable allowlist mode (admin only). While enabled, only
+    /// allowlisted addresses are compliant.
+    pub fn set_allowlist_enforced(env: Env, enforced: bool) {
+        Self::require_admin(&env);
+        compliance::set_allowlist_enforced(&env, enforced);
+    }
+
+    /// Returns whether allowlist mode is enabled.
+    pub fn is_allowlist_enforced(env: Env) -> bool {
+        compliance::is_allowlist_enforced(&env)
+    }
+
+    /// Returns `true` when `address` is not blacklisted and, if allowlist
+    /// mode is enabled, is allowlisted — Issue #551.
+    pub fn is_address_compliant(env: Env, address: Address) -> bool {
+        compliance::is_address_compliant(&env, &address)
+    }
+
+    /// Register the address of the KYC provider allowed to attest
+    /// verifications (admin only) — Issue #548.
+    pub fn set_kyc_provider(env: Env, provider: Address) {
+        Self::require_admin(&env);
+        compliance::set_kyc_provider(&env, &provider);
+    }
+
+    /// Returns the registered KYC provider, if any.
+    pub fn get_kyc_provider(env: Env) -> Option<Address> {
+        compliance::get_kyc_provider(&env)
+    }
+
+    /// Record the KYC provider's verification of `address` — Issue #548.
+    ///
+    /// Requires the registered provider's auth. Returns `false` without
+    /// storing anything when `kyc_data` is unusable (zero level, zero
+    /// reference hash, or `expires_at` not in the future).
+    ///
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    pub fn verify_kyc(
+        env: Env,
+        address: Address,
+        kyc_data: compliance::KycData,
+    ) -> Result<bool, ContractError> {
+        compliance::verify_kyc(&env, &address, kyc_data)
+    }
+
+    /// Revoke the KYC verification of `address` (KYC provider only).
+    ///
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        compliance::revoke_kyc_as_provider(&env, &address)
+    }
+
+    /// Revoke the KYC verification of `address` (admin only).
+    ///
+    /// # Errors
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn admin_revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::revoke_kyc(&env, &address)
+    }
+
+    /// Returns the stored KYC record for `address`, if any.
+    pub fn get_kyc_record(env: Env, address: Address) -> Option<compliance::KycRecord> {
+        compliance::get_kyc_record(&env, &address)
+    }
+
+    /// Returns `true` when `address` holds a non-revoked, unexpired KYC
+    /// verification.
+    pub fn is_kyc_verified(env: Env, address: Address) -> bool {
+        compliance::is_kyc_verified(&env, &address)
+    }
+
+    /// Set the amount at or above which deposits and withdrawals require a
+    /// valid KYC verification (admin only). `0` disables the requirement.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - `amount` is negative
+    pub fn set_kyc_high_value_threshold(env: Env, amount: i128) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_kyc_high_value_threshold(&env, amount)
+    }
+
+    /// Returns the high-value KYC threshold (`0` = disabled).
+    pub fn get_kyc_high_value_threshold(env: Env) -> i128 {
+        compliance::get_kyc_high_value_threshold(&env)
+    }
+
+    /// Configure regulatory reporting thresholds (admin only) — Issue #550.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidConfig` - a threshold is negative, or a
+    ///   cumulative threshold is set with a zero window
+    pub fn set_reporting_thresholds(
+        env: Env,
+        config: compliance::ThresholdConfig,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_threshold_config(&env, &config)
+    }
+
+    /// Returns the configured reporting thresholds, if any.
+    pub fn get_reporting_thresholds(env: Env) -> Option<compliance::ThresholdConfig> {
+        compliance::get_threshold_config(&env)
+    }
+
+    /// Returns the rolling cumulative transfer volume tracked for `address`.
+    pub fn get_cumulative_volume(
+        env: Env,
+        address: Address,
+    ) -> Option<compliance::CumulativeVolume> {
+        compliance::get_cumulative_volume(&env, &address)
+    }
+
+    /// Returns the compliance alert with `alert_id`, if any.
+    pub fn get_compliance_alert(env: Env, alert_id: u64) -> Option<compliance::ComplianceAlert> {
+        compliance::get_alert(&env, alert_id)
+    }
+
+    /// Returns the number of compliance alerts raised so far.
+    pub fn get_compliance_alert_count(env: Env) -> u64 {
+        compliance::get_alert_count(&env)
+    }
+
+    /// Mark a compliance alert as reviewed (admin only).
+    ///
+    /// # Errors
+    /// * `ContractError::AlertNotFound` - no alert with `alert_id`
+    pub fn acknowledge_compliance_alert(env: Env, alert_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::acknowledge_alert(&env, alert_id)
+    }
+
+    /// Returns the recorded transaction with `tx_id`, if any — Issue #549.
+    pub fn get_transaction(env: Env, tx_id: u64) -> Option<compliance::TransactionRecord> {
+        compliance::get_transaction(&env, tx_id)
+    }
+
+    /// Returns the number of transactions in the given inclusive date range
+    /// (unix seconds).
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn count_transactions(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<u64, ContractError> {
+        compliance::count_transactions(&env, start_date, end_date)
+    }
+
+    /// Export transactions in the inclusive date range (unix seconds) as a
+    /// UTF-8 CSV document — Issue #549.
+    ///
+    /// Columns: `tx_id,timestamp,kind,vault_id,from,to,token,amount,flagged`.
+    /// Addresses are hex-encoded XDR `ScAddress` values. At most
+    /// `compliance::MAX_EXPORT_ROWS` rows are returned; use
+    /// `count_transactions` to detect ranges that need splitting.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn export_transactions(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<Bytes, ContractError> {
+        compliance::export_transactions(&env, start_date, end_date).map(|(csv, _)| csv)
+    }
+
+    /// Returns the SHA-256 digest of the CSV `export_transactions` produces
+    /// for the range; this is the message the report signer signs.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn compliance_report_digest(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        compliance::report_digest(&env, start_date, end_date)
+    }
+
+    /// Register the ed25519 public key allowed to sign compliance reports
+    /// (admin only) — Issue #549.
+    pub fn set_report_signer(env: Env, public_key: BytesN<32>) {
+        Self::require_admin(&env);
+        compliance::set_report_signer(&env, &public_key);
+    }
+
+    /// Returns the registered report signer public key, if any.
+    pub fn get_report_signer(env: Env) -> Option<BytesN<32>> {
+        compliance::get_report_signer(&env)
+    }
+
+    /// Store a signed compliance report for regulatory submission.
+    ///
+    /// `signature` must be the registered signer's ed25519 signature over
+    /// `compliance_report_digest(start_date, end_date)`; an invalid signature
+    /// aborts the invocation. Returns the new report id.
+    ///
+    /// # Errors
+    /// * `ContractError::ReportSignerNotSet` - no signer has been registered
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn sign_compliance_report(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+        signature: BytesN<64>,
+    ) -> Result<u64, ContractError> {
+        compliance::sign_report(&env, start_date, end_date, signature)
+    }
+
+    /// Returns the signed report with `report_id`, if any.
+    pub fn get_signed_report(env: Env, report_id: u64) -> Option<compliance::SignedReport> {
+        compliance::get_signed_report(&env, report_id)
     }
 }
