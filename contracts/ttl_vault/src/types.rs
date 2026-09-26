@@ -549,6 +549,32 @@ pub enum DataKey {
     // Upgrade safety: recorded interface/storage fingerprint of the
     // currently running contract, checked by validate_upgrade.
     UpgradeManifest,
+
+    // ── Issue #563: Cursor-based pagination ────────────────────────────────────
+    // (No extra storage keys needed; pagination is computed from existing keys.)
+
+    // ── Issue #562: Check-in batch accumulation ────────────────────────────────
+    /// Configurable interval (seconds) at which the backend flushes accumulated
+    /// batch check-ins.  Stored as a u64 in instance storage.
+    BatchFlushInterval,
+    /// Last timestamp at which a scheduled batch was flushed.
+    BatchLastFlush,
+
+    // ── Issue #561: Data Deduplication ────────────────────────────────────────
+    /// Global counter for vault config templates.
+    VaultConfigTemplateCount,
+    /// template_id → VaultConfigTemplate
+    VaultConfigTemplate(u64),
+    /// vault_id → template_id (0 if not using a template)
+    VaultTemplateRef(u64),
+
+    // ── Issue #560: Merkle tree for vault history ─────────────────────────────
+    /// vault_id, event_index → MerkleLeaf
+    MerkleLeaf(u64, u32),
+    /// vault_id → number of history leaves
+    MerkleLeafCount(u64),
+    /// vault_id → current Merkle root (BytesN<32>)
+    MerkleRoot(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1718,3 +1744,129 @@ pub struct VestingStaggerEntry {
     /// Number of installments already claimed by this beneficiary.
     pub claimed_installments: u32,
 }
+
+// ── Issue #563: Cursor-based pagination ───────────────────────────────────────
+
+/// Sort field options for vault list endpoints.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VaultSortField {
+    /// Sort by vault creation timestamp (default, stable ordering for new vaults).
+    CreatedAt,
+    /// Sort by last check-in timestamp.
+    LastCheckIn,
+    /// Sort by vault balance (descending: largest first).
+    Balance,
+}
+
+/// A cursor-paginated page of vault IDs returned by list endpoints.
+///
+/// `next_cursor` is `None` when the caller has reached the last page.
+/// Pass the returned cursor to the next call's `cursor` parameter to fetch
+/// the following page.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VaultPage {
+    /// Vault IDs for this page (may be fewer than `limit` on the last page).
+    pub items: Vec<u64>,
+    /// Opaque cursor for the next page.  `None` means no more pages remain.
+    pub next_cursor: Option<u64>,
+    /// Total number of vaults in the underlying collection (before filtering).
+    pub total: u32,
+}
+
+// ── Issue #562: Check-in batch accumulation ───────────────────────────────────
+
+/// Result entry for a single vault in a batch check-in operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCheckInResult {
+    pub vault_id: u64,
+    /// `true` if the check-in succeeded; `false` if it was skipped due to an error.
+    pub success: bool,
+    /// Non-zero contract error code when `success == false`.
+    pub error_code: u32,
+}
+
+// ── Issue #561: Data Deduplication ────────────────────────────────────────────
+
+/// A shared vault configuration template used for deduplication.
+///
+/// Vaults that match a template's configuration reference the template ID
+/// instead of storing all fields redundantly.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VaultConfigTemplate {
+    pub template_id: u64,
+    /// Canonical check-in interval this template represents (seconds).
+    pub check_in_interval: u64,
+    /// Encoded beneficiary list (Vec<BeneficiaryEntry> serialised as Bytes for
+    /// compact storage inside the template record).
+    pub beneficiaries_hash: BytesN<32>,
+    /// Creation timestamp.
+    pub created_at: u64,
+    /// Number of vaults referencing this template.
+    pub ref_count: u32,
+}
+
+// ── Issue #560: Merkle Tree for Vault History Proofs ─────────────────────────
+
+/// A single leaf in the vault history Merkle tree.
+///
+/// Each leaf commits to: `sha256(vault_id || event_index || timestamp || event_topic)`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerkleLeaf {
+    pub event_index: u32,
+    pub timestamp: u64,
+    /// 9-character Soroban event topic (e.g. `check_in`, `deposit`).
+    pub event_topic: Bytes,
+    /// SHA-256 commitment of this leaf's fields.
+    pub hash: BytesN<32>,
+}
+
+/// An inclusion proof for a single vault history event.
+///
+/// The verifier reconstructs the Merkle root by hashing `leaf_hash` up
+/// through `siblings` (using the corresponding `positions` bits to determine
+/// left/right ordering at each level) and comparing with `root`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerkleProof {
+    pub vault_id: u64,
+    pub event_index: u32,
+    /// Leaf hash being proven.
+    pub leaf_hash: BytesN<32>,
+    /// Sibling hashes at each level of the tree (bottom → root).
+    pub siblings: Vec<BytesN<32>>,
+    /// Bit-field: bit `i` is 1 if the sibling at level `i` is to the right.
+    pub positions: Vec<bool>,
+    /// Expected Merkle root at the time this proof was generated.
+    pub root: BytesN<32>,
+}
+
+// ── Issue #563: Event topics ──────────────────────────────────────────────────
+
+/// Emitted when a vault list page is fetched (includes cursor metadata).
+pub const VAULT_LIST_TOPIC: Symbol = symbol_short!("v_list");
+
+// ── Issue #560: Event topics ──────────────────────────────────────────────────
+
+/// Emitted when a Merkle root is updated for a vault's history.
+pub const HISTORY_ROOT_TOPIC: Symbol = symbol_short!("hist_rt");
+
+/// Emitted when a history proof is generated.
+pub const HISTORY_PROOF_TOPIC: Symbol = symbol_short!("hist_prf");
+
+// ── Issue #561: Event topics ──────────────────────────────────────────────────
+
+/// Emitted when a vault config template is registered.
+pub const VAULT_TMPL_REG_TOPIC: Symbol = symbol_short!("v_tmpl_r");
+
+/// Emitted when a vault references a config template.
+pub const VAULT_TMPL_REF_TOPIC: Symbol = symbol_short!("v_tmpl_f");
+
+// ── New DataKey variants (appended to DataKey enum body via extension) ─────────
+// NOTE: These variants live in separate storage-key files referenced by lib.rs.
+// They are defined as free constants here so they can be used in the DataKey
+// extension block in types.rs after the enum definition.
