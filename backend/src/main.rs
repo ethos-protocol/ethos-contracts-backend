@@ -20,7 +20,15 @@ use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
-    // cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
+    cost_tracking::{
+        allocate_cost, get_budget_breaches, get_cost_dashboard, get_cost_report,
+        get_gas_cost_report, get_optimization_suggestions, record_cost_entry, record_gas_cost,
+        set_budget_threshold, CostState,
+    },
+    dr_automation::{
+        confirm_dr_action, get_dr_test_schedule, get_rto_rpo, list_playbooks, request_dr_action,
+        DrAutomationState,
+    },
     // Commented out: custom_metrics unused in current build
     // custom_metrics::{
     //     aggregate_custom_metric, create_dashboard_share, get_shared_dashboard, list_custom_metrics,
@@ -409,6 +417,43 @@ async fn main() {
     //     .route("/dashboards/shared/:token", get(get_shared_dashboard))
     //     .with_state(custom_metrics_store);
 
+    // ── Cost tracking routes (#594) ────────────────────────────────────────
+    // Records per-operation cost entries (fiat + gas), surfaces dashboards,
+    // budget thresholds / breach alerts, and optimization suggestions.
+    let cost_state = Arc::new(CostState::new());
+    let cost_router = Router::new()
+        .route(
+            "/admin/cost/entries",
+            post(record_cost_entry),
+        )
+        .route("/admin/cost/report", get(get_cost_report))
+        .route("/admin/cost/allocate", post(allocate_cost))
+        .route(
+            "/admin/cost/budget-thresholds",
+            post(set_budget_threshold),
+        )
+        .route("/admin/cost/budget-breaches", get(get_budget_breaches))
+        .route("/admin/cost/gas", post(record_gas_cost))
+        .route("/admin/cost/gas/report", get(get_gas_cost_report))
+        .route("/admin/cost/dashboard", get(get_cost_dashboard))
+        .route("/admin/cost/optimizations", get(get_optimization_suggestions))
+        .with_state(cost_state);
+
+    // ── Disaster recovery automation routes (#595) ─────────────────────────
+    // Two-phase destructive-action API mirroring docs/disaster-recovery-runbook.md,
+    // plus RTO/RPO targets, DR test schedule, and incident response playbooks.
+    let dr_state = Arc::new(DrAutomationState::new());
+    let dr_router = Router::new()
+        .route("/admin/dr/actions", post(request_dr_action))
+        .route(
+            "/admin/dr/actions/:token/confirm",
+            post(confirm_dr_action),
+        )
+        .route("/admin/dr/rto-rpo", get(get_rto_rpo))
+        .route("/admin/dr/test-schedule", get(get_dr_test_schedule))
+        .route("/admin/dr/playbooks", get(list_playbooks))
+        .with_state(dr_state);
+
     // ── Anomaly detection routes (#544 seasonal, #545 correlation, #546 investigations)
     let anomaly_store = AnomalyStore::new();
     let anomaly_router = Router::new()
@@ -471,7 +516,9 @@ async fn main() {
         .merge(anomaly_router)
         .merge(aml_router)
         // .merge(log_router)
-        .merge(webauthn_router);
+        .merge(webauthn_router)
+        .merge(cost_router)
+        .merge(dr_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
