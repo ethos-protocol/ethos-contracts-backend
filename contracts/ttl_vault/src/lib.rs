@@ -10,6 +10,7 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod aml;
 pub mod composition_rules;
 pub mod compliance;
 pub mod credential_anchoring;
@@ -131,6 +132,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_breach_detection_tests;
+#[cfg(test)]
 mod passkey_cap_tests;
 #[cfg(test)]
 mod passkey_delegation_tests;
@@ -138,6 +143,10 @@ mod passkey_delegation_tests;
 mod passkey_escrow_tests;
 #[cfg(test)]
 mod passkey_expiry_notification_tests;
+#[cfg(test)]
+mod passkey_metadata_tests;
+#[cfg(test)]
+mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
@@ -149,7 +158,23 @@ mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
 #[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
+#[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
+mod withdrawal_notification_confirmation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
+#[cfg(test)]
+mod withdrawal_rate_limit_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
+#[cfg(test)]
+mod multisig_withdrawal_tests;
+#[cfg(test)]
+mod withdrawal_rollback_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -399,19 +424,8 @@ pub enum ContractError {
     UpgradeStorageSchemaChanged = 128,
     UpgradeErrorCodesReduced = 129,
     UpgradeManifestNotSet = 130,
-    // Issue #551: blacklist / allowlist management
-    AddressBlacklisted = 131,
-    AddressNotAllowlisted = 132,
-    InvalidBlacklistReason = 133,
-    // Issue #548: KYC verification
-    KycProviderNotSet = 134,
-    KycNotFound = 135,
-    KycRequired = 136,
-    // Issue #549: transaction reporting
-    InvalidReportRange = 137,
-    ReportSignerNotSet = 138,
-    // Issue #550: regulatory threshold monitoring
-    AlertNotFound = 139,
+    // Issue #547: AML screening rejected a beneficiary / transfer recipient
+    AmlFlaggedAddress = 131,
 }
 
 #[contract]
@@ -1255,6 +1269,7 @@ impl TtlVaultContract {
             YieldDistributionMode::DistributeToBeneficiary => {
                 // Transfer yield to beneficiary
                 let token_client = token::Client::new(&env, &vault.token_address);
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -1290,6 +1305,7 @@ impl TtlVaultContract {
 
                 if beneficiary_amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &vault.beneficiary);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &vault.beneficiary,
@@ -1355,6 +1371,55 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    // --- AML screening (Issue #547) ---
+
+    /// Returns `true` when `address` passes AML screening: it is not on the
+    /// local flag list and, if a sanctions oracle is configured, the oracle
+    /// does not report it as sanctioned (oracle failures fail closed).
+    pub fn check_aml_compliance(env: Env, address: Address) -> bool {
+        aml::check_compliance(&env, &address)
+    }
+
+    /// Admin-only: configure (or clear with `None`) the on-chain sanctions
+    /// oracle, which must expose `is_sanctioned(Address) -> bool`.
+    pub fn set_aml_oracle(env: Env, admin: Address, oracle: Option<Address>) {
+        aml::set_oracle(&env, &admin, oracle);
+    }
+
+    /// Returns the configured sanctions oracle, if any.
+    pub fn get_aml_oracle(env: Env) -> Option<Address> {
+        aml::get_oracle(&env)
+    }
+
+    /// Admin-only: configure (or clear) the AML reporter — typically the
+    /// backend service that screens addresses with an AML provider and
+    /// mirrors hits on-chain.
+    pub fn set_aml_reporter(env: Env, admin: Address, reporter: Option<Address>) {
+        aml::set_reporter(&env, &admin, reporter);
+    }
+
+    /// Returns the configured AML reporter, if any.
+    pub fn get_aml_reporter(env: Env) -> Option<Address> {
+        aml::get_reporter(&env)
+    }
+
+    /// Admin or AML reporter: flag `address`, blocking it from being added as
+    /// a beneficiary and from receiving any transfer out of a vault.
+    pub fn flag_aml_address(env: Env, caller: Address, address: Address, reason: String) {
+        aml::flag_address(&env, &caller, address, reason);
+    }
+
+    /// Admin or AML reporter: remove a flag (e.g. after a false positive is
+    /// cleared by compliance review).
+    pub fn unflag_aml_address(env: Env, caller: Address, address: Address) {
+        aml::unflag_address(&env, &caller, address);
+    }
+
+    /// Returns the flag record for `address`, if it is locally flagged.
+    pub fn get_aml_flag(env: Env, address: Address) -> Option<aml::AmlFlag> {
+        aml::get_flag(&env, &address)
     }
 
     /// Returns the current protocol-level configuration as a typed struct — Issue #810.
@@ -1585,6 +1650,8 @@ impl TtlVaultContract {
         if owner == beneficiary {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
+        // Issue #547: screen the beneficiary against AML/sanctions data.
+        aml::require_compliant(&env, &beneficiary);
 
         // Issue #551: owner and beneficiary must pass blacklist/allowlist screening
         Self::assert_compliant(&env, &owner);
@@ -1844,6 +1911,7 @@ impl TtlVaultContract {
                 let total_penalty = (penalty_per * missed as i128).min(vault.balance);
                 if total_penalty > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &recipient);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &recipient,
@@ -2693,6 +2761,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &escrow.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &escrow.beneficiary,
@@ -3254,6 +3323,7 @@ impl TtlVaultContract {
                     .publish((BURN_EVENT_TOPIC, vault_id), burn_amount);
             }
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -3601,6 +3671,7 @@ impl TtlVaultContract {
 
         if vault.beneficiaries.is_empty() {
             // Single-beneficiary path: send full amount to primary beneficiary.
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (symbol_short!("partial"), vault_id),
@@ -3617,6 +3688,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -3680,6 +3752,9 @@ impl TtlVaultContract {
                 return Err(ContractError::InvalidBeneficiary);
             }
             Self::assert_not_zero_address(&env, &entry.address);
+            if !aml::check_compliance(&env, &entry.address) {
+                return Err(ContractError::AmlFlaggedAddress);
+            }
         }
         vault.beneficiaries = beneficiaries.clone();
         Self::save_vault(&env, vault_id, &vault);
@@ -3783,6 +3858,9 @@ impl TtlVaultContract {
         }
         if address == vault.owner {
             return Err(ContractError::InvalidBeneficiary);
+        }
+        if !aml::check_compliance(&env, &address) {
+            return Err(ContractError::AmlFlaggedAddress);
         }
 
         // Check if beneficiary already exists
@@ -4540,6 +4618,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &pending.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &pending.beneficiary,
@@ -4725,6 +4804,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (CLAIM_VEST_TOPIC, vault_id),
@@ -4740,6 +4820,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -5350,6 +5431,7 @@ impl TtlVaultContract {
 
                 if amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &caller);
                     token_client.transfer(&env.current_contract_address(), &caller, &amount);
                     vault.balance -= amount;
                     entry.claimed_installments = unlocked;
@@ -5677,6 +5759,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -5700,6 +5783,7 @@ impl TtlVaultContract {
                     total_claimable * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -6324,6 +6408,7 @@ impl TtlVaultContract {
 
                     if unvested > 0 {
                         let token_client = token::Client::new(&env, &vault.token_address);
+                        crate::aml::require_compliant(&env, &forfeit_cfg.forfeiture_recipient);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &forfeit_cfg.forfeiture_recipient,
@@ -6607,6 +6692,7 @@ impl TtlVaultContract {
         );
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &beneficiary);
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount);
 
         env.events().publish(
@@ -6888,6 +6974,9 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBeneficiary);
         }
         Self::assert_not_zero_address(&env, &new_beneficiary);
+        if !aml::check_compliance(&env, &new_beneficiary) {
+            return Err(ContractError::AmlFlaggedAddress);
+        }
 
         let now = env.ledger().timestamp();
         // Timelock: 24 hours
@@ -7978,6 +8067,7 @@ impl TtlVaultContract {
 
         let amount = vault.balance;
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &claim);
         token_client.transfer(&env.current_contract_address(), &claim, &amount);
 
         vault.balance = 0;
@@ -10782,6 +10872,7 @@ impl TtlVaultContract {
                 let beneficiary = Self::get_delegated_beneficiary(&env, vault_id)
                     .unwrap_or(vault.beneficiary.clone());
 
+                crate::aml::require_compliant(&env, &beneficiary);
                 token_client.transfer(&env.current_contract_address(), &beneficiary, &entry.amount);
 
                 vault.balance -= entry.amount;
@@ -13185,6 +13276,7 @@ impl TtlVaultContract {
                 release_amount * (entry.bps as i128) / (total_qualifying_bps as i128)
             };
             if share > 0 {
+                crate::aml::require_compliant(env, &entry.address);
                 token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 env.events().publish(
                     (RELEASE_TOPIC,),
@@ -13850,6 +13942,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (VESTING_CATCHUP_CLAIMED_TOPIC, vault_id),
@@ -13865,6 +13958,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -14044,6 +14138,7 @@ impl TtlVaultContract {
             // Pay base without bonus
             let token_client = token::Client::new(&env, &vault.token_address);
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -14063,6 +14158,7 @@ impl TtlVaultContract {
                         fallback * (entry.bps as i128) / 10_000
                     };
                     if share > 0 {
+                        crate::aml::require_compliant(&env, &entry.address);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &entry.address,
@@ -14094,6 +14190,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -14113,6 +14210,7 @@ impl TtlVaultContract {
                     total_amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
