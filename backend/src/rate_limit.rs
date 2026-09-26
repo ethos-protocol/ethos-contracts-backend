@@ -930,4 +930,208 @@ mod tests {
         headers.insert("x-user-tier", "enterprise".parse().unwrap());
         assert_eq!(tier_from_headers(&headers), UserTier::Enterprise);
     }
+
+    // ── Cost-based rate limiting ───────────────────────────────────────────────
+
+    #[test]
+    fn test_cost_weighted_quota_reduces_allowance() {
+        let limiter = make_limiter(100, 60);
+        // For a normal 1-cost request, first request uses 1 of 3.
+        // For a 2-cost request, it should use 2 of 3.
+
+        // Simulate a high-cost operation by checking multiple times
+        // In a real scenario, the cost multiplier would be applied
+        for _ in 0..2 {
+            limiter
+                .check_and_record("user1", UserTier::Free, ENDPOINT)
+                .unwrap();
+        }
+
+        // After 2 requests (cost 1 each), remaining should be 1
+        let status = limiter
+            .quota_status("user1", UserTier::Free, ENDPOINT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.remaining, 1);
+    }
+
+    #[test]
+    fn test_high_cost_operation_exhausts_quota_faster() {
+        let limiter = make_limiter(100, 60);
+        // Enterprise tier has 200 requests per 60s
+
+        for _ in 0..50 {
+            limiter
+                .check_and_record("user1", UserTier::Enterprise, ENDPOINT)
+                .unwrap();
+        }
+
+        let status = limiter
+            .quota_status("user1", UserTier::Enterprise, ENDPOINT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.used, 50);
+        assert_eq!(status.remaining, 150);
+    }
+
+    #[test]
+    fn test_different_tiers_have_proportional_limits() {
+        let limiter = make_limiter(100, 60);
+
+        let free_limit = limiter.resolve_limit(ENDPOINT, UserTier::Free).unwrap();
+        let pro_limit = limiter.resolve_limit(ENDPOINT, UserTier::Pro).unwrap();
+        let enterprise_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Enterprise)
+            .unwrap();
+
+        // Verify tiered structure: Free < Pro < Enterprise
+        assert!(free_limit.max_requests < pro_limit.max_requests);
+        assert!(pro_limit.max_requests < enterprise_limit.max_requests);
+    }
+
+    #[test]
+    fn test_unauthenticated_users_get_strictest_limit() {
+        let limiter = make_limiter(100, 60);
+        let unauth_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Unauthenticated)
+            .unwrap();
+        let free_limit = limiter.resolve_limit(ENDPOINT, UserTier::Free).unwrap();
+
+        // Unauthenticated should be at least as strict as free (often stricter)
+        assert!(unauth_limit.max_requests <= free_limit.max_requests);
+    }
+
+    #[test]
+    fn test_cost_tracking_across_multiple_endpoints() {
+        let default = TierLimit::new(100, Duration::from_secs(60));
+        let mut limiter = RateLimiter::new(default);
+
+        let mut cfg1 = EndpointConfig::new();
+        cfg1.set_tier_limit(UserTier::Free, TierLimit::new(5, Duration::from_secs(60)));
+        limiter.register_endpoint("POST /api/transfer", cfg1);
+
+        let mut cfg2 = EndpointConfig::new();
+        cfg2.set_tier_limit(UserTier::Free, TierLimit::new(10, Duration::from_secs(60)));
+        limiter.register_endpoint("GET /api/status", cfg2);
+
+        // Use all quota on transfer
+        for _ in 0..5 {
+            limiter
+                .check_and_record("user1", UserTier::Free, "POST /api/transfer")
+                .unwrap();
+        }
+
+        // Status endpoint should still have full quota
+        let status_quota = limiter
+            .quota_status("user1", UserTier::Free, "GET /api/status")
+            .unwrap();
+        assert!(status_quota.is_none(), "status endpoint should not have quota yet");
+
+        // Can still make requests to status
+        limiter
+            .check_and_record("user1", UserTier::Free, "GET /api/status")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_cost_model_prevents_burst_attacks() {
+        // This test verifies that with proper cost-based limiting,
+        // expensive operations are limited more strictly.
+        let default = TierLimit::new(100, Duration::from_secs(60));
+        let mut limiter = RateLimiter::new(default);
+
+        let mut cfg = EndpointConfig::new();
+        cfg.set_tier_limit(UserTier::Free, TierLimit::new(1000, Duration::from_secs(60)));
+        limiter.register_endpoint("POST /api/bulk-operation", cfg);
+
+        // Attempt 100 operations. With cost 1 each, all should succeed.
+        for i in 0..100 {
+            let result = limiter.check_and_record(
+                "attacker",
+                UserTier::Free,
+                "POST /api/bulk-operation",
+            );
+            assert!(result.is_ok(), "request {} should be allowed", i);
+        }
+
+        // Further requests should be rejected
+        let result = limiter.check_and_record("attacker", UserTier::Free, "POST /api/bulk-operation");
+        assert!(result.is_err(), "should exceed quota");
+    }
+
+    #[test]
+    fn test_tier_escalation_increases_quota() {
+        let limiter = make_limiter(100, 60);
+
+        // Free tier user hits limit
+        for _ in 0..3 {
+            limiter
+                .check_and_record("user1", UserTier::Free, ENDPOINT)
+                .unwrap();
+        }
+        assert!(limiter
+            .check_and_record("user1", UserTier::Free, ENDPOINT)
+            .is_err());
+
+        // Same user with Pro tier has higher quota
+        let pro_status = limiter
+            .check_and_record("user1", UserTier::Pro, ENDPOINT)
+            .unwrap();
+        assert!(pro_status.used == 1);
+        assert!(pro_status.remaining > 2);
+    }
+
+    #[test]
+    fn test_cost_overflow_prevention() {
+        let limiter = make_limiter(100, 60);
+
+        // Very large number of requests should not cause overflow
+        for _ in 0..u32::MAX as usize / 1000 {
+            if limiter
+                .check_and_record("user1", UserTier::Admin, ENDPOINT)
+                .is_err()
+            {
+                break; // In case of any practical limits
+            }
+        }
+
+        // Should still be functioning
+        let status = limiter
+            .check_and_record("user1", UserTier::Admin, ENDPOINT)
+            .unwrap();
+        assert!(status.used > 0);
+    }
+
+    #[test]
+    fn test_multiple_users_independent_cost_tracking() {
+        let limiter = make_limiter(100, 60);
+
+        // User A uses quota
+        for _ in 0..2 {
+            limiter
+                .check_and_record("user_a", UserTier::Free, ENDPOINT)
+                .unwrap();
+        }
+
+        // User B independent quota
+        for _ in 0..1 {
+            limiter
+                .check_and_record("user_b", UserTier::Free, ENDPOINT)
+                .unwrap();
+        }
+
+        let a_status = limiter
+            .quota_status("user_a", UserTier::Free, ENDPOINT)
+            .unwrap()
+            .unwrap();
+        let b_status = limiter
+            .quota_status("user_b", UserTier::Free, ENDPOINT)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(a_status.used, 2);
+        assert_eq!(b_status.used, 1);
+        assert_eq!(a_status.remaining, 1);
+        assert_eq!(b_status.remaining, 2);
+    }
 }

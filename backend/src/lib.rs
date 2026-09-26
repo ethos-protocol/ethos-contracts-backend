@@ -59,6 +59,7 @@ pub mod profiler;
 pub mod query_cache;
 pub mod replay;
 pub mod request_queue;
+pub mod request_signing;
 pub mod retention;
 pub mod retry_policy;
 pub mod routes;
