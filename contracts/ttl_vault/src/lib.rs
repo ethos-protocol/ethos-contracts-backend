@@ -13,14 +13,18 @@ use soroban_sdk::{
 };
 
 pub mod aml;
-pub mod composition_rules;
 pub mod compliance;
+pub mod compliance_policy;
+pub mod composition_rules;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
 pub mod credential_lifecycle;
 #[cfg(test)]
 mod credential_lifecycle_tests;
+mod diff_codec;
+pub mod history_archive;
+pub mod incremental_snapshots;
 mod oracle;
 pub mod ranking;
 pub mod slice_attribute_matching;
@@ -30,6 +34,7 @@ pub mod slice_failover;
 pub mod slice_performance;
 pub mod template_inheritance;
 mod types;
+pub mod vault_compression;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
     BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
@@ -40,19 +45,18 @@ use types::{
     PasskeyHash, PasskeyUsageEntry, PauseRecord, PendingBeneficiaryUpdate, ProofOfLifeEntry,
     ProposalStatus, ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry,
     StateTransitionEntry, TokenCollateral, TokenConversion, TokenHedge, TokenLending,
-    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary,
-    VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim,
-    VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit, WithdrawalReversal,
-    WithdrawalScheduleEntry, WithdrawalTracker, UpgradeManifest, YieldDistributionConfig,
-    YieldDistributionMode,
-    ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
-    ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, BACKUP_CODE_USED_TOPIC,
-    BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_CAP_TOPIC,
-    BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_REBALANCED_TOPIC,
-    BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC, BENEFICIARY_UPDATED_TOPIC,
-    BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC, CHECKIN_GEO_TOPIC,
-    CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC, CLAIM_VEST_TOPIC,
-    CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
+    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, UpgradeManifest, Vault,
+    VaultStatusSummary, VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig,
+    VestingPendingClaim, VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit,
+    WithdrawalReversal, WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig,
+    YieldDistributionMode, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
+    ADMIN_TRANSFER_COMPLETED_TOPIC, ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
+    BACKUP_CODE_USED_TOPIC, BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC,
+    BENEFICIARY_CAP_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC,
+    BENEFICIARY_REBALANCED_TOPIC, BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC,
+    BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC,
+    CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
+    CLAIM_VEST_TOPIC, CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     DELEGATE_BENEFICIARY_TOPIC, DELEGATE_CHECKIN_TOPIC, DEPOSIT_TOPIC, DISPUTE_FILED_TOPIC,
     DISPUTE_RESOLVED_TOPIC, DUPLICATE_VAULT_TOPIC, EXPIRY_WARNING_THRESHOLD,
     HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC, INACTIVITY_PENALTY_TOPIC,
@@ -91,39 +95,102 @@ use types::{
     WRAPPED_TOKEN_UNREGISTERED_TOPIC, YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
 };
 use types::{
-    BeneficiaryAuction, BeneficiaryAuctionBid, BeneficiaryConditionalAcceptance,
-    BeneficiaryConflict, BeneficiaryConflictClaim, BeneficiaryRebalancedEvent,
-    BeneficiaryTierSetEvent, BeneficiaryTriggerSetEvent, BeneficiaryVestingSchedule,
-    BeneficiaryWaterfallEvent, ConflictResolution, CountdownConfig, CustomMetadataEntry,
-    PasskeyLockout, PasskeyRecoveryRequest, PasskeyRotationPolicy, ProtocolConfig, ReleaseTrigger,
-    TwoFactorConfigData, VaultSnapshot, VestingAccelerationConfig, VestingForfeitureConfig,
-    VestingRolloverConfig, VestingStaggerEntry, WithdrawalApprovalRequest, WithdrawalEscrow,
-    WithdrawalProof, WithdrawalRateLimit, WithdrawalRollback, AUCTION_BID_TOPIC,
-    AUCTION_CREATED_TOPIC, AUCTION_FINALIZED_TOPIC, BENEFICIARY_CONFLICT_FILED_TOPIC,
-    BENEFICIARY_CONFLICT_RESOLVED_TOPIC, BEN_COMMITTED_TOPIC, BEN_REVEALED_TOPIC,
-    BIND_PASSKEY_BIOMETRIC_TOPIC, BIO_CHECKIN_TOPIC, BURN_EVENT_TOPIC,
-    CLAIM_BENEFICIARY_VESTING_TOPIC, CLAWBACK_UNVESTED_TOPIC, COUNTDOWN_NOTIF_TOPIC,
-    EMERGENCY_RECOVERY_GENERATED_TOPIC, EMERGENCY_RECOVERY_USED_TOPIC, MAX_VESTING_SCHEDULES,
-    MILESTONE_ADJUST_TOPIC, MILESTONE_CLAIM_TOPIC, MILESTONE_EMERGENCY_TOPIC,
-    MILESTONE_PAUSE_TOPIC, MILESTONE_PROGRESS_TOPIC, MILESTONE_RESUME_TOPIC, MILESTONE_VEST_TOPIC,
-    PASSKEY_COMPROMISED_TOPIC, PASSKEY_EXPIRED_TOPIC, PROTOCOL_CONFIG_APPLIED_TOPIC,
-    PROTOCOL_CONFIG_PROPOSED_TOPIC, SET_BENEFICIARY_VESTING_TOPIC, SET_COUNTDOWN_TOPIC,
-    TWO_FACTOR_DISABLED_TOPIC, TWO_FACTOR_ENABLED_TOPIC, TWO_FACTOR_VERIFIED_TOPIC,
-    UNBIND_PASSKEY_BIOMETRIC_TOPIC, VESTING_ACCELERATED_TOPIC, VESTING_FINALIZED_TOPIC,
-    VESTING_FORFEITURE_TOPIC, VESTING_PENALTY_TOPIC, VESTING_REVERSED_TOPIC,
-    VESTING_ROLLOVER_TOPIC, VESTING_SCHEDULE_ADDED_TOPIC, VESTING_STAGGER_TOPIC,
-    WITHDRAWAL_ESCROW_CREATED_TOPIC, WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC,
-    WITHDRAWAL_RATE_LIMITED_TOPIC, WITHDRAWAL_ROLLBACK_TOPIC,
     // Issue #563: cursor pagination
-    BatchCheckInResult, VaultConfigTemplate, VaultPage, VaultSortField,
+    BatchCheckInResult,
+    BeneficiaryAuction,
+    BeneficiaryAuctionBid,
+    BeneficiaryConditionalAcceptance,
+    BeneficiaryConflict,
+    BeneficiaryConflictClaim,
+    BeneficiaryRebalancedEvent,
+    BeneficiaryTierSetEvent,
+    BeneficiaryTriggerSetEvent,
+    BeneficiaryVestingSchedule,
+    BeneficiaryWaterfallEvent,
+    ConflictResolution,
+    CountdownConfig,
+    CustomMetadataEntry,
     // Issue #560: Merkle history proofs
-    MerkleLeaf, MerkleProof,
+    MerkleLeaf,
+    MerkleProof,
+    PasskeyLockout,
+    PasskeyRecoveryRequest,
+    PasskeyRotationPolicy,
+    ProtocolConfig,
+    ReleaseTrigger,
+    TwoFactorConfigData,
+    VaultConfigTemplate,
+    VaultPage,
+    VaultSnapshot,
+    VaultSortField,
+    VestingAccelerationConfig,
+    VestingForfeitureConfig,
+    VestingRolloverConfig,
+    VestingStaggerEntry,
+    WithdrawalApprovalRequest,
+    WithdrawalEscrow,
+    WithdrawalProof,
+    WithdrawalRateLimit,
+    WithdrawalRollback,
+    AUCTION_BID_TOPIC,
+    AUCTION_CREATED_TOPIC,
+    AUCTION_FINALIZED_TOPIC,
+    BENEFICIARY_CONFLICT_FILED_TOPIC,
+    BENEFICIARY_CONFLICT_RESOLVED_TOPIC,
+    BEN_COMMITTED_TOPIC,
+    BEN_REVEALED_TOPIC,
+    BIND_PASSKEY_BIOMETRIC_TOPIC,
+    BIO_CHECKIN_TOPIC,
+    BURN_EVENT_TOPIC,
+    CLAIM_BENEFICIARY_VESTING_TOPIC,
+    CLAWBACK_UNVESTED_TOPIC,
+    COUNTDOWN_NOTIF_TOPIC,
+    EMERGENCY_RECOVERY_GENERATED_TOPIC,
+    EMERGENCY_RECOVERY_USED_TOPIC,
     // New event topics
-    HISTORY_PROOF_TOPIC, HISTORY_ROOT_TOPIC, VAULT_LIST_TOPIC, VAULT_TMPL_REF_TOPIC,
+    HISTORY_PROOF_TOPIC,
+    HISTORY_ROOT_TOPIC,
+    MAX_VESTING_SCHEDULES,
+    MILESTONE_ADJUST_TOPIC,
+    MILESTONE_CLAIM_TOPIC,
+    MILESTONE_EMERGENCY_TOPIC,
+    MILESTONE_PAUSE_TOPIC,
+    MILESTONE_PROGRESS_TOPIC,
+    MILESTONE_RESUME_TOPIC,
+    MILESTONE_VEST_TOPIC,
+    PASSKEY_COMPROMISED_TOPIC,
+    PASSKEY_EXPIRED_TOPIC,
+    PROTOCOL_CONFIG_APPLIED_TOPIC,
+    PROTOCOL_CONFIG_PROPOSED_TOPIC,
+    SET_BENEFICIARY_VESTING_TOPIC,
+    SET_COUNTDOWN_TOPIC,
+    TWO_FACTOR_DISABLED_TOPIC,
+    TWO_FACTOR_ENABLED_TOPIC,
+    TWO_FACTOR_VERIFIED_TOPIC,
+    UNBIND_PASSKEY_BIOMETRIC_TOPIC,
+    VAULT_LIST_TOPIC,
+    VAULT_TMPL_REF_TOPIC,
     VAULT_TMPL_REG_TOPIC,
+    VESTING_ACCELERATED_TOPIC,
+    VESTING_FINALIZED_TOPIC,
+    VESTING_FORFEITURE_TOPIC,
+    VESTING_PENALTY_TOPIC,
+    VESTING_REVERSED_TOPIC,
+    VESTING_ROLLOVER_TOPIC,
+    VESTING_SCHEDULE_ADDED_TOPIC,
+    VESTING_STAGGER_TOPIC,
+    WITHDRAWAL_ESCROW_CREATED_TOPIC,
+    WITHDRAWAL_ESCROW_VERIFIED_TOPIC,
+    WITHDRAWAL_PROOF_TOPIC,
+    WITHDRAWAL_RATE_LIMITED_TOPIC,
+    WITHDRAWAL_ROLLBACK_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
+#[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
 #[cfg(test)]
@@ -135,13 +202,17 @@ mod bps_invariant_tests;
 #[cfg(test)]
 mod composition_rules_tests;
 #[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
 mod hibernation_consistency_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
-mod passkey_audit_tests;
+mod multisig_withdrawal_tests;
 #[cfg(test)]
 mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_audit_tests;
 #[cfg(test)]
 mod passkey_breach_detection_tests;
 #[cfg(test)]
@@ -159,31 +230,23 @@ mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
-mod slice_failover_tests;
-#[cfg(test)]
 mod slice_consensus_voting_tests;
+#[cfg(test)]
+mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
+mod upgrade_validation_tests;
+#[cfg(test)]
 mod withdrawal_escrow_tests;
-#[cfg(test)]
-mod beneficiary_conditional_acceptance_tests;
-#[cfg(test)]
-mod beneficiary_dispute_escalation_tests;
-#[cfg(test)]
-mod conditional_withdrawal_release_tests;
 #[cfg(test)]
 mod withdrawal_notification_confirmation_tests;
 #[cfg(test)]
-mod upgrade_validation_tests;
-#[cfg(test)]
 mod withdrawal_rate_limit_tests;
 #[cfg(test)]
-mod withdrawal_whitelist_tests;
-#[cfg(test)]
-mod multisig_withdrawal_tests;
-#[cfg(test)]
 mod withdrawal_rollback_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -435,6 +498,13 @@ pub enum ContractError {
     UpgradeManifestNotSet = 130,
     // Issue #547: AML screening rejected a beneficiary / transfer recipient
     AmlFlaggedAddress = 131,
+    // Issue #559: incremental snapshot chain failed reconstruction/verification
+    SnapshotCorrupted = 132,
+    // Issue #556: compliance policy versioning
+    InvalidEffectiveDate = 133,
+    PolicyVersionNotFound = 134,
+    // Issue #558: compressed vault record failed decoding/verification
+    VaultCompressionCorrupted = 135,
 }
 
 #[contract]
@@ -7907,10 +7977,13 @@ impl TtlVaultContract {
         // Extending TTL on an archived entry restores it. If the entry no longer
         // exists at all, load_vault will panic with VaultNotFound.
         let vault = Self::load_vault(&env, vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Issue #558: a compressed vault lives under its own key.
+        if !vault_compression::extend_ttl(&env, vault_id) {
+            let ttl = vault_ttl_ledgers(vault.check_in_interval);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        }
         // Clear any stale archived-info snapshot now that the vault is live again.
         env.storage()
             .persistent()
@@ -8854,9 +8927,7 @@ impl TtlVaultContract {
     }
 
     fn load_vault(env: &Env, vault_id: u64) -> Vault {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Vault(vault_id))
+        Self::try_load_vault(env, vault_id)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::VaultNotFound))
     }
 
@@ -8872,7 +8943,11 @@ impl TtlVaultContract {
     /// # Returns
     /// `Some(Vault)` if the vault exists, `None` otherwise
     fn try_load_vault(env: &Env, vault_id: u64) -> Option<Vault> {
-        env.storage().persistent().get(&DataKey::Vault(vault_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Vault(vault_id))
+            // Issue #558: inactive vaults may be stored compressed; decompress on demand.
+            .or_else(|| vault_compression::load(env, vault_id))
     }
 
     fn load_owner_vault_ids(env: &Env, owner: &Address) -> Vec<u64> {
@@ -8929,6 +9004,8 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Issue #558: a write stores the vault uncompressed again.
+        vault_compression::clear(env, vault_id);
     }
 
     fn load_beneficiary_vault_ids(env: &Env, beneficiary: &Address) -> Vec<u64> {
@@ -9880,9 +9957,7 @@ impl TtlVaultContract {
             // distinct. Replacing the stored vector below then makes the prior
             // generation unambiguously invalid, even when codes are regenerated
             // in the same ledger timestamp.
-            let code_number = vault_id
-                .wrapping_mul(timestamp)
-                .wrapping_add(i as u64);
+            let code_number = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
             let code_str = String::from_str(&env, "code");
             let mut suffix = String::from_str(&env, "");
             let mut remaining = code_number;
@@ -9898,7 +9973,10 @@ impl TtlVaultContract {
                 }
                 while digit_count > 0 {
                     digit_count -= 1;
-                    suffix.push_str(&String::from_bytes(&env, &Bytes::from_array(&env, &[digits[digit_count]])));
+                    suffix.push_str(&String::from_bytes(
+                        &env,
+                        &Bytes::from_array(&env, &[digits[digit_count]]),
+                    ));
                 }
             }
             let code_str = code_str.concat(&suffix);
@@ -11953,6 +12031,8 @@ impl TtlVaultContract {
     ///
     /// # Returns
     /// A vector of `StateTransitionEntry` records ordered oldest-first.
+    /// Entries moved out by `archive_vault_history` (#557) are no longer
+    /// included; read them with `get_archived_history`.
     pub fn get_state_transition_log(env: Env, vault_id: u64) -> Vec<StateTransitionEntry> {
         env.storage()
             .persistent()
@@ -12084,8 +12164,7 @@ impl TtlVaultContract {
         let mut results = Vec::new(&env);
         let now = env.ledger().timestamp();
         for vault_id in vault_ids.iter() {
-            let key = DataKey::Vault(vault_id);
-            if let Some(vault) = env.storage().persistent().get::<DataKey, Vault>(&key) {
+            if let Some(vault) = Self::try_load_vault(&env, vault_id) {
                 let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
                 let is_expired = now > deadline && vault.status == ReleaseStatus::Locked;
                 results.push_back(VaultStatusSummary {
@@ -15646,6 +15725,11 @@ impl TtlVaultContract {
     pub fn set_allowlist_enforced(env: Env, enforced: bool) {
         Self::require_admin(&env);
         compliance::set_allowlist_enforced(&env, enforced);
+        compliance_policy::record_live_change(
+            &env,
+            &Self::load_admin(&env),
+            compliance_policy::REASON_ALLOWLIST_MODE,
+        );
     }
 
     /// Returns whether allowlist mode is enabled.
@@ -15723,7 +15807,13 @@ impl TtlVaultContract {
     /// * `ContractError::InvalidAmount` - `amount` is negative
     pub fn set_kyc_high_value_threshold(env: Env, amount: i128) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        compliance::set_kyc_high_value_threshold(&env, amount)
+        compliance::set_kyc_high_value_threshold(&env, amount)?;
+        compliance_policy::record_live_change(
+            &env,
+            &Self::load_admin(&env),
+            compliance_policy::REASON_KYC_THRESHOLD,
+        );
+        Ok(())
     }
 
     /// Returns the high-value KYC threshold (`0` = disabled).
@@ -15741,7 +15831,13 @@ impl TtlVaultContract {
         config: compliance::ThresholdConfig,
     ) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        compliance::set_threshold_config(&env, &config)
+        compliance::set_threshold_config(&env, &config)?;
+        compliance_policy::record_live_change(
+            &env,
+            &Self::load_admin(&env),
+            compliance_policy::REASON_REPORT_THRESHOLDS,
+        );
+        Ok(())
     }
 
     /// Returns the configured reporting thresholds, if any.
@@ -15858,5 +15954,225 @@ impl TtlVaultContract {
     /// Returns the signed report with `report_id`, if any.
     pub fn get_signed_report(env: Env, report_id: u64) -> Option<compliance::SignedReport> {
         compliance::get_signed_report(&env, report_id)
+    }
+
+    // ── Issue #556: Compliance policy versioning ─────────────────────────────
+
+    /// Publish a complete compliance policy that takes effect at
+    /// `effective_from` (admin only). A policy effective now is applied
+    /// immediately; a future one is applied by `sync_compliance_policy` once
+    /// its date is reached. Returns the new version number.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidEffectiveDate` - `effective_from` is in the past
+    /// * `ContractError::InvalidAmount` - `kyc_high_value_threshold` is negative
+    /// * `ContractError::InvalidConfig` - `reporting_thresholds` is invalid
+    pub fn publish_compliance_policy(
+        env: Env,
+        kyc_high_value_threshold: i128,
+        allowlist_enforced: bool,
+        reporting_thresholds: Option<compliance::ThresholdConfig>,
+        effective_from: u64,
+    ) -> Result<u32, ContractError> {
+        Self::require_admin(&env);
+        compliance_policy::publish_policy(
+            &env,
+            &Self::load_admin(&env),
+            kyc_high_value_threshold,
+            allowlist_enforced,
+            reporting_thresholds,
+            effective_from,
+        )
+    }
+
+    /// Returns the compliance policy that was in force at `timestamp`.
+    ///
+    /// # Errors
+    /// * `ContractError::PolicyVersionNotFound` - no policy was in force yet
+    pub fn get_policy_version(
+        env: Env,
+        timestamp: u64,
+    ) -> Result<compliance_policy::Policy, ContractError> {
+        compliance_policy::get_policy_version(&env, timestamp)
+    }
+
+    /// Returns compliance policy `version` (1-based), if it exists.
+    pub fn get_compliance_policy(env: Env, version: u32) -> Option<compliance_policy::Policy> {
+        compliance_policy::get_policy(&env, version)
+    }
+
+    /// Returns the number of recorded compliance policy versions.
+    pub fn get_policy_version_count(env: Env) -> u32 {
+        compliance_policy::get_version_count(&env)
+    }
+
+    /// Returns the version currently applied to the live compliance
+    /// configuration (`0` if none).
+    pub fn get_applied_policy_version(env: Env) -> u32 {
+        compliance_policy::get_applied_version(&env)
+    }
+
+    /// Apply the policy in force now if it is not applied yet. Anyone may call
+    /// this. Returns the newly applied version, or `None` if nothing changed.
+    pub fn sync_compliance_policy(env: Env) -> Result<Option<u32>, ContractError> {
+        compliance_policy::sync_active_policy(&env)
+    }
+
+    // ── Issue #557: Vault history archival ───────────────────────────────────
+
+    /// Move state-transition entries older than
+    /// `history_archive::ARCHIVE_MIN_AGE_SECONDS` into hash-chained archive
+    /// pages of `history_archive::ARCHIVE_PAGE_SIZE` entries. Anyone may call
+    /// this. Returns the number of pages archived.
+    pub fn archive_vault_history(env: Env, vault_id: u64) -> u32 {
+        history_archive::archive_history(&env, vault_id)
+    }
+
+    /// Returns archived history `page` for a vault while its body is still on
+    /// the live ledger. Evicted pages are served from the `hist_arc` event
+    /// stream and can be checked with `verify_archived_page`.
+    pub fn get_archived_history(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+    ) -> Option<history_archive::ArchivedHistoryPage> {
+        history_archive::get_archived_page(&env, vault_id, page)
+    }
+
+    /// Returns the archive bookkeeping (page count, chain head) for a vault.
+    pub fn get_history_archive_meta(env: Env, vault_id: u64) -> history_archive::ArchiveMeta {
+        history_archive::get_meta(&env, vault_id)
+    }
+
+    /// Returns the on-chain integrity digest of an archived page, if any.
+    pub fn get_archive_page_digest(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+    ) -> Option<history_archive::ArchivePageDigest> {
+        history_archive::get_digest(&env, vault_id, page)
+    }
+
+    /// Verifies externally-held page entries against the on-chain digest.
+    pub fn verify_archived_page(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+        entries: Vec<StateTransitionEntry>,
+    ) -> bool {
+        history_archive::verify_page(&env, vault_id, page, &entries)
+    }
+
+    /// Verifies the whole archive hash chain and every live page body.
+    pub fn verify_history_archive(env: Env, vault_id: u64) -> bool {
+        history_archive::verify_integrity(&env, vault_id)
+    }
+
+    // ── Issue #558: Vault compression for inactive accounts ─────────────────
+
+    /// Compress a vault that has been inactive for at least the configured
+    /// period. Anyone may call this; reads keep working transparently and the
+    /// next write stores the vault uncompressed again. Returns `true` when
+    /// the vault was compressed, `false` when it is not eligible, already
+    /// compressed, or would not shrink.
+    ///
+    /// # Panics
+    /// * `ContractError::VaultNotFound` - the vault does not exist
+    pub fn compress_vault(env: Env, vault_id: u64) -> bool {
+        vault_compression::compress(&env, vault_id).unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Store a compressed vault uncompressed again. Returns `false` if the
+    /// vault was not compressed.
+    pub fn decompress_vault(env: Env, vault_id: u64) -> bool {
+        match vault_compression::load(&env, vault_id) {
+            Some(vault) => {
+                Self::save_vault(&env, vault_id, &vault);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns whether a vault is currently stored compressed.
+    pub fn is_vault_compressed(env: Env, vault_id: u64) -> bool {
+        vault_compression::is_compressed(&env, vault_id)
+    }
+
+    /// Returns original/compressed sizes for a compressed vault, if any.
+    pub fn get_vault_compression_info(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<vault_compression::CompressionInfo> {
+        vault_compression::get_info(&env, vault_id)
+    }
+
+    /// Set the inactivity period, in seconds, after which vaults may be
+    /// compressed (admin only). Default: 90 days.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidConfig` - `seconds` is zero
+    pub fn set_compression_inactivity(env: Env, seconds: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        vault_compression::set_inactivity_threshold(&env, seconds)
+    }
+
+    /// Returns the inactivity period after which vaults may be compressed.
+    pub fn get_compression_inactivity(env: Env) -> u64 {
+        vault_compression::get_inactivity_threshold(&env)
+    }
+
+    // ── Issue #559: Incremental state snapshots ──────────────────────────────
+
+    /// Take an incremental snapshot of the vault: a full checkpoint every
+    /// `incremental_snapshots::FULL_SNAPSHOT_INTERVAL` snapshots, otherwise
+    /// only the differentially-compressed fields that changed. Anyone may
+    /// call this. Returns the snapshot sequence number.
+    pub fn create_incremental_snapshot(env: Env, vault_id: u64) -> u32 {
+        let vault = Self::load_vault(&env, vault_id);
+        incremental_snapshots::create_snapshot(&env, vault_id, &vault)
+    }
+
+    /// Returns the stored snapshot entry at `sequence`, if any.
+    pub fn get_incremental_snapshot(
+        env: Env,
+        vault_id: u64,
+        sequence: u32,
+    ) -> Option<incremental_snapshots::IncrementalSnapshot> {
+        incremental_snapshots::get_snapshot(&env, vault_id, sequence)
+    }
+
+    /// Returns the number of incremental snapshots taken for a vault.
+    pub fn get_incremental_snapshot_count(env: Env, vault_id: u64) -> u32 {
+        incremental_snapshots::get_snapshot_count(&env, vault_id)
+    }
+
+    /// Reconstructs the full vault state at snapshot `sequence`.
+    ///
+    /// # Errors
+    /// * `ContractError::SnapshotNotFound` - no snapshot with `sequence`
+    /// * `ContractError::SnapshotCorrupted` - the chain fails verification
+    pub fn reconstruct_vault_snapshot(
+        env: Env,
+        vault_id: u64,
+        sequence: u32,
+    ) -> Result<Vault, ContractError> {
+        incremental_snapshots::reconstruct(&env, vault_id, sequence)
+    }
+
+    /// Reconstructs the vault state from the latest snapshot taken at or
+    /// before `timestamp`.
+    ///
+    /// # Errors
+    /// * `ContractError::SnapshotNotFound` - no snapshot at or before `timestamp`
+    /// * `ContractError::SnapshotCorrupted` - the chain fails verification
+    pub fn reconstruct_vault_at(
+        env: Env,
+        vault_id: u64,
+        timestamp: u64,
+    ) -> Result<Vault, ContractError> {
+        let sequence = incremental_snapshots::find_sequence_at(&env, vault_id, timestamp)
+            .ok_or(ContractError::SnapshotNotFound)?;
+        incremental_snapshots::reconstruct(&env, vault_id, sequence)
     }
 }
