@@ -10,6 +10,7 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod compliance;
 pub mod composition_rules;
 pub mod credential_anchoring;
 #[cfg(test)]
@@ -398,6 +399,20 @@ pub enum ContractError {
     UpgradeStorageSchemaChanged = 128,
     UpgradeErrorCodesReduced = 129,
     UpgradeManifestNotSet = 130,
+    // Issues #552-#555: compliance audit trail, SAR, reports, regulatory changes
+    InvalidComplianceInput = 131,
+    AddressBlacklisted = 132,
+    SarNotFound = 133,
+    InvalidSarReason = 134,
+    InvalidSarTransition = 135,
+    InvalidCompliancePeriod = 136,
+    ComplianceReportNotFound = 137,
+    ReportAlreadySigned = 138,
+    ReportDigestMismatch = 139,
+    RequirementNotFound = 140,
+    RequirementRetired = 141,
+    RequirementAlreadyImplemented = 142,
+    NoticeNotFound = 143,
 }
 
 #[contract]
@@ -1562,6 +1577,7 @@ impl TtlVaultContract {
         if owner == Self::load_admin(&env) {
             panic_with_error!(&env, ContractError::AdminCannotOwnVault);
         }
+        Self::assert_not_blacklisted(&env, &owner);
         if check_in_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidInterval);
         }
@@ -1911,6 +1927,7 @@ impl TtlVaultContract {
         if from != vault.owner {
             panic_with_error!(&env, ContractError::UnauthorizedDepositor);
         }
+        Self::assert_not_blacklisted(&env, &from);
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
@@ -1944,6 +1961,7 @@ impl TtlVaultContract {
         Self::save_vault(&env, vault_id, &vault);
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
+        compliance::record_transaction(&env, amount, true);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -2212,6 +2230,7 @@ impl TtlVaultContract {
 
         // Issue #569: Record successful withdrawal in audit trail
         Self::record_withdrawal_audit(&env, vault_id, &caller, amount, true, "");
+        compliance::record_transaction(&env, amount, false);
 
         // Issue #571: Emit withdrawal notification event
         env.events().publish(
@@ -8653,6 +8672,13 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Issue #552: reject inflows from compliance-blacklisted addresses.
+    fn assert_not_blacklisted(env: &Env, address: &Address) {
+        if compliance::is_blacklisted(env, address) {
+            panic_with_error!(env, ContractError::AddressBlacklisted);
+        }
     }
 
     fn require_admin(env: &Env) {
@@ -15414,5 +15440,357 @@ impl TtlVaultContract {
             primary_slice_id,
             backup_slice_id,
         ))
+    }
+
+    // ── Issue #552: Compliance audit trail ───────────────────────────────────
+
+    /// Returns the compliance audit trail for `address`: AML checks, KYC
+    /// verifications, blacklist decisions, SAR activity, report generation and
+    /// regulatory acknowledgements, oldest first. The most recent
+    /// `compliance::MAX_AUDIT_TRAIL_ENTRIES` entries are retained on-chain.
+    pub fn get_compliance_audit_trail(
+        env: Env,
+        address: Address,
+    ) -> Vec<compliance::ComplianceAuditEntry> {
+        compliance::get_audit_trail(&env, &address)
+    }
+
+    /// Records an AML screening result for `address` (admin-only).
+    ///
+    /// A check whose `risk_score` (0–100) meets the AML threshold is flagged;
+    /// if `vault_id` is given, a SAR is filed automatically against that vault.
+    ///
+    /// # Errors
+    /// * `InvalidComplianceInput` — score above 100 or invalid `provider`.
+    /// * `VaultNotFound` — `vault_id` does not exist.
+    pub fn record_aml_check(
+        env: Env,
+        address: Address,
+        vault_id: Option<u64>,
+        risk_score: u32,
+        provider: Bytes,
+    ) -> Result<compliance::AmlCheckRecord, ContractError> {
+        Self::require_admin(&env);
+        let vault = match vault_id {
+            Some(id) => Some((
+                id,
+                Self::try_load_vault(&env, id)
+                    .ok_or(ContractError::VaultNotFound)?
+                    .owner,
+            )),
+            None => None,
+        };
+        compliance::record_aml_check(
+            &env,
+            &Self::load_admin(&env),
+            &address,
+            vault,
+            risk_score,
+            provider,
+        )
+    }
+
+    /// Returns the most recent AML check recorded for `address`.
+    pub fn get_last_aml_check(env: Env, address: Address) -> Option<compliance::AmlCheckRecord> {
+        compliance::get_last_aml_check(&env, &address)
+    }
+
+    /// Sets the AML risk score (1–100) at which checks are flagged (admin-only).
+    pub fn set_aml_risk_threshold(env: Env, threshold: u32) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_aml_threshold(&env, threshold)
+    }
+
+    /// Returns the AML risk score threshold.
+    pub fn get_aml_risk_threshold(env: Env) -> u32 {
+        compliance::get_aml_threshold(&env)
+    }
+
+    /// Records a KYC verification outcome for `address` (admin-only).
+    /// `expires_at` of 0 means the verification does not expire.
+    pub fn record_kyc_verification(
+        env: Env,
+        address: Address,
+        status: compliance::KycStatus,
+        provider: Bytes,
+        expires_at: u64,
+    ) -> Result<compliance::KycRecord, ContractError> {
+        Self::require_admin(&env);
+        compliance::record_kyc_verification(
+            &env,
+            &Self::load_admin(&env),
+            &address,
+            status,
+            provider,
+            expires_at,
+        )
+    }
+
+    /// Returns the KYC record for `address` (`Unverified` if none exists).
+    pub fn get_kyc_status(env: Env, address: Address) -> compliance::KycRecord {
+        compliance::get_kyc_record(&env, &address)
+    }
+
+    /// Adds or removes `address` from the compliance blacklist (admin-only).
+    /// Blacklisted addresses cannot create vaults or deposit.
+    pub fn set_compliance_blacklist(
+        env: Env,
+        address: Address,
+        blacklisted: bool,
+        reason: Bytes,
+    ) -> Result<compliance::BlacklistRecord, ContractError> {
+        Self::require_admin(&env);
+        compliance::set_blacklist(&env, &Self::load_admin(&env), &address, blacklisted, reason)
+    }
+
+    /// Returns whether `address` is currently blacklisted.
+    pub fn is_compliance_blacklisted(env: Env, address: Address) -> bool {
+        compliance::is_blacklisted(&env, &address)
+    }
+
+    /// Returns the latest blacklist decision for `address`, if any.
+    pub fn get_blacklist_record(env: Env, address: Address) -> Option<compliance::BlacklistRecord> {
+        compliance::get_blacklist_record(&env, &address)
+    }
+
+    // ── Issue #553: Suspicious Activity Reporting ────────────────────────────
+
+    /// Files a Suspicious Activity Report against `vault_id` (admin-only).
+    /// The vault owner is recorded as the SAR subject. Returns the SAR id.
+    ///
+    /// # Errors
+    /// * `VaultNotFound` — the vault does not exist.
+    /// * `InvalidSarReason` — `reason` is empty or longer than
+    ///   `compliance::MAX_SAR_REASON_LEN`.
+    pub fn file_sar(env: Env, vault_id: u64, reason: Bytes) -> Result<u64, ContractError> {
+        Self::require_admin(&env);
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        compliance::file_sar(
+            &env,
+            &Self::load_admin(&env),
+            vault_id,
+            &vault.owner,
+            reason,
+            false,
+        )
+    }
+
+    /// Advances the filing status of a SAR (admin-only). Transitions are
+    /// forward-only; moving to `Submitted` requires a `submission_ref`.
+    ///
+    /// # Errors
+    /// * `SarNotFound`, `InvalidSarTransition`, `InvalidComplianceInput`.
+    pub fn update_sar_status(
+        env: Env,
+        sar_id: u64,
+        status: compliance::SarStatus,
+        submission_ref: Bytes,
+    ) -> Result<compliance::SarRecord, ContractError> {
+        Self::require_admin(&env);
+        compliance::update_sar_status(
+            &env,
+            &Self::load_admin(&env),
+            sar_id,
+            status,
+            submission_ref,
+        )
+    }
+
+    /// Returns a SAR by id.
+    pub fn get_sar(env: Env, sar_id: u64) -> Result<compliance::SarRecord, ContractError> {
+        compliance::get_sar(&env, sar_id)
+    }
+
+    /// Returns the ids of all SARs filed against `vault_id`.
+    pub fn get_vault_sars(env: Env, vault_id: u64) -> Vec<u64> {
+        compliance::get_vault_sars(&env, vault_id)
+    }
+
+    /// Generates the submission package for a SAR (admin-only): the SAR, a
+    /// snapshot of the vault, the subject's KYC/AML/blacklist state and recent
+    /// compliance audit entries, sealed with a sha256 content digest.
+    pub fn generate_sar_report(
+        env: Env,
+        sar_id: u64,
+    ) -> Result<compliance::SarReport, ContractError> {
+        Self::require_admin(&env);
+        let sar = compliance::get_sar(&env, sar_id)?;
+        let vault = Self::try_load_vault(&env, sar.vault_id).ok_or(ContractError::VaultNotFound)?;
+        compliance::generate_sar_report(&env, sar_id, &vault)
+    }
+
+    // ── Issue #554: Compliance report generation ─────────────────────────────
+
+    /// Generates and stores a compliance report for `period` (admin-only),
+    /// aggregating AML checks, KYC status, blacklist decisions, SARs and vault
+    /// transactions at daily granularity.
+    ///
+    /// # Errors
+    /// * `InvalidCompliancePeriod` — `end <= start` or the period spans more
+    ///   than `compliance::MAX_REPORT_PERIOD_DAYS` days.
+    pub fn generate_compliance_report(
+        env: Env,
+        period: compliance::CompliancePeriod,
+    ) -> Result<compliance::ComplianceReport, ContractError> {
+        Self::require_admin(&env);
+        compliance::generate_report(&env, &Self::load_admin(&env), period)
+    }
+
+    /// Returns a stored compliance report.
+    pub fn get_compliance_report(
+        env: Env,
+        report_id: u64,
+    ) -> Result<compliance::ComplianceReport, ContractError> {
+        compliance::get_report(&env, report_id)
+    }
+
+    /// Attaches an ed25519 signature over the report digest (admin-only).
+    /// The signature is verified on-chain; an invalid signature aborts.
+    pub fn sign_compliance_report(
+        env: Env,
+        report_id: u64,
+        signer: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<compliance::ComplianceReport, ContractError> {
+        Self::require_admin(&env);
+        compliance::sign_report(&env, &Self::load_admin(&env), report_id, signer, signature)
+    }
+
+    /// Recomputes a report's digest and re-verifies its signature, if any.
+    pub fn verify_compliance_report(
+        env: Env,
+        report_id: u64,
+    ) -> Result<compliance::ReportVerification, ContractError> {
+        compliance::verify_report(&env, report_id)
+    }
+
+    // ── Issue #555: Regulatory change management ─────────────────────────────
+
+    /// Registers a new regulatory requirement at version 1 (admin-only) and
+    /// publishes an `Introduced` change notice.
+    pub fn register_regulatory_requirement(
+        env: Env,
+        code: Bytes,
+        jurisdiction: Bytes,
+        description: Bytes,
+        rule_hash: BytesN<32>,
+        effective_date: u64,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        Self::require_admin(&env);
+        compliance::register_requirement(
+            &env,
+            &Self::load_admin(&env),
+            code,
+            jurisdiction,
+            description,
+            rule_hash,
+            effective_date,
+        )
+    }
+
+    /// Publishes a new version of a requirement (admin-only). The previous
+    /// version is kept in history as `Superseded`.
+    pub fn amend_regulatory_requirement(
+        env: Env,
+        requirement_id: u64,
+        description: Bytes,
+        rule_hash: BytesN<32>,
+        effective_date: u64,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        Self::require_admin(&env);
+        compliance::amend_requirement(
+            &env,
+            &Self::load_admin(&env),
+            requirement_id,
+            description,
+            rule_hash,
+            effective_date,
+        )
+    }
+
+    /// Records the implementation date of a requirement's current version
+    /// (admin-only).
+    pub fn mark_requirement_implemented(
+        env: Env,
+        requirement_id: u64,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        Self::require_admin(&env);
+        compliance::mark_requirement_implemented(&env, &Self::load_admin(&env), requirement_id)
+    }
+
+    /// Retires a requirement (admin-only).
+    pub fn retire_regulatory_requirement(
+        env: Env,
+        requirement_id: u64,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        Self::require_admin(&env);
+        compliance::retire_requirement(&env, &Self::load_admin(&env), requirement_id)
+    }
+
+    /// Returns the current version of a requirement.
+    pub fn get_regulatory_requirement(
+        env: Env,
+        requirement_id: u64,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        compliance::get_requirement(&env, requirement_id)
+    }
+
+    /// Returns a specific historical version of a requirement.
+    pub fn get_requirement_version(
+        env: Env,
+        requirement_id: u64,
+        version: u32,
+    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
+        compliance::get_requirement_version(&env, requirement_id, version)
+    }
+
+    /// Returns every version of a requirement, oldest first.
+    pub fn get_requirement_history(
+        env: Env,
+        requirement_id: u64,
+    ) -> Result<Vec<compliance::RegulatoryRequirement>, ContractError> {
+        compliance::get_requirement_history(&env, requirement_id)
+    }
+
+    /// Returns the ids of all registered requirements.
+    pub fn list_regulatory_requirements(env: Env) -> Vec<u64> {
+        compliance::list_requirements(&env)
+    }
+
+    /// Returns active requirements whose current version is not implemented.
+    pub fn get_pending_implementations(env: Env) -> Vec<compliance::RegulatoryRequirement> {
+        compliance::get_pending_implementations(&env)
+    }
+
+    /// Returns whether a requirement is active and past its effective date.
+    pub fn is_requirement_effective(env: Env, requirement_id: u64) -> Result<bool, ContractError> {
+        compliance::is_requirement_effective(&env, requirement_id)
+    }
+
+    /// Returns up to `limit` regulatory change notices after `after_id`.
+    pub fn get_regulatory_notices(
+        env: Env,
+        after_id: u64,
+        limit: u32,
+    ) -> Vec<compliance::RegulatoryChangeNotice> {
+        compliance::get_notices(&env, after_id, limit)
+    }
+
+    /// Returns the change notices `user` has not acknowledged yet.
+    pub fn get_pending_regulatory_notices(
+        env: Env,
+        user: Address,
+    ) -> Vec<compliance::RegulatoryChangeNotice> {
+        compliance::get_pending_notices(&env, &user)
+    }
+
+    /// Acknowledges all regulatory change notices up to `notice_id`.
+    pub fn acknowledge_regulatory_notices(
+        env: Env,
+        user: Address,
+        notice_id: u64,
+    ) -> Result<(), ContractError> {
+        user.require_auth();
+        compliance::acknowledge_notices(&env, &user, notice_id)
     }
 }
