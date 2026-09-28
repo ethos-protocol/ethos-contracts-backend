@@ -1,12 +1,24 @@
 pub mod acl;
+pub mod alert_rules;
+pub mod automated_rollback;
+pub mod blue_green;
+pub mod analytics;
 pub mod anomaly_detection;
+pub mod anomaly_explanation;
 pub mod audit;
+pub mod lazy_metadata;
+pub mod materialized_views;
+pub mod query_optimizer;
+#[cfg(test)]
+mod property_tests;
 pub mod backup_validation;
 pub mod batch_conditional_completion;
 pub mod batching;
 pub mod bulkhead;
+pub mod bulk_operations;
 pub mod cache;
 pub mod cache_partition;
+pub mod canary;
 pub mod cdc_lag;
 pub mod chaos;
 pub mod circuit_breaker;
@@ -26,16 +38,26 @@ pub mod error_context;
 pub mod event_sourcing;
 pub mod fallback;
 pub mod feature_flags;
+pub mod fraud_detection;
 pub mod graphql;
 pub mod handlers;
 pub mod health;
 pub mod health_routing;
 pub mod incidents;
+pub mod job_queue;
 pub mod load_shedding;
 pub mod message_queue;
 pub mod metrics;
 #[cfg(test)]
 mod migration_rollback_tests;
+#[cfg(test)]
+mod response_caching_tests;
+#[cfg(test)]
+mod circuit_breaker_tests;
+#[cfg(test)]
+mod api_versioning_tests;
+#[cfg(test)]
+mod bulk_operations_tests;
 pub mod models;
 pub mod multilevel_cache;
 pub mod notifications;
@@ -46,6 +68,7 @@ pub mod profiler;
 pub mod query_cache;
 pub mod replay;
 pub mod request_queue;
+pub mod request_signing;
 pub mod retention;
 pub mod retry_policy;
 pub mod routes;

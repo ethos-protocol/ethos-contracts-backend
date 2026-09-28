@@ -160,6 +160,54 @@ impl InvalidationStrategy {
     }
 }
 
+/// Public interface for cache invalidation strategy
+pub struct CacheInvalidationStrategy {
+    dependencies: Arc<Mutex<HashMap<String, Vec<String>>>>,
+}
+
+impl CacheInvalidationStrategy {
+    pub fn new() -> Self {
+        Self {
+            dependencies: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn register_dependencies(&self, key: &str, deps: Vec<&str>) {
+        let mut map = self.dependencies.lock().unwrap();
+        map.insert(key.to_string(), deps.iter().map(|s| s.to_string()).collect());
+    }
+
+    pub fn get_dependencies(&self, key: &str) -> Option<Vec<String>> {
+        self.dependencies.lock().unwrap().get(key).cloned()
+    }
+
+    pub fn invalidate(&self, key: &str) {
+        let mut map = self.dependencies.lock().unwrap();
+        map.remove(key);
+    }
+
+    pub fn invalidate_pattern(&self, pattern: &str) {
+        let mut map = self.dependencies.lock().unwrap();
+        let keys_to_remove: Vec<_> = map
+            .keys()
+            .filter(|k| {
+                let pat = pattern.replace("*", "");
+                k.starts_with(&pat)
+            })
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            map.remove(&key);
+        }
+    }
+}
+
+impl Default for CacheInvalidationStrategy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Event-Driven Cache Invalidator ────────────────────────────────────────────
 
 pub struct CacheInvalidator {

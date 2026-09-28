@@ -74,4 +74,5 @@ signature = "2"
 [dev-dependencies]
 tokio-test = "0.4"
 mockito = "1.4"
+proptest = { version = "1.4", default-features = false, features = ["std"] }
 

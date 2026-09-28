@@ -5,13 +5,16 @@
 // currently emits them.
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, symbol_short, token, vec, xdr::ToXdr,
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
-pub mod compliance;
+pub mod aml;
 pub mod composition_rules;
+pub mod compliance;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
@@ -111,6 +114,13 @@ use types::{
     VESTING_ROLLOVER_TOPIC, VESTING_SCHEDULE_ADDED_TOPIC, VESTING_STAGGER_TOPIC,
     WITHDRAWAL_ESCROW_CREATED_TOPIC, WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC,
     WITHDRAWAL_RATE_LIMITED_TOPIC, WITHDRAWAL_ROLLBACK_TOPIC,
+    // Issue #563: cursor pagination
+    BatchCheckInResult, VaultConfigTemplate, VaultPage, VaultSortField,
+    // Issue #560: Merkle history proofs
+    MerkleLeaf, MerkleProof,
+    // New event topics
+    HISTORY_PROOF_TOPIC, HISTORY_ROOT_TOPIC, VAULT_LIST_TOPIC, VAULT_TMPL_REF_TOPIC,
+    VAULT_TMPL_REG_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -131,6 +141,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_breach_detection_tests;
+#[cfg(test)]
 mod passkey_cap_tests;
 #[cfg(test)]
 mod passkey_delegation_tests;
@@ -138,6 +152,10 @@ mod passkey_delegation_tests;
 mod passkey_escrow_tests;
 #[cfg(test)]
 mod passkey_expiry_notification_tests;
+#[cfg(test)]
+mod passkey_metadata_tests;
+#[cfg(test)]
+mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
@@ -149,7 +167,23 @@ mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
 #[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
+#[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
+mod withdrawal_notification_confirmation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
+#[cfg(test)]
+mod withdrawal_rate_limit_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
+#[cfg(test)]
+mod multisig_withdrawal_tests;
+#[cfg(test)]
+mod withdrawal_rollback_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -399,20 +433,8 @@ pub enum ContractError {
     UpgradeStorageSchemaChanged = 128,
     UpgradeErrorCodesReduced = 129,
     UpgradeManifestNotSet = 130,
-    // Issues #552-#555: compliance audit trail, SAR, reports, regulatory changes
-    InvalidComplianceInput = 131,
-    AddressBlacklisted = 132,
-    SarNotFound = 133,
-    InvalidSarReason = 134,
-    InvalidSarTransition = 135,
-    InvalidCompliancePeriod = 136,
-    ComplianceReportNotFound = 137,
-    ReportAlreadySigned = 138,
-    ReportDigestMismatch = 139,
-    RequirementNotFound = 140,
-    RequirementRetired = 141,
-    RequirementAlreadyImplemented = 142,
-    NoticeNotFound = 143,
+    // Issue #547: AML screening rejected a beneficiary / transfer recipient
+    AmlFlaggedAddress = 131,
 }
 
 #[contract]
@@ -1256,6 +1278,7 @@ impl TtlVaultContract {
             YieldDistributionMode::DistributeToBeneficiary => {
                 // Transfer yield to beneficiary
                 let token_client = token::Client::new(&env, &vault.token_address);
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -1291,6 +1314,7 @@ impl TtlVaultContract {
 
                 if beneficiary_amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &vault.beneficiary);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &vault.beneficiary,
@@ -1356,6 +1380,55 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    // --- AML screening (Issue #547) ---
+
+    /// Returns `true` when `address` passes AML screening: it is not on the
+    /// local flag list and, if a sanctions oracle is configured, the oracle
+    /// does not report it as sanctioned (oracle failures fail closed).
+    pub fn check_aml_compliance(env: Env, address: Address) -> bool {
+        aml::check_compliance(&env, &address)
+    }
+
+    /// Admin-only: configure (or clear with `None`) the on-chain sanctions
+    /// oracle, which must expose `is_sanctioned(Address) -> bool`.
+    pub fn set_aml_oracle(env: Env, admin: Address, oracle: Option<Address>) {
+        aml::set_oracle(&env, &admin, oracle);
+    }
+
+    /// Returns the configured sanctions oracle, if any.
+    pub fn get_aml_oracle(env: Env) -> Option<Address> {
+        aml::get_oracle(&env)
+    }
+
+    /// Admin-only: configure (or clear) the AML reporter — typically the
+    /// backend service that screens addresses with an AML provider and
+    /// mirrors hits on-chain.
+    pub fn set_aml_reporter(env: Env, admin: Address, reporter: Option<Address>) {
+        aml::set_reporter(&env, &admin, reporter);
+    }
+
+    /// Returns the configured AML reporter, if any.
+    pub fn get_aml_reporter(env: Env) -> Option<Address> {
+        aml::get_reporter(&env)
+    }
+
+    /// Admin or AML reporter: flag `address`, blocking it from being added as
+    /// a beneficiary and from receiving any transfer out of a vault.
+    pub fn flag_aml_address(env: Env, caller: Address, address: Address, reason: String) {
+        aml::flag_address(&env, &caller, address, reason);
+    }
+
+    /// Admin or AML reporter: remove a flag (e.g. after a false positive is
+    /// cleared by compliance review).
+    pub fn unflag_aml_address(env: Env, caller: Address, address: Address) {
+        aml::unflag_address(&env, &caller, address);
+    }
+
+    /// Returns the flag record for `address`, if it is locally flagged.
+    pub fn get_aml_flag(env: Env, address: Address) -> Option<aml::AmlFlag> {
+        aml::get_flag(&env, &address)
     }
 
     /// Returns the current protocol-level configuration as a typed struct — Issue #810.
@@ -1587,6 +1660,12 @@ impl TtlVaultContract {
         if owner == beneficiary {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
+        // Issue #547: screen the beneficiary against AML/sanctions data.
+        aml::require_compliant(&env, &beneficiary);
+
+        // Issue #551: owner and beneficiary must pass blacklist/allowlist screening
+        Self::assert_compliant(&env, &owner);
+        Self::assert_compliant(&env, &beneficiary);
 
         // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
         let dup_key =
@@ -1842,6 +1921,7 @@ impl TtlVaultContract {
                 let total_penalty = (penalty_per * missed as i128).min(vault.balance);
                 if total_penalty > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &recipient);
                     token_client.transfer(
                         &env.current_contract_address(),
                         &recipient,
@@ -1931,6 +2011,11 @@ impl TtlVaultContract {
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        Self::assert_compliant(&env, &from);
+        if let Err(e) = compliance::check_kyc_for_amount(&env, &from, amount) {
+            panic_with_error!(&env, e);
+        }
         if vault.status != ReleaseStatus::Locked {
             panic_with_error!(&env, ContractError::AlreadyReleased);
         }
@@ -1959,6 +2044,17 @@ impl TtlVaultContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
         Self::save_vault(&env, vault_id, &vault);
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Deposit,
+            vault_id,
+            &from,
+            &env.current_contract_address(),
+            &vault.token_address,
+            amount,
+            &from,
+        );
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
         compliance::record_transaction(&env, amount, true);
@@ -2217,9 +2313,36 @@ impl TtlVaultContract {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
         }
 
+        // Issues #551 / #548: compliance screening and high-value KYC gate
+        if let Err(e) = compliance::check_address(&env, &vault.owner)
+            .and_then(|()| compliance::check_kyc_for_amount(&env, &vault.owner, amount))
+        {
+            Self::record_withdrawal_audit(
+                &env,
+                vault_id,
+                &caller,
+                amount,
+                false,
+                "Compliance check failed",
+            );
+            return Err(e);
+        }
+
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Issues #549 / #550: record for reporting and run threshold monitoring
+        compliance::record_transaction(
+            &env,
+            compliance::TxKind::Withdrawal,
+            vault_id,
+            &env.current_contract_address(),
+            &vault.owner,
+            &vault.token_address,
+            amount,
+            &vault.owner,
+        );
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -2651,6 +2774,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &escrow.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &escrow.beneficiary,
@@ -3212,6 +3336,7 @@ impl TtlVaultContract {
                     .publish((BURN_EVENT_TOPIC, vault_id), burn_amount);
             }
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -3559,6 +3684,7 @@ impl TtlVaultContract {
 
         if vault.beneficiaries.is_empty() {
             // Single-beneficiary path: send full amount to primary beneficiary.
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (symbol_short!("partial"), vault_id),
@@ -3575,6 +3701,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -3638,6 +3765,9 @@ impl TtlVaultContract {
                 return Err(ContractError::InvalidBeneficiary);
             }
             Self::assert_not_zero_address(&env, &entry.address);
+            if !aml::check_compliance(&env, &entry.address) {
+                return Err(ContractError::AmlFlaggedAddress);
+            }
         }
         vault.beneficiaries = beneficiaries.clone();
         Self::save_vault(&env, vault_id, &vault);
@@ -3741,6 +3871,9 @@ impl TtlVaultContract {
         }
         if address == vault.owner {
             return Err(ContractError::InvalidBeneficiary);
+        }
+        if !aml::check_compliance(&env, &address) {
+            return Err(ContractError::AmlFlaggedAddress);
         }
 
         // Check if beneficiary already exists
@@ -4498,6 +4631,7 @@ impl TtlVaultContract {
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &pending.beneficiary);
         token_client.transfer(
             &env.current_contract_address(),
             &pending.beneficiary,
@@ -4683,6 +4817,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (CLAIM_VEST_TOPIC, vault_id),
@@ -4698,6 +4833,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -5308,6 +5444,7 @@ impl TtlVaultContract {
 
                 if amount > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
+                    crate::aml::require_compliant(&env, &caller);
                     token_client.transfer(&env.current_contract_address(), &caller, &amount);
                     vault.balance -= amount;
                     entry.claimed_installments = unlocked;
@@ -5635,6 +5772,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -5658,6 +5796,7 @@ impl TtlVaultContract {
                     total_claimable * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -6282,6 +6421,7 @@ impl TtlVaultContract {
 
                     if unvested > 0 {
                         let token_client = token::Client::new(&env, &vault.token_address);
+                        crate::aml::require_compliant(&env, &forfeit_cfg.forfeiture_recipient);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &forfeit_cfg.forfeiture_recipient,
@@ -6565,6 +6705,7 @@ impl TtlVaultContract {
         );
 
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &beneficiary);
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount);
 
         env.events().publish(
@@ -6846,6 +6987,9 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBeneficiary);
         }
         Self::assert_not_zero_address(&env, &new_beneficiary);
+        if !aml::check_compliance(&env, &new_beneficiary) {
+            return Err(ContractError::AmlFlaggedAddress);
+        }
 
         let now = env.ledger().timestamp();
         // Timelock: 24 hours
@@ -7936,6 +8080,7 @@ impl TtlVaultContract {
 
         let amount = vault.balance;
         let token_client = token::Client::new(&env, &vault.token_address);
+        crate::aml::require_compliant(&env, &claim);
         token_client.transfer(&env.current_contract_address(), &claim, &amount);
 
         vault.balance = 0;
@@ -8684,6 +8829,14 @@ impl TtlVaultContract {
     fn require_admin(env: &Env) {
         let admin = Self::load_admin(env);
         admin.require_auth();
+    }
+
+    /// Panics with the compliance error if `address` is blacklisted or, in
+    /// allowlist mode, not allowlisted — Issue #551.
+    fn assert_compliant(env: &Env, address: &Address) {
+        if let Err(e) = compliance::check_address(env, address) {
+            panic_with_error!(env, e);
+        }
     }
 
     fn load_admin(env: &Env) -> Address {
@@ -10739,6 +10892,7 @@ impl TtlVaultContract {
                 let beneficiary = Self::get_delegated_beneficiary(&env, vault_id)
                     .unwrap_or(vault.beneficiary.clone());
 
+                crate::aml::require_compliant(&env, &beneficiary);
                 token_client.transfer(&env.current_contract_address(), &beneficiary, &entry.amount);
 
                 vault.balance -= entry.amount;
@@ -13142,6 +13296,7 @@ impl TtlVaultContract {
                 release_amount * (entry.bps as i128) / (total_qualifying_bps as i128)
             };
             if share > 0 {
+                crate::aml::require_compliant(env, &entry.address);
                 token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 env.events().publish(
                     (RELEASE_TOPIC,),
@@ -13807,6 +13962,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
             env.events().publish(
                 (VESTING_CATCHUP_CLAIMED_TOPIC, vault_id),
@@ -13822,6 +13978,7 @@ impl TtlVaultContract {
                     amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -14001,6 +14158,7 @@ impl TtlVaultContract {
             // Pay base without bonus
             let token_client = token::Client::new(&env, &vault.token_address);
             if vault.beneficiaries.is_empty() {
+                crate::aml::require_compliant(&env, &vault.beneficiary);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &vault.beneficiary,
@@ -14020,6 +14178,7 @@ impl TtlVaultContract {
                         fallback * (entry.bps as i128) / 10_000
                     };
                     if share > 0 {
+                        crate::aml::require_compliant(&env, &entry.address);
                         token_client.transfer(
                             &env.current_contract_address(),
                             &entry.address,
@@ -14051,6 +14210,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
 
         if vault.beneficiaries.is_empty() {
+            crate::aml::require_compliant(&env, &vault.beneficiary);
             token_client.transfer(
                 &env.current_contract_address(),
                 &vault.beneficiary,
@@ -14070,6 +14230,7 @@ impl TtlVaultContract {
                     total_amount * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
+                    crate::aml::require_compliant(&env, &entry.address);
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
                 distributed += share;
@@ -15442,355 +15603,271 @@ impl TtlVaultContract {
         ))
     }
 
-    // ── Issue #552: Compliance audit trail ───────────────────────────────────
+    // --- compliance (Issues #548, #549, #550, #551) ---
 
-    /// Returns the compliance audit trail for `address`: AML checks, KYC
-    /// verifications, blacklist decisions, SAR activity, report generation and
-    /// regulatory acknowledgements, oldest first. The most recent
-    /// `compliance::MAX_AUDIT_TRAIL_ENTRIES` entries are retained on-chain.
-    pub fn get_compliance_audit_trail(
-        env: Env,
-        address: Address,
-    ) -> Vec<compliance::ComplianceAuditEntry> {
-        compliance::get_audit_trail(&env, &address)
-    }
-
-    /// Records an AML screening result for `address` (admin-only).
+    /// Blacklist `address` with a recorded `reason` (admin only) — Issue #551.
     ///
-    /// A check whose `risk_score` (0–100) meets the AML threshold is flagged;
-    /// if `vault_id` is given, a SAR is filed automatically against that vault.
+    /// Blacklisted addresses cannot create vaults, deposit, or withdraw.
     ///
     /// # Errors
-    /// * `InvalidComplianceInput` — score above 100 or invalid `provider`.
-    /// * `VaultNotFound` — `vault_id` does not exist.
-    pub fn record_aml_check(
+    /// * `ContractError::InvalidBlacklistReason` - reason is empty or longer
+    ///   than `compliance::MAX_REASON_LEN` bytes
+    pub fn blacklist_address(
         env: Env,
         address: Address,
-        vault_id: Option<u64>,
-        risk_score: u32,
-        provider: Bytes,
-    ) -> Result<compliance::AmlCheckRecord, ContractError> {
+        reason: String,
+    ) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        let vault = match vault_id {
-            Some(id) => Some((
-                id,
-                Self::try_load_vault(&env, id)
-                    .ok_or(ContractError::VaultNotFound)?
-                    .owner,
-            )),
-            None => None,
-        };
-        compliance::record_aml_check(
-            &env,
-            &Self::load_admin(&env),
-            &address,
-            vault,
-            risk_score,
-            provider,
-        )
+        let admin = Self::load_admin(&env);
+        compliance::blacklist_address(&env, &address, reason, &admin)
     }
 
-    /// Returns the most recent AML check recorded for `address`.
-    pub fn get_last_aml_check(env: Env, address: Address) -> Option<compliance::AmlCheckRecord> {
-        compliance::get_last_aml_check(&env, &address)
-    }
-
-    /// Sets the AML risk score (1–100) at which checks are flagged (admin-only).
-    pub fn set_aml_risk_threshold(env: Env, threshold: u32) -> Result<(), ContractError> {
+    /// Remove `address` from the blacklist (admin only). Returns `false` if
+    /// the address was not blacklisted.
+    pub fn remove_from_blacklist(env: Env, address: Address) -> bool {
         Self::require_admin(&env);
-        compliance::set_aml_threshold(&env, threshold)
+        compliance::remove_from_blacklist(&env, &address)
     }
 
-    /// Returns the AML risk score threshold.
-    pub fn get_aml_risk_threshold(env: Env) -> u32 {
-        compliance::get_aml_threshold(&env)
+    /// Returns the blacklist entry (reason, author, timestamp) for `address`.
+    pub fn get_blacklist_entry(env: Env, address: Address) -> Option<compliance::BlacklistEntry> {
+        compliance::get_blacklist_entry(&env, &address)
     }
 
-    /// Records a KYC verification outcome for `address` (admin-only).
-    /// `expires_at` of 0 means the verification does not expire.
-    pub fn record_kyc_verification(
+    /// Add `address` to the allowlist (admin only) — Issue #551.
+    pub fn add_to_allowlist(env: Env, address: Address) {
+        Self::require_admin(&env);
+        compliance::allowlist_address(&env, &address);
+    }
+
+    /// Remove `address` from the allowlist (admin only). Returns `false` if
+    /// the address was not allowlisted.
+    pub fn remove_from_allowlist(env: Env, address: Address) -> bool {
+        Self::require_admin(&env);
+        compliance::remove_from_allowlist(&env, &address)
+    }
+
+    /// Returns whether `address` is on the allowlist.
+    pub fn is_allowlisted(env: Env, address: Address) -> bool {
+        compliance::is_allowlisted(&env, &address)
+    }
+
+    /// Enable or disable allowlist mode (admin only). While enabled, only
+    /// allowlisted addresses are compliant.
+    pub fn set_allowlist_enforced(env: Env, enforced: bool) {
+        Self::require_admin(&env);
+        compliance::set_allowlist_enforced(&env, enforced);
+    }
+
+    /// Returns whether allowlist mode is enabled.
+    pub fn is_allowlist_enforced(env: Env) -> bool {
+        compliance::is_allowlist_enforced(&env)
+    }
+
+    /// Returns `true` when `address` is not blacklisted and, if allowlist
+    /// mode is enabled, is allowlisted — Issue #551.
+    pub fn is_address_compliant(env: Env, address: Address) -> bool {
+        compliance::is_address_compliant(&env, &address)
+    }
+
+    /// Register the address of the KYC provider allowed to attest
+    /// verifications (admin only) — Issue #548.
+    pub fn set_kyc_provider(env: Env, provider: Address) {
+        Self::require_admin(&env);
+        compliance::set_kyc_provider(&env, &provider);
+    }
+
+    /// Returns the registered KYC provider, if any.
+    pub fn get_kyc_provider(env: Env) -> Option<Address> {
+        compliance::get_kyc_provider(&env)
+    }
+
+    /// Record the KYC provider's verification of `address` — Issue #548.
+    ///
+    /// Requires the registered provider's auth. Returns `false` without
+    /// storing anything when `kyc_data` is unusable (zero level, zero
+    /// reference hash, or `expires_at` not in the future).
+    ///
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    pub fn verify_kyc(
         env: Env,
         address: Address,
-        status: compliance::KycStatus,
-        provider: Bytes,
-        expires_at: u64,
-    ) -> Result<compliance::KycRecord, ContractError> {
-        Self::require_admin(&env);
-        compliance::record_kyc_verification(
-            &env,
-            &Self::load_admin(&env),
-            &address,
-            status,
-            provider,
-            expires_at,
-        )
+        kyc_data: compliance::KycData,
+    ) -> Result<bool, ContractError> {
+        compliance::verify_kyc(&env, &address, kyc_data)
     }
 
-    /// Returns the KYC record for `address` (`Unverified` if none exists).
-    pub fn get_kyc_status(env: Env, address: Address) -> compliance::KycRecord {
+    /// Revoke the KYC verification of `address` (KYC provider only).
+    ///
+    /// # Errors
+    /// * `ContractError::KycProviderNotSet` - no provider has been registered
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        compliance::revoke_kyc_as_provider(&env, &address)
+    }
+
+    /// Revoke the KYC verification of `address` (admin only).
+    ///
+    /// # Errors
+    /// * `ContractError::KycNotFound` - `address` has no KYC record
+    pub fn admin_revoke_kyc(env: Env, address: Address) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::revoke_kyc(&env, &address)
+    }
+
+    /// Returns the stored KYC record for `address`, if any.
+    pub fn get_kyc_record(env: Env, address: Address) -> Option<compliance::KycRecord> {
         compliance::get_kyc_record(&env, &address)
     }
 
-    /// Adds or removes `address` from the compliance blacklist (admin-only).
-    /// Blacklisted addresses cannot create vaults or deposit.
-    pub fn set_compliance_blacklist(
+    /// Returns `true` when `address` holds a non-revoked, unexpired KYC
+    /// verification.
+    pub fn is_kyc_verified(env: Env, address: Address) -> bool {
+        compliance::is_kyc_verified(&env, &address)
+    }
+
+    /// Set the amount at or above which deposits and withdrawals require a
+    /// valid KYC verification (admin only). `0` disables the requirement.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - `amount` is negative
+    pub fn set_kyc_high_value_threshold(env: Env, amount: i128) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_kyc_high_value_threshold(&env, amount)
+    }
+
+    /// Returns the high-value KYC threshold (`0` = disabled).
+    pub fn get_kyc_high_value_threshold(env: Env) -> i128 {
+        compliance::get_kyc_high_value_threshold(&env)
+    }
+
+    /// Configure regulatory reporting thresholds (admin only) — Issue #550.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidConfig` - a threshold is negative, or a
+    ///   cumulative threshold is set with a zero window
+    pub fn set_reporting_thresholds(
+        env: Env,
+        config: compliance::ThresholdConfig,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        compliance::set_threshold_config(&env, &config)
+    }
+
+    /// Returns the configured reporting thresholds, if any.
+    pub fn get_reporting_thresholds(env: Env) -> Option<compliance::ThresholdConfig> {
+        compliance::get_threshold_config(&env)
+    }
+
+    /// Returns the rolling cumulative transfer volume tracked for `address`.
+    pub fn get_cumulative_volume(
         env: Env,
         address: Address,
-        blacklisted: bool,
-        reason: Bytes,
-    ) -> Result<compliance::BlacklistRecord, ContractError> {
-        Self::require_admin(&env);
-        compliance::set_blacklist(&env, &Self::load_admin(&env), &address, blacklisted, reason)
+    ) -> Option<compliance::CumulativeVolume> {
+        compliance::get_cumulative_volume(&env, &address)
     }
 
-    /// Returns whether `address` is currently blacklisted.
-    pub fn is_compliance_blacklisted(env: Env, address: Address) -> bool {
-        compliance::is_blacklisted(&env, &address)
+    /// Returns the compliance alert with `alert_id`, if any.
+    pub fn get_compliance_alert(env: Env, alert_id: u64) -> Option<compliance::ComplianceAlert> {
+        compliance::get_alert(&env, alert_id)
     }
 
-    /// Returns the latest blacklist decision for `address`, if any.
-    pub fn get_blacklist_record(env: Env, address: Address) -> Option<compliance::BlacklistRecord> {
-        compliance::get_blacklist_record(&env, &address)
+    /// Returns the number of compliance alerts raised so far.
+    pub fn get_compliance_alert_count(env: Env) -> u64 {
+        compliance::get_alert_count(&env)
     }
 
-    // ── Issue #553: Suspicious Activity Reporting ────────────────────────────
-
-    /// Files a Suspicious Activity Report against `vault_id` (admin-only).
-    /// The vault owner is recorded as the SAR subject. Returns the SAR id.
+    /// Mark a compliance alert as reviewed (admin only).
     ///
     /// # Errors
-    /// * `VaultNotFound` — the vault does not exist.
-    /// * `InvalidSarReason` — `reason` is empty or longer than
-    ///   `compliance::MAX_SAR_REASON_LEN`.
-    pub fn file_sar(env: Env, vault_id: u64, reason: Bytes) -> Result<u64, ContractError> {
+    /// * `ContractError::AlertNotFound` - no alert with `alert_id`
+    pub fn acknowledge_compliance_alert(env: Env, alert_id: u64) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
-        compliance::file_sar(
-            &env,
-            &Self::load_admin(&env),
-            vault_id,
-            &vault.owner,
-            reason,
-            false,
-        )
+        compliance::acknowledge_alert(&env, alert_id)
     }
 
-    /// Advances the filing status of a SAR (admin-only). Transitions are
-    /// forward-only; moving to `Submitted` requires a `submission_ref`.
+    /// Returns the recorded transaction with `tx_id`, if any — Issue #549.
+    pub fn get_transaction(env: Env, tx_id: u64) -> Option<compliance::TransactionRecord> {
+        compliance::get_transaction(&env, tx_id)
+    }
+
+    /// Returns the number of transactions in the given inclusive date range
+    /// (unix seconds).
     ///
     /// # Errors
-    /// * `SarNotFound`, `InvalidSarTransition`, `InvalidComplianceInput`.
-    pub fn update_sar_status(
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn count_transactions(
         env: Env,
-        sar_id: u64,
-        status: compliance::SarStatus,
-        submission_ref: Bytes,
-    ) -> Result<compliance::SarRecord, ContractError> {
-        Self::require_admin(&env);
-        compliance::update_sar_status(
-            &env,
-            &Self::load_admin(&env),
-            sar_id,
-            status,
-            submission_ref,
-        )
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<u64, ContractError> {
+        compliance::count_transactions(&env, start_date, end_date)
     }
 
-    /// Returns a SAR by id.
-    pub fn get_sar(env: Env, sar_id: u64) -> Result<compliance::SarRecord, ContractError> {
-        compliance::get_sar(&env, sar_id)
-    }
-
-    /// Returns the ids of all SARs filed against `vault_id`.
-    pub fn get_vault_sars(env: Env, vault_id: u64) -> Vec<u64> {
-        compliance::get_vault_sars(&env, vault_id)
-    }
-
-    /// Generates the submission package for a SAR (admin-only): the SAR, a
-    /// snapshot of the vault, the subject's KYC/AML/blacklist state and recent
-    /// compliance audit entries, sealed with a sha256 content digest.
-    pub fn generate_sar_report(
-        env: Env,
-        sar_id: u64,
-    ) -> Result<compliance::SarReport, ContractError> {
-        Self::require_admin(&env);
-        let sar = compliance::get_sar(&env, sar_id)?;
-        let vault = Self::try_load_vault(&env, sar.vault_id).ok_or(ContractError::VaultNotFound)?;
-        compliance::generate_sar_report(&env, sar_id, &vault)
-    }
-
-    // ── Issue #554: Compliance report generation ─────────────────────────────
-
-    /// Generates and stores a compliance report for `period` (admin-only),
-    /// aggregating AML checks, KYC status, blacklist decisions, SARs and vault
-    /// transactions at daily granularity.
+    /// Export transactions in the inclusive date range (unix seconds) as a
+    /// UTF-8 CSV document — Issue #549.
+    ///
+    /// Columns: `tx_id,timestamp,kind,vault_id,from,to,token,amount,flagged`.
+    /// Addresses are hex-encoded XDR `ScAddress` values. At most
+    /// `compliance::MAX_EXPORT_ROWS` rows are returned; use
+    /// `count_transactions` to detect ranges that need splitting.
     ///
     /// # Errors
-    /// * `InvalidCompliancePeriod` — `end <= start` or the period spans more
-    ///   than `compliance::MAX_REPORT_PERIOD_DAYS` days.
-    pub fn generate_compliance_report(
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn export_transactions(
         env: Env,
-        period: compliance::CompliancePeriod,
-    ) -> Result<compliance::ComplianceReport, ContractError> {
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<Bytes, ContractError> {
+        compliance::export_transactions(&env, start_date, end_date).map(|(csv, _)| csv)
+    }
+
+    /// Returns the SHA-256 digest of the CSV `export_transactions` produces
+    /// for the range; this is the message the report signer signs.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
+    pub fn compliance_report_digest(
+        env: Env,
+        start_date: u64,
+        end_date: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        compliance::report_digest(&env, start_date, end_date)
+    }
+
+    /// Register the ed25519 public key allowed to sign compliance reports
+    /// (admin only) — Issue #549.
+    pub fn set_report_signer(env: Env, public_key: BytesN<32>) {
         Self::require_admin(&env);
-        compliance::generate_report(&env, &Self::load_admin(&env), period)
+        compliance::set_report_signer(&env, &public_key);
     }
 
-    /// Returns a stored compliance report.
-    pub fn get_compliance_report(
-        env: Env,
-        report_id: u64,
-    ) -> Result<compliance::ComplianceReport, ContractError> {
-        compliance::get_report(&env, report_id)
+    /// Returns the registered report signer public key, if any.
+    pub fn get_report_signer(env: Env) -> Option<BytesN<32>> {
+        compliance::get_report_signer(&env)
     }
 
-    /// Attaches an ed25519 signature over the report digest (admin-only).
-    /// The signature is verified on-chain; an invalid signature aborts.
+    /// Store a signed compliance report for regulatory submission.
+    ///
+    /// `signature` must be the registered signer's ed25519 signature over
+    /// `compliance_report_digest(start_date, end_date)`; an invalid signature
+    /// aborts the invocation. Returns the new report id.
+    ///
+    /// # Errors
+    /// * `ContractError::ReportSignerNotSet` - no signer has been registered
+    /// * `ContractError::InvalidReportRange` - `start_date > end_date`
     pub fn sign_compliance_report(
         env: Env,
-        report_id: u64,
-        signer: BytesN<32>,
+        start_date: u64,
+        end_date: u64,
         signature: BytesN<64>,
-    ) -> Result<compliance::ComplianceReport, ContractError> {
-        Self::require_admin(&env);
-        compliance::sign_report(&env, &Self::load_admin(&env), report_id, signer, signature)
+    ) -> Result<u64, ContractError> {
+        compliance::sign_report(&env, start_date, end_date, signature)
     }
 
-    /// Recomputes a report's digest and re-verifies its signature, if any.
-    pub fn verify_compliance_report(
-        env: Env,
-        report_id: u64,
-    ) -> Result<compliance::ReportVerification, ContractError> {
-        compliance::verify_report(&env, report_id)
-    }
-
-    // ── Issue #555: Regulatory change management ─────────────────────────────
-
-    /// Registers a new regulatory requirement at version 1 (admin-only) and
-    /// publishes an `Introduced` change notice.
-    pub fn register_regulatory_requirement(
-        env: Env,
-        code: Bytes,
-        jurisdiction: Bytes,
-        description: Bytes,
-        rule_hash: BytesN<32>,
-        effective_date: u64,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        Self::require_admin(&env);
-        compliance::register_requirement(
-            &env,
-            &Self::load_admin(&env),
-            code,
-            jurisdiction,
-            description,
-            rule_hash,
-            effective_date,
-        )
-    }
-
-    /// Publishes a new version of a requirement (admin-only). The previous
-    /// version is kept in history as `Superseded`.
-    pub fn amend_regulatory_requirement(
-        env: Env,
-        requirement_id: u64,
-        description: Bytes,
-        rule_hash: BytesN<32>,
-        effective_date: u64,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        Self::require_admin(&env);
-        compliance::amend_requirement(
-            &env,
-            &Self::load_admin(&env),
-            requirement_id,
-            description,
-            rule_hash,
-            effective_date,
-        )
-    }
-
-    /// Records the implementation date of a requirement's current version
-    /// (admin-only).
-    pub fn mark_requirement_implemented(
-        env: Env,
-        requirement_id: u64,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        Self::require_admin(&env);
-        compliance::mark_requirement_implemented(&env, &Self::load_admin(&env), requirement_id)
-    }
-
-    /// Retires a requirement (admin-only).
-    pub fn retire_regulatory_requirement(
-        env: Env,
-        requirement_id: u64,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        Self::require_admin(&env);
-        compliance::retire_requirement(&env, &Self::load_admin(&env), requirement_id)
-    }
-
-    /// Returns the current version of a requirement.
-    pub fn get_regulatory_requirement(
-        env: Env,
-        requirement_id: u64,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        compliance::get_requirement(&env, requirement_id)
-    }
-
-    /// Returns a specific historical version of a requirement.
-    pub fn get_requirement_version(
-        env: Env,
-        requirement_id: u64,
-        version: u32,
-    ) -> Result<compliance::RegulatoryRequirement, ContractError> {
-        compliance::get_requirement_version(&env, requirement_id, version)
-    }
-
-    /// Returns every version of a requirement, oldest first.
-    pub fn get_requirement_history(
-        env: Env,
-        requirement_id: u64,
-    ) -> Result<Vec<compliance::RegulatoryRequirement>, ContractError> {
-        compliance::get_requirement_history(&env, requirement_id)
-    }
-
-    /// Returns the ids of all registered requirements.
-    pub fn list_regulatory_requirements(env: Env) -> Vec<u64> {
-        compliance::list_requirements(&env)
-    }
-
-    /// Returns active requirements whose current version is not implemented.
-    pub fn get_pending_implementations(env: Env) -> Vec<compliance::RegulatoryRequirement> {
-        compliance::get_pending_implementations(&env)
-    }
-
-    /// Returns whether a requirement is active and past its effective date.
-    pub fn is_requirement_effective(env: Env, requirement_id: u64) -> Result<bool, ContractError> {
-        compliance::is_requirement_effective(&env, requirement_id)
-    }
-
-    /// Returns up to `limit` regulatory change notices after `after_id`.
-    pub fn get_regulatory_notices(
-        env: Env,
-        after_id: u64,
-        limit: u32,
-    ) -> Vec<compliance::RegulatoryChangeNotice> {
-        compliance::get_notices(&env, after_id, limit)
-    }
-
-    /// Returns the change notices `user` has not acknowledged yet.
-    pub fn get_pending_regulatory_notices(
-        env: Env,
-        user: Address,
-    ) -> Vec<compliance::RegulatoryChangeNotice> {
-        compliance::get_pending_notices(&env, &user)
-    }
-
-    /// Acknowledges all regulatory change notices up to `notice_id`.
-    pub fn acknowledge_regulatory_notices(
-        env: Env,
-        user: Address,
-        notice_id: u64,
-    ) -> Result<(), ContractError> {
-        user.require_auth();
-        compliance::acknowledge_notices(&env, &user, notice_id)
+    /// Returns the signed report with `report_id`, if any.
+    pub fn get_signed_report(env: Env, report_id: u64) -> Option<compliance::SignedReport> {
+        compliance::get_signed_report(&env, report_id)
     }
 }

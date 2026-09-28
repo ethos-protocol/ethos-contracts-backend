@@ -330,4 +330,175 @@ mod tests {
             "expected the query to be rejected for exceeding the complexity limit"
         );
     }
+
+    #[tokio::test]
+    async fn fetch_single_vault_by_id() {
+        let schema = test_schema();
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+
+        let vault = DomainVault {
+            id: "vault-1".to_string(),
+            owner: "alice".to_string(),
+            beneficiary: "bob".to_string(),
+            balance: 1000,
+            check_in_interval: 86400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(86400),
+        };
+
+        vault_store.lock().unwrap().insert(vault.id.clone(), vault.clone());
+
+        let schema_with_data = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store)
+            .data(event_store)
+            .finish();
+
+        let resp = schema_with_data
+            .execute("{ vault(id: \"vault-1\") { id owner beneficiary balance } }")
+            .await;
+
+        assert!(resp.errors.is_empty());
+        assert!(resp.data.to_string().contains("alice"));
+    }
+
+    #[tokio::test]
+    async fn list_vaults_with_pagination() {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+
+        for i in 0..15 {
+            let vault = DomainVault {
+                id: format!("vault-{i}"),
+                owner: format!("owner-{i}"),
+                beneficiary: "beneficiary".to_string(),
+                balance: (i * 100) as i128,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: Some(86400),
+            };
+            vault_store.lock().unwrap().insert(vault.id.clone(), vault);
+        }
+
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store)
+            .data(event_store)
+            .finish();
+
+        let resp = schema
+            .execute("{ vaults(page: 1, limit: 10) { total page limit vaults { id } } }")
+            .await;
+
+        assert!(resp.errors.is_empty());
+        assert!(resp.data.to_string().contains("\"total\": 15"));
+    }
+
+    #[tokio::test]
+    async fn create_vault_mutation_validates_input() {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store.clone())
+            .data(event_store)
+            .finish();
+
+        // Empty owner should fail
+        let resp = schema
+            .execute("mutation { createVault(owner: \"\", beneficiary: \"bob\", checkInInterval: 1) { id } }")
+            .await;
+        assert!(!resp.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_vault_mutation_succeeds_with_valid_input() {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store.clone())
+            .data(event_store)
+            .finish();
+
+        let resp = schema
+            .execute("mutation { createVault(owner: \"alice\", beneficiary: \"bob\", checkInInterval: 86400) { id owner beneficiary } }")
+            .await;
+
+        assert!(resp.errors.is_empty());
+        let stored = vault_store.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_in_updates_vault_state() {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+
+        let vault = DomainVault {
+            id: "vault-1".to_string(),
+            owner: "alice".to_string(),
+            beneficiary: "bob".to_string(),
+            balance: 1000,
+            check_in_interval: 86400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(1000),
+        };
+        vault_store.lock().unwrap().insert(vault.id.clone(), vault);
+
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store.clone())
+            .data(event_store)
+            .finish();
+
+        let resp = schema
+            .execute("mutation { checkIn(vaultId: \"vault-1\") { id ttlRemaining } }")
+            .await;
+
+        assert!(resp.errors.is_empty());
+        let stored = vault_store.lock().unwrap();
+        let vault_after = stored.get("vault-1").unwrap();
+        assert_eq!(vault_after.ttl_remaining, Some(86400));
+    }
+
+    #[tokio::test]
+    async fn vault_events_query_returns_matching_events() {
+        let vault_store: VaultStore = Arc::new(Mutex::new(HashMap::new()));
+        let event_store: EventStore = Arc::new(Mutex::new(Vec::new()));
+
+        let event = DomainEvent {
+            vault_id: "vault-1".to_string(),
+            event_type: crate::models::EventType::CheckIn,
+            timestamp: Utc::now(),
+            data: serde_json::json!({}),
+        };
+        event_store.lock().unwrap().push(event);
+
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .limit_depth(MAX_QUERY_DEPTH)
+            .limit_complexity(MAX_QUERY_COMPLEXITY)
+            .data(vault_store)
+            .data(event_store)
+            .finish();
+
+        let resp = schema
+            .execute("{ vaultEvents(vaultId: \"vault-1\") { vaultId eventType } }")
+            .await;
+
+        assert!(resp.errors.is_empty());
+        assert!(resp.data.to_string().contains("vault-1"));
+    }
 }

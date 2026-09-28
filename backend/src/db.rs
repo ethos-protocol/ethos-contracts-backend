@@ -1157,6 +1157,65 @@ impl Db {
                 ALTER TABLE secret_rotation_policies ADD COLUMN max_token_lifetime_hours INTEGER NOT NULL DEFAULT 0;
                 ",
             ),
+            (
+                "17",
+                r"
+                -- #564: Lazy loading for vault metadata.
+                -- Large metadata blobs are decoupled from the core `vaults` table and
+                -- fetched on demand via `LazyMetadataLoader`.
+                CREATE TABLE IF NOT EXISTS vault_metadata (
+                    vault_id    TEXT PRIMARY KEY,
+                    fields      TEXT NOT NULL DEFAULT '{}',
+                    updated_at  TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_metadata_updated_at
+                    ON vault_metadata(updated_at);
+                ",
+            ),
+            (
+                "18",
+                r"
+                -- #565: Materialized views for common vault queries.
+                -- vault_summary_view holds a singleton row (id=1) with pre-aggregated
+                -- counters; vault_owner_counts_view holds per-owner row counts.
+                CREATE TABLE IF NOT EXISTS vault_summary_view (
+                    id                    INTEGER PRIMARY KEY,
+                    total_vaults          INTEGER NOT NULL DEFAULT 0,
+                    active_vaults         INTEGER NOT NULL DEFAULT 0,
+                    released_vaults       INTEGER NOT NULL DEFAULT 0,
+                    expired_vaults        INTEGER NOT NULL DEFAULT 0,
+                    total_balance_text    TEXT    NOT NULL DEFAULT '0',
+                    avg_check_in_interval REAL    NOT NULL DEFAULT 0.0,
+                    last_refreshed_at     TEXT    NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS vault_owner_counts_view (
+                    owner        TEXT    NOT NULL,
+                    vault_count  INTEGER NOT NULL DEFAULT 0,
+                    active_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (owner)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_owner_counts_active
+                    ON vault_owner_counts_view(active_count);
+                ",
+            ),
+            (
+                "19",
+                r"
+                -- #566: Query plan optimization indexes.
+                -- Composite and single-column indexes that the query planner exploits
+                -- to avoid full scans for the most common query shapes.
+                CREATE INDEX IF NOT EXISTS idx_vaults_owner
+                    ON vaults(owner);
+                CREATE INDEX IF NOT EXISTS idx_vaults_status
+                    ON vaults(status);
+                CREATE INDEX IF NOT EXISTS idx_vaults_owner_status
+                    ON vaults(owner, status);
+                CREATE INDEX IF NOT EXISTS idx_vaults_created_at
+                    ON vaults(created_at);
+                CREATE INDEX IF NOT EXISTS idx_vaults_owner_created_at
+                    ON vaults(owner, created_at);
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1250,6 +1309,31 @@ impl Db {
             (
                 "10",
                 "ALTER TABLE reminder_preferences DROP COLUMN normalized_frequency;",
+            ),
+            (
+                "17",
+                r"
+                DROP INDEX IF EXISTS idx_vault_metadata_updated_at;
+                DROP TABLE IF EXISTS vault_metadata;
+                ",
+            ),
+            (
+                "18",
+                r"
+                DROP INDEX IF EXISTS idx_vault_owner_counts_active;
+                DROP TABLE IF EXISTS vault_owner_counts_view;
+                DROP TABLE IF EXISTS vault_summary_view;
+                ",
+            ),
+            (
+                "19",
+                r"
+                DROP INDEX IF EXISTS idx_vaults_owner_created_at;
+                DROP INDEX IF EXISTS idx_vaults_created_at;
+                DROP INDEX IF EXISTS idx_vaults_owner_status;
+                DROP INDEX IF EXISTS idx_vaults_status;
+                DROP INDEX IF EXISTS idx_vaults_owner;
+                ",
             ),
         ];
 
