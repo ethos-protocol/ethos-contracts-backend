@@ -1650,6 +1650,7 @@ impl TtlVaultContract {
         if owner == Self::load_admin(&env) {
             panic_with_error!(&env, ContractError::AdminCannotOwnVault);
         }
+        Self::assert_not_blacklisted(&env, &owner);
         if check_in_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidInterval);
         }
@@ -2006,6 +2007,7 @@ impl TtlVaultContract {
         if from != vault.owner {
             panic_with_error!(&env, ContractError::UnauthorizedDepositor);
         }
+        Self::assert_not_blacklisted(&env, &from);
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
@@ -2055,6 +2057,7 @@ impl TtlVaultContract {
         );
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
+        compliance::record_transaction(&env, amount, true);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -2350,6 +2353,7 @@ impl TtlVaultContract {
 
         // Issue #569: Record successful withdrawal in audit trail
         Self::record_withdrawal_audit(&env, vault_id, &caller, amount, true, "");
+        compliance::record_transaction(&env, amount, false);
 
         // Issue #571: Emit withdrawal notification event
         env.events().publish(
@@ -8813,6 +8817,13 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Issue #552: reject inflows from compliance-blacklisted addresses.
+    fn assert_not_blacklisted(env: &Env, address: &Address) {
+        if compliance::is_blacklisted(env, address) {
+            panic_with_error!(env, ContractError::AddressBlacklisted);
+        }
     }
 
     fn require_admin(env: &Env) {
