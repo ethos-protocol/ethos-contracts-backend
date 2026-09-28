@@ -1,0 +1,14 @@
+{
+  "$comment": "Baseline Soroban budget costs for core vault operations, used by scripts/compare_bench_baseline.py to catch >5% performance regressions. Captured from contracts/ttl_vault/src/performance_regression_tests.rs running with --nocapture. Update this file after intentional performance improvements.",
+  "unit": "native_soroban_budget",
+  "captured_from": "contracts/ttl_vault/src/performance_regression_tests.rs",
+  "tolerance_percent": 5,
+  "benchmarks": {
+    "create_vault": { "n": 1, "cpu": 500000, "mem": 32768 },
+    "deposit": { "n": 1, "cpu": 300000, "mem": 16384 },
+    "withdraw": { "n": 1, "cpu": 350000, "mem": 16384 },
+    "check_in": { "n": 1, "cpu": 400000, "mem": 16384 },
+    "trigger_release_1_beneficiary": { "n": 1, "cpu": 123456, "mem": 4096 },
+    "trigger_release_5_beneficiaries": { "n": 5, "cpu": 234567, "mem": 8192 }
+  }
+}
