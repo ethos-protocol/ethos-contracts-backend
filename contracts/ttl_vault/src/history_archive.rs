@@ -179,11 +179,9 @@ pub fn archive_history(env: &Env, vault_id: u64) -> u32 {
         // Cold body: written once with a short TTL and never extended.
         let page_key = ArchiveKey::Page(vault_id, page);
         env.storage().persistent().set(&page_key, &body);
-        env.storage().persistent().extend_ttl(
-            &page_key,
-            COLD_PAGE_TTL_LEDGERS,
-            COLD_PAGE_TTL_LEDGERS,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&page_key, COLD_PAGE_TTL_LEDGERS, COLD_PAGE_TTL_LEDGERS);
 
         persist(
             env,

@@ -157,6 +157,7 @@ The script will display the target network and identity, then require you to typ
 - [TTL & State Archival Logic](docs/ttl-logic.md)
 - [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+- [ZK Proof Verification Guide (Groth16)](docs/zk-proof-verification-guide.md)
 
 ### Beneficiary Features
 - [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
@@ -167,6 +168,8 @@ The script will display the target network and identity, then require you to typ
 ### Operations
 - [Withdrawal Features](docs/withdrawal-features.md)
 - [Deployment Guide](docs/deployment-guide.md)
+- [Deployment Runbook](docs/deployment-runbook.md)
+- [Troubleshooting Guide](docs/troubleshooting.md)
 - [Monitoring Guide](docs/monitoring-guide.md)
 - [Disaster Recovery Runbook](docs/disaster-recovery-runbook.md)
 
@@ -177,6 +180,7 @@ The script will display the target network and identity, then require you to typ
 
 ### Reference
 - [API Reference](docs/api-reference.md)
+- [Backend API Documentation with Examples](docs/api-documentation.md)
 - [OpenAPI Specification](docs/openapi.yaml)
 - [Roadmap](docs/roadmap.md)
 

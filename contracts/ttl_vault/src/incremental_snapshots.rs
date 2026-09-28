@@ -212,7 +212,7 @@ fn replay_fields(env: &Env, vault_id: u64, sequence: u32) -> Vec<Bytes> {
 /// its sequence number.
 pub fn create_snapshot(env: &Env, vault_id: u64, vault: &Vault) -> u32 {
     let sequence = get_snapshot_count(env, vault_id);
-    let is_full = sequence.is_multiple_of(FULL_SNAPSHOT_INTERVAL);
+    let is_full = sequence % FULL_SNAPSHOT_INTERVAL == 0;
 
     let current = encode_fields(env, vault);
     let previous = if is_full {

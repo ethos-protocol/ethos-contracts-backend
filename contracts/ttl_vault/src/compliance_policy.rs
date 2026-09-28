@@ -188,7 +188,7 @@ pub fn get_policy_version(env: &Env, timestamp: u64) -> Result<Policy, ContractE
         // Later versions win ties because the index is in version order.
         if best
             .as_ref()
-            .is_none_or(|b| entry.effective_from >= b.effective_from)
+            .map_or(true, |b| entry.effective_from >= b.effective_from)
         {
             best = Some(entry);
         }
@@ -220,9 +220,7 @@ pub fn sync_active_policy(env: &Env) -> Result<Option<u32>, ContractError> {
     }
 
     persist(env, &PolicyKey::Applied, &active.version);
-    env.events().publish(
-        (POLICY_APPLIED_TOPIC, active.version),
-        active.effective_from,
-    );
+    env.events()
+        .publish((POLICY_APPLIED_TOPIC, active.version), active.effective_from);
     Ok(Some(active.version))
 }

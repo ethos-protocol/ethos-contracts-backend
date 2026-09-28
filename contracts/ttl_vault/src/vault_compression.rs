@@ -1,18 +1,21 @@
 /// Issue #558 — Vault compression for inactive accounts
 ///
-/// A vault that has not been checked in for `get_inactivity_threshold` seconds
-/// (default `DEFAULT_INACTIVITY_SECONDS`, 90 days) can be compressed: its
-/// `DataKey::Vault` entry is replaced by a `CompressedVault` holding the
-/// zero-run RLE of the vault's XDR (see `diff_codec`). Vault XDR is dominated
-/// by fixed-width integers and zero padding, so this typically shrinks the
-/// entry substantially; compression is skipped when it would not save space.
+/// Vaults whose owner has not checked in for `N` days (default
+/// `DEFAULT_INACTIVITY_DAYS`, admin-configurable) can be compressed: the
+/// vault's XDR is zero-run-length encoded (see `diff_codec`), stored under a
+/// compact `CompressionKey::Compressed` entry, and the uncompressed
+/// `DataKey::Vault` entry is removed.
 ///
-/// Decompression happens **on demand**: the contract's vault loaders fall back
-/// to `load` here when no plain entry exists, so every read keeps working
-/// unchanged. The first write (`save_vault`) stores the vault uncompressed
-/// again and drops the compressed record. `decompress_vault` does this
-/// explicitly. A SHA-256 of the original XDR is stored and verified on every
-/// decompression so a corrupted record is detected rather than returned.
+/// Decompression is on demand and transparent:
+///
+/// - `load_vault` / `try_load_vault` fall back to decoding the compressed
+///   entry in memory, so every read path keeps working unchanged.
+/// - `save_vault` discards any compressed copy, so the first state-mutating
+///   operation re-materializes the vault uncompressed.
+/// - `decompress_vault` restores a vault explicitly.
+///
+/// A SHA-256 of the original XDR is stored with the compressed payload and
+/// checked on every decode.
 use soroban_sdk::{
     contracttype, panic_with_error, symbol_short,
     xdr::{FromXdr, ToXdr},
@@ -23,8 +26,13 @@ use crate::diff_codec;
 use crate::types::{DataKey, Vault};
 use crate::ContractError;
 
-/// Default inactivity period (90 days) after which a vault may be compressed.
-pub const DEFAULT_INACTIVITY_SECONDS: u64 = 7_776_000;
+/// Default number of days without a check-in before a vault may be compressed.
+pub const DEFAULT_INACTIVITY_DAYS: u32 = 90;
+
+/// Upper bound for the configurable inactivity period (10 years).
+pub const MAX_INACTIVITY_DAYS: u32 = 3_650;
+
+const SECONDS_PER_DAY: u64 = 86_400;
 
 pub const VAULT_COMPRESSED_TOPIC: Symbol = symbol_short!("v_cmp");
 pub const VAULT_DECOMPRESSED_TOPIC: Symbol = symbol_short!("v_dcmp");
@@ -32,30 +40,27 @@ pub const VAULT_DECOMPRESSED_TOPIC: Symbol = symbol_short!("v_dcmp");
 #[contracttype]
 #[derive(Clone)]
 pub enum CompressionKey {
-    /// Compressed vault body by vault id.
-    Vault(u64),
-    /// Admin-configured inactivity threshold in seconds.
-    InactivityThreshold,
+    /// Compressed vault payload by vault id.
+    Compressed(u64),
+    /// Days of inactivity before compression is allowed (u32).
+    InactivityDays,
 }
 
-/// Compressed form of a vault stored in place of `DataKey::Vault`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompressedVault {
-    pub vault_id: u64,
-    /// RLE(xdr(vault)).
+    /// RLE-encoded vault XDR.
     pub data: Bytes,
-    /// Length of the uncompressed vault XDR.
     pub original_size: u32,
     pub compressed_size: u32,
-    /// SHA-256 of the uncompressed vault XDR.
-    pub state_hash: BytesN<32>,
-    /// Check-in interval, kept uncompressed to derive the entry TTL.
-    pub check_in_interval: u64,
     pub compressed_at: u64,
+    /// SHA-256 of the original vault XDR.
+    pub content_hash: BytesN<32>,
+    /// Persistent TTL (ledgers) derived from the vault's check-in interval.
+    pub ttl_ledgers: u32,
 }
 
-/// Summary returned by `get_vault_compression_info`.
+/// Summary returned to callers inspecting a compressed vault.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompressionInfo {
@@ -64,131 +69,112 @@ pub struct CompressionInfo {
     pub compressed_at: u64,
 }
 
-pub fn get_inactivity_threshold(env: &Env) -> u64 {
+pub fn get_inactivity_days(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .get(&CompressionKey::InactivityThreshold)
-        .unwrap_or(DEFAULT_INACTIVITY_SECONDS)
+        .get(&CompressionKey::InactivityDays)
+        .unwrap_or(DEFAULT_INACTIVITY_DAYS)
 }
 
-pub fn set_inactivity_threshold(env: &Env, seconds: u64) -> Result<(), ContractError> {
-    if seconds == 0 {
+pub fn set_inactivity_days(env: &Env, days: u32) -> Result<(), ContractError> {
+    if days == 0 || days > MAX_INACTIVITY_DAYS {
         return Err(ContractError::InvalidConfig);
     }
     env.storage()
         .instance()
-        .set(&CompressionKey::InactivityThreshold, &seconds);
+        .set(&CompressionKey::InactivityDays, &days);
     Ok(())
 }
 
-fn get_record(env: &Env, vault_id: u64) -> Option<CompressedVault> {
+fn load_compressed(env: &Env, vault_id: u64) -> Option<CompressedVault> {
     env.storage()
         .persistent()
-        .get(&CompressionKey::Vault(vault_id))
+        .get(&CompressionKey::Compressed(vault_id))
 }
 
 pub fn is_compressed(env: &Env, vault_id: u64) -> bool {
     env.storage()
         .persistent()
-        .has(&CompressionKey::Vault(vault_id))
+        .has(&CompressionKey::Compressed(vault_id))
 }
 
 pub fn get_info(env: &Env, vault_id: u64) -> Option<CompressionInfo> {
-    get_record(env, vault_id).map(|r| CompressionInfo {
-        original_size: r.original_size,
-        compressed_size: r.compressed_size,
-        compressed_at: r.compressed_at,
+    load_compressed(env, vault_id).map(|c| CompressionInfo {
+        original_size: c.original_size,
+        compressed_size: c.compressed_size,
+        compressed_at: c.compressed_at,
     })
 }
 
-fn decode(env: &Env, record: &CompressedVault) -> Vault {
-    let xdr = diff_codec::decompress(env, &record.data)
-        .unwrap_or_else(|| panic_with_error!(env, ContractError::VaultCompressionCorrupted));
+fn decode(env: &Env, c: &CompressedVault) -> Vault {
+    let xdr = diff_codec::decompress(env, &c.data)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::CompressionCorrupted));
     let hash: BytesN<32> = env.crypto().sha256(&xdr).into();
-    if xdr.len() != record.original_size || hash != record.state_hash {
-        panic_with_error!(env, ContractError::VaultCompressionCorrupted);
+    if xdr.len() != c.original_size || hash != c.content_hash {
+        panic_with_error!(env, ContractError::CompressionCorrupted);
     }
     Vault::from_xdr(env, &xdr)
-        .unwrap_or_else(|_| panic_with_error!(env, ContractError::VaultCompressionCorrupted))
+        .unwrap_or_else(|_| panic_with_error!(env, ContractError::CompressionCorrupted))
 }
 
-/// Decodes a compressed vault without touching storage layout. Used by the
-/// contract's vault loaders as the fallback when no plain entry exists.
-pub fn load(env: &Env, vault_id: u64) -> Option<Vault> {
-    get_record(env, vault_id).map(|record| decode(env, &record))
+/// Decodes a compressed vault in memory without touching storage. Used by
+/// `load_vault` so reads never need an explicit decompression step.
+pub fn load_decompressed(env: &Env, vault_id: u64) -> Option<Vault> {
+    load_compressed(env, vault_id).map(|c| decode(env, &c))
 }
 
-/// Compresses the vault if it is stored uncompressed, has been inactive for
-/// at least the configured threshold, and compression actually saves space.
-/// Returns `true` when the vault was compressed.
-pub fn compress(env: &Env, vault_id: u64) -> Result<bool, ContractError> {
-    let key = DataKey::Vault(vault_id);
-    let vault: Vault = match env.storage().persistent().get(&key) {
-        Some(v) => v,
-        None if is_compressed(env, vault_id) => return Ok(false),
-        None => return Err(ContractError::VaultNotFound),
+/// Drops the compressed copy once the vault has been re-materialized.
+pub fn discard(env: &Env, vault_id: u64) {
+    let key = CompressionKey::Compressed(vault_id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((VAULT_DECOMPRESSED_TOPIC, vault_id), vault_id);
+    }
+}
+
+/// Compresses the vault if it has been inactive for at least the configured
+/// number of days. Returns `true` if the vault was compressed, `false` if it
+/// is still active, already compressed, or would not shrink.
+pub fn compress(env: &Env, vault_id: u64, ttl_ledgers: u32) -> bool {
+    if is_compressed(env, vault_id) {
+        return false;
+    }
+    let vault_key = DataKey::Vault(vault_id);
+    let Some(vault) = env.storage().persistent().get::<DataKey, Vault>(&vault_key) else {
+        panic_with_error!(env, ContractError::VaultNotFound);
     };
 
     let now = env.ledger().timestamp();
-    if now.saturating_sub(vault.last_check_in) < get_inactivity_threshold(env) {
-        return Ok(false);
+    let min_idle = u64::from(get_inactivity_days(env)) * SECONDS_PER_DAY;
+    if now.saturating_sub(vault.last_check_in) < min_idle {
+        return false;
     }
 
-    let xdr = vault.clone().to_xdr(env);
+    let xdr = vault.to_xdr(env);
     let data = diff_codec::compress(env, &xdr);
     if data.len() >= xdr.len() {
-        return Ok(false);
+        return false;
     }
 
     let record = CompressedVault {
-        vault_id,
         original_size: xdr.len(),
         compressed_size: data.len(),
-        state_hash: env.crypto().sha256(&xdr).into(),
-        data,
-        check_in_interval: vault.check_in_interval,
         compressed_at: now,
+        content_hash: env.crypto().sha256(&xdr).into(),
+        ttl_ledgers,
+        data,
     };
-    let ckey = CompressionKey::Vault(vault_id);
-    env.storage().persistent().set(&ckey, &record);
-    env.storage().persistent().extend_ttl(
-        &ckey,
-        crate::VAULT_TTL_THRESHOLD,
-        crate::vault_ttl_ledgers(vault.check_in_interval),
-    );
-    env.storage().persistent().remove(&key);
+    let key = CompressionKey::Compressed(vault_id);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::VAULT_TTL_THRESHOLD, ttl_ledgers);
+    env.storage().persistent().remove(&vault_key);
 
     env.events().publish(
         (VAULT_COMPRESSED_TOPIC, vault_id),
         (record.original_size, record.compressed_size),
     );
-    Ok(true)
-}
-
-/// Drops the compressed record once the vault has been written back
-/// uncompressed. Called from `save_vault`; a no-op for plain vaults.
-pub fn clear(env: &Env, vault_id: u64) {
-    let ckey = CompressionKey::Vault(vault_id);
-    if env.storage().persistent().has(&ckey) {
-        env.storage().persistent().remove(&ckey);
-        env.events().publish(
-            (VAULT_DECOMPRESSED_TOPIC, vault_id),
-            env.ledger().timestamp(),
-        );
-    }
-}
-
-/// Extends the TTL of a compressed record. Returns `false` if there is none.
-pub fn extend_ttl(env: &Env, vault_id: u64) -> bool {
-    match get_record(env, vault_id) {
-        Some(record) => {
-            env.storage().persistent().extend_ttl(
-                &CompressionKey::Vault(vault_id),
-                crate::VAULT_TTL_THRESHOLD,
-                crate::vault_ttl_ledgers(record.check_in_interval),
-            );
-            true
-        }
-        None => false,
-    }
+    true
 }
