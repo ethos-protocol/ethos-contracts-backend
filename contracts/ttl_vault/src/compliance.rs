@@ -471,6 +471,14 @@ pub fn set_threshold_config(env: &Env, config: &ThresholdConfig) -> Result<(), C
     Ok(())
 }
 
+/// Removes the reporting thresholds, disabling threshold monitoring. Used when
+/// a versioned compliance policy without thresholds becomes active (#556).
+pub fn clear_threshold_config(env: &Env) {
+    env.storage()
+        .persistent()
+        .remove(&ComplianceKey::ThresholdConfig);
+}
+
 pub fn get_threshold_config(env: &Env) -> Option<ThresholdConfig> {
     env.storage().persistent().get(&ComplianceKey::ThresholdConfig)
 }

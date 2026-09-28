@@ -15,12 +15,22 @@ use soroban_sdk::{
 pub mod aml;
 pub mod composition_rules;
 pub mod compliance;
+pub mod compliance_policy;
+#[cfg(test)]
+mod compliance_policy_tests;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
 pub mod credential_lifecycle;
 #[cfg(test)]
 mod credential_lifecycle_tests;
+mod diff_codec;
+pub mod history_archive;
+#[cfg(test)]
+mod history_archive_tests;
+pub mod incremental_snapshots;
+#[cfg(test)]
+mod incremental_snapshots_tests;
 mod oracle;
 pub mod ranking;
 pub mod slice_attribute_matching;
@@ -30,6 +40,9 @@ pub mod slice_failover;
 pub mod slice_performance;
 pub mod template_inheritance;
 mod types;
+pub mod vault_compression;
+#[cfg(test)]
+mod vault_compression_tests;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
     BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
@@ -435,6 +448,16 @@ pub enum ContractError {
     UpgradeManifestNotSet = 130,
     // Issue #547: AML screening rejected a beneficiary / transfer recipient
     AmlFlaggedAddress = 131,
+    // Issue #559: incremental snapshot chain failed to reconstruct / verify
+    SnapshotCorrupted = 132,
+    // Issue #557: history archive page missing or hash chain broken
+    ArchivePageNotFound = 133,
+    ArchiveIntegrityViolation = 134,
+    // Issue #556: compliance policy versioning
+    PolicyVersionNotFound = 135,
+    InvalidEffectiveDate = 136,
+    // Issue #558: compressed vault payload failed to decode / verify
+    CompressionCorrupted = 137,
 }
 
 #[contract]
@@ -7907,14 +7930,11 @@ impl TtlVaultContract {
     /// # Panics
     /// Panics if the vault does not exist (was never created or has been permanently deleted)
     pub fn restore_vault(env: Env, vault_id: u64) {
-        let key = DataKey::Vault(vault_id);
         // Extending TTL on an archived entry restores it. If the entry no longer
-        // exists at all, load_vault will panic with VaultNotFound.
+        // exists at all, load_vault will panic with VaultNotFound. Re-saving also
+        // re-materializes a compressed vault (Issue #558) and extends its TTL.
         let vault = Self::load_vault(&env, vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        Self::save_vault(&env, vault_id, &vault);
         // Clear any stale archived-info snapshot now that the vault is live again.
         env.storage()
             .persistent()
@@ -8865,9 +8885,7 @@ impl TtlVaultContract {
     }
 
     fn load_vault(env: &Env, vault_id: u64) -> Vault {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Vault(vault_id))
+        Self::try_load_vault(env, vault_id)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::VaultNotFound))
     }
 
@@ -8883,7 +8901,11 @@ impl TtlVaultContract {
     /// # Returns
     /// `Some(Vault)` if the vault exists, `None` otherwise
     fn try_load_vault(env: &Env, vault_id: u64) -> Option<Vault> {
-        env.storage().persistent().get(&DataKey::Vault(vault_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Vault(vault_id))
+            // Issue #558: inactive vaults may be stored compressed; decode on demand.
+            .or_else(|| vault_compression::load_decompressed(env, vault_id))
     }
 
     fn load_owner_vault_ids(env: &Env, owner: &Address) -> Vec<u64> {
@@ -8940,6 +8962,8 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Issue #558: a write re-materializes a compressed vault.
+        vault_compression::discard(env, vault_id);
     }
 
     fn load_beneficiary_vault_ids(env: &Env, beneficiary: &Address) -> Vec<u64> {
@@ -12095,8 +12119,7 @@ impl TtlVaultContract {
         let mut results = Vec::new(&env);
         let now = env.ledger().timestamp();
         for vault_id in vault_ids.iter() {
-            let key = DataKey::Vault(vault_id);
-            if let Some(vault) = env.storage().persistent().get::<DataKey, Vault>(&key) {
+            if let Some(vault) = Self::try_load_vault(&env, vault_id) {
                 let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
                 let is_expired = now > deadline && vault.status == ReleaseStatus::Locked;
                 results.push_back(VaultStatusSummary {
@@ -15657,6 +15680,12 @@ impl TtlVaultContract {
     pub fn set_allowlist_enforced(env: Env, enforced: bool) {
         Self::require_admin(&env);
         compliance::set_allowlist_enforced(&env, enforced);
+        let admin = Self::load_admin(&env);
+        compliance_policy::record_live_change(
+            &env,
+            &admin,
+            compliance_policy::REASON_ALLOWLIST_MODE,
+        );
     }
 
     /// Returns whether allowlist mode is enabled.
@@ -15734,7 +15763,14 @@ impl TtlVaultContract {
     /// * `ContractError::InvalidAmount` - `amount` is negative
     pub fn set_kyc_high_value_threshold(env: Env, amount: i128) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        compliance::set_kyc_high_value_threshold(&env, amount)
+        compliance::set_kyc_high_value_threshold(&env, amount)?;
+        let admin = Self::load_admin(&env);
+        compliance_policy::record_live_change(
+            &env,
+            &admin,
+            compliance_policy::REASON_KYC_THRESHOLD,
+        );
+        Ok(())
     }
 
     /// Returns the high-value KYC threshold (`0` = disabled).
@@ -15752,7 +15788,14 @@ impl TtlVaultContract {
         config: compliance::ThresholdConfig,
     ) -> Result<(), ContractError> {
         Self::require_admin(&env);
-        compliance::set_threshold_config(&env, &config)
+        compliance::set_threshold_config(&env, &config)?;
+        let admin = Self::load_admin(&env);
+        compliance_policy::record_live_change(
+            &env,
+            &admin,
+            compliance_policy::REASON_REPORT_THRESHOLDS,
+        );
+        Ok(())
     }
 
     /// Returns the configured reporting thresholds, if any.
@@ -15869,5 +15912,241 @@ impl TtlVaultContract {
     /// Returns the signed report with `report_id`, if any.
     pub fn get_signed_report(env: Env, report_id: u64) -> Option<compliance::SignedReport> {
         compliance::get_signed_report(&env, report_id)
+    }
+
+    // --- Issue #556: compliance policy versioning ---
+
+    /// Publish a complete compliance policy that takes effect at
+    /// `effective_from` (admin only). A policy effective now is applied to the
+    /// live configuration immediately; a future one is applied by
+    /// `sync_compliance_policy` once its date is reached. Returns the new
+    /// version number.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidEffectiveDate` - `effective_from` is in the past
+    /// * `ContractError::InvalidAmount` - negative KYC threshold
+    /// * `ContractError::InvalidConfig` - invalid reporting thresholds
+    pub fn publish_compliance_policy(
+        env: Env,
+        kyc_high_value_threshold: i128,
+        allowlist_enforced: bool,
+        reporting_thresholds: Option<compliance::ThresholdConfig>,
+        effective_from: u64,
+    ) -> Result<u32, ContractError> {
+        Self::require_admin(&env);
+        let admin = Self::load_admin(&env);
+        compliance_policy::publish_policy(
+            &env,
+            &admin,
+            kyc_high_value_threshold,
+            allowlist_enforced,
+            reporting_thresholds,
+            effective_from,
+        )
+    }
+
+    /// Returns the compliance policy that was in force at `timestamp`.
+    ///
+    /// # Errors
+    /// * `ContractError::PolicyVersionNotFound` - no policy was in force yet
+    pub fn get_policy_version(
+        env: Env,
+        timestamp: u64,
+    ) -> Result<compliance_policy::Policy, ContractError> {
+        compliance_policy::get_policy_version(&env, timestamp)
+    }
+
+    /// Returns a compliance policy by its version number.
+    pub fn get_policy_by_version(env: Env, version: u32) -> Option<compliance_policy::Policy> {
+        compliance_policy::get_policy(&env, version)
+    }
+
+    /// Returns the number of recorded compliance policy versions.
+    pub fn get_policy_version_count(env: Env) -> u32 {
+        compliance_policy::get_version_count(&env)
+    }
+
+    /// Returns the policy version currently applied to the live configuration
+    /// (`0` if none has been recorded).
+    pub fn get_applied_policy_version(env: Env) -> u32 {
+        compliance_policy::get_applied_version(&env)
+    }
+
+    /// Applies a scheduled compliance policy whose effective date has been
+    /// reached. Anyone may call this. Returns the applied version, or `None`
+    /// if the live configuration was already current.
+    pub fn sync_compliance_policy(env: Env) -> Result<Option<u32>, ContractError> {
+        compliance_policy::sync_active_policy(&env)
+    }
+
+    // --- Issue #557: vault history archival ---
+
+    /// Moves state-transition history entries older than
+    /// `history_archive::ARCHIVE_MIN_AGE_SECONDS` out of the hot on-chain log
+    /// into hash-chained archive pages (vault owner or admin). Returns the
+    /// number of pages archived.
+    ///
+    /// After archival, `get_state_transition_log` returns only the recent
+    /// (hot) entries; older ones are available via `get_archived_history`.
+    pub fn archive_vault_history(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner && caller != Self::load_admin(&env) {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(history_archive::archive_history(&env, vault_id))
+    }
+
+    /// Returns archived history page `page` for a vault.
+    ///
+    /// # Errors
+    /// * `ContractError::ArchivePageNotFound` - the page was never archived, or
+    ///   its cold body has been evicted from the live ledger (use the
+    ///   `hist_arc` event copy with `verify_archived_history_page`)
+    pub fn get_archived_history(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+    ) -> Result<history_archive::ArchivedHistoryPage, ContractError> {
+        history_archive::get_archived_page(&env, vault_id, page)
+            .ok_or(ContractError::ArchivePageNotFound)
+    }
+
+    /// Returns archive bookkeeping (page count, archived entries, chain head).
+    pub fn get_history_archive_info(env: Env, vault_id: u64) -> history_archive::ArchiveMeta {
+        history_archive::get_meta(&env, vault_id)
+    }
+
+    /// Verifies externally-held entries for an archived page against the
+    /// on-chain integrity digest.
+    pub fn verify_archived_history_page(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+        entries: Vec<StateTransitionEntry>,
+    ) -> bool {
+        history_archive::verify_page(&env, vault_id, page, &entries)
+    }
+
+    /// Verifies the full archive hash chain for a vault.
+    ///
+    /// # Errors
+    /// * `ContractError::ArchiveIntegrityViolation` - the chain is broken
+    pub fn verify_history_archive(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        if history_archive::verify_integrity(&env, vault_id) {
+            Ok(())
+        } else {
+            Err(ContractError::ArchiveIntegrityViolation)
+        }
+    }
+
+    // --- Issue #558: vault compression for inactive accounts ---
+
+    /// Compresses a vault that has been inactive (no check-in) for at least
+    /// the configured number of days. Anyone may call this; it changes only
+    /// the storage representation, never the vault's state. Returns `true` if
+    /// the vault was compressed.
+    ///
+    /// Compressed vaults are decompressed transparently on read, and restored
+    /// uncompressed by the next state-changing operation.
+    pub fn compress_vault(env: Env, vault_id: u64) -> bool {
+        let ttl = Self::try_load_vault(&env, vault_id)
+            .map(|v| vault_ttl_ledgers(v.check_in_interval))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+        vault_compression::compress(&env, vault_id, ttl)
+    }
+
+    /// Restores a compressed vault to its uncompressed storage form. Returns
+    /// `false` if the vault was not compressed.
+    pub fn decompress_vault(env: Env, vault_id: u64) -> bool {
+        match vault_compression::load_decompressed(&env, vault_id) {
+            Some(vault) => {
+                Self::save_vault(&env, vault_id, &vault);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns whether a vault is currently stored compressed.
+    pub fn is_vault_compressed(env: Env, vault_id: u64) -> bool {
+        vault_compression::is_compressed(&env, vault_id)
+    }
+
+    /// Returns size information for a compressed vault, if compressed.
+    pub fn get_vault_compression_info(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<vault_compression::CompressionInfo> {
+        vault_compression::get_info(&env, vault_id)
+    }
+
+    /// Sets the number of inactive days after which vaults may be compressed
+    /// (admin only, `1..=vault_compression::MAX_INACTIVITY_DAYS`).
+    pub fn set_compression_inactivity_days(env: Env, days: u32) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        vault_compression::set_inactivity_days(&env, days)
+    }
+
+    /// Returns the inactivity period (days) required before compression.
+    pub fn get_compression_inactivity_days(env: Env) -> u32 {
+        vault_compression::get_inactivity_days(&env)
+    }
+
+    // --- Issue #559: incremental state snapshots ---
+
+    /// Takes an incremental snapshot of the vault. Only fields changed since
+    /// the previous snapshot are stored (differentially compressed), with a
+    /// full checkpoint every `incremental_snapshots::FULL_SNAPSHOT_INTERVAL`
+    /// snapshots. Anyone may call this. Returns the snapshot sequence number.
+    pub fn create_incremental_snapshot(env: Env, vault_id: u64) -> u32 {
+        let vault = Self::load_vault(&env, vault_id);
+        incremental_snapshots::create_snapshot(&env, vault_id, &vault)
+    }
+
+    /// Reconstructs the full vault state at snapshot `sequence`.
+    ///
+    /// # Errors
+    /// * `ContractError::SnapshotNotFound` - no snapshot with that sequence
+    /// * `ContractError::SnapshotCorrupted` - reconstruction failed hash check
+    pub fn reconstruct_vault_snapshot(
+        env: Env,
+        vault_id: u64,
+        sequence: u32,
+    ) -> Result<Vault, ContractError> {
+        incremental_snapshots::reconstruct(&env, vault_id, sequence)
+    }
+
+    /// Reconstructs the vault state as of the latest incremental snapshot
+    /// taken at or before `timestamp`.
+    ///
+    /// # Errors
+    /// * `ContractError::SnapshotNotFound` - no snapshot at or before `timestamp`
+    pub fn reconstruct_vault_snapshot_at(
+        env: Env,
+        vault_id: u64,
+        timestamp: u64,
+    ) -> Result<Vault, ContractError> {
+        let sequence = incremental_snapshots::find_sequence_at(&env, vault_id, timestamp)
+            .ok_or(ContractError::SnapshotNotFound)?;
+        incremental_snapshots::reconstruct(&env, vault_id, sequence)
+    }
+
+    /// Returns the raw stored snapshot entry (deltas and sizes).
+    pub fn get_incremental_snapshot(
+        env: Env,
+        vault_id: u64,
+        sequence: u32,
+    ) -> Option<incremental_snapshots::IncrementalSnapshot> {
+        incremental_snapshots::get_snapshot(&env, vault_id, sequence)
+    }
+
+    /// Returns how many incremental snapshots exist for a vault.
+    pub fn get_incremental_snapshot_count(env: Env, vault_id: u64) -> u32 {
+        incremental_snapshots::get_snapshot_count(&env, vault_id)
     }
 }
