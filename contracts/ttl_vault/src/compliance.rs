@@ -364,11 +364,7 @@ fn require_kyc_provider(env: &Env) -> Result<Address, ContractError> {
 /// Record the provider's KYC attestation for `address`. Requires the
 /// registered provider's auth. Returns `false` (and stores nothing) when the
 /// attestation is unusable: zero level, zero reference, or already expired.
-pub fn verify_kyc(
-    env: &Env,
-    address: &Address,
-    kyc_data: KycData,
-) -> Result<bool, ContractError> {
+pub fn verify_kyc(env: &Env, address: &Address, kyc_data: KycData) -> Result<bool, ContractError> {
     let provider = require_kyc_provider(env)?;
     let now = env.ledger().timestamp();
     let empty_ref = BytesN::from_array(env, &[0u8; 32]);
@@ -480,7 +476,9 @@ pub fn clear_threshold_config(env: &Env) {
 }
 
 pub fn get_threshold_config(env: &Env) -> Option<ThresholdConfig> {
-    env.storage().persistent().get(&ComplianceKey::ThresholdConfig)
+    env.storage()
+        .persistent()
+        .get(&ComplianceKey::ThresholdConfig)
 }
 
 pub fn get_cumulative_volume(env: &Env, address: &Address) -> Option<CumulativeVolume> {
@@ -570,7 +568,9 @@ fn monitor_thresholds(env: &Env, address: &Address, tx_id: u64, amount: i128) ->
 }
 
 pub fn get_alert(env: &Env, alert_id: u64) -> Option<ComplianceAlert> {
-    env.storage().persistent().get(&ComplianceKey::Alert(alert_id))
+    env.storage()
+        .persistent()
+        .get(&ComplianceKey::Alert(alert_id))
 }
 
 pub fn get_alert_count(env: &Env) -> u64 {
@@ -664,11 +664,7 @@ fn validate_range(start_date: u64, end_date: u64) -> Result<(), ContractError> {
 }
 
 /// Number of transactions with `start_date <= timestamp <= end_date`.
-pub fn count_transactions(
-    env: &Env,
-    start_date: u64,
-    end_date: u64,
-) -> Result<u64, ContractError> {
+pub fn count_transactions(env: &Env, start_date: u64, end_date: u64) -> Result<u64, ContractError> {
     validate_range(start_date, end_date)?;
     let first = lower_bound(env, start_date);
     let after = if end_date == u64::MAX {
@@ -825,8 +821,10 @@ pub fn sign_report(
         signed_at: env.ledger().timestamp(),
     };
     persist(env, &ComplianceKey::SignedReport(id), &report);
-    env.events()
-        .publish((REPORT_SIGNED_TOPIC, id), (start_date, end_date, report_hash));
+    env.events().publish(
+        (REPORT_SIGNED_TOPIC, id),
+        (start_date, end_date, report_hash),
+    );
     Ok(id)
 }
 

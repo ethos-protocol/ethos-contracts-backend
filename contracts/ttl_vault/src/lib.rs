@@ -13,7 +13,6 @@ use soroban_sdk::{
 };
 
 pub mod aml;
-pub mod composition_rules;
 pub mod compliance;
 pub mod compliance_policy;
 #[cfg(test)]
@@ -53,19 +52,18 @@ use types::{
     PasskeyHash, PasskeyUsageEntry, PauseRecord, PendingBeneficiaryUpdate, ProofOfLifeEntry,
     ProposalStatus, ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry,
     StateTransitionEntry, TokenCollateral, TokenConversion, TokenHedge, TokenLending,
-    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary,
-    VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim,
-    VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit, WithdrawalReversal,
-    WithdrawalScheduleEntry, WithdrawalTracker, UpgradeManifest, YieldDistributionConfig,
-    YieldDistributionMode,
-    ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
-    ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, BACKUP_CODE_USED_TOPIC,
-    BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_CAP_TOPIC,
-    BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_REBALANCED_TOPIC,
-    BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC, BENEFICIARY_UPDATED_TOPIC,
-    BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC, CHECKIN_GEO_TOPIC,
-    CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC, CLAIM_VEST_TOPIC,
-    CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
+    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, UpgradeManifest, Vault,
+    VaultStatusSummary, VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig,
+    VestingPendingClaim, VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit,
+    WithdrawalReversal, WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig,
+    YieldDistributionMode, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
+    ADMIN_TRANSFER_COMPLETED_TOPIC, ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
+    BACKUP_CODE_USED_TOPIC, BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC,
+    BENEFICIARY_CAP_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC,
+    BENEFICIARY_REBALANCED_TOPIC, BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC,
+    BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC,
+    CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
+    CLAIM_VEST_TOPIC, CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     DELEGATE_BENEFICIARY_TOPIC, DELEGATE_CHECKIN_TOPIC, DEPOSIT_TOPIC, DISPUTE_FILED_TOPIC,
     DISPUTE_RESOLVED_TOPIC, DUPLICATE_VAULT_TOPIC, EXPIRY_WARNING_THRESHOLD,
     HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC, INACTIVITY_PENALTY_TOPIC,
@@ -104,39 +102,102 @@ use types::{
     WRAPPED_TOKEN_UNREGISTERED_TOPIC, YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
 };
 use types::{
-    BeneficiaryAuction, BeneficiaryAuctionBid, BeneficiaryConditionalAcceptance,
-    BeneficiaryConflict, BeneficiaryConflictClaim, BeneficiaryRebalancedEvent,
-    BeneficiaryTierSetEvent, BeneficiaryTriggerSetEvent, BeneficiaryVestingSchedule,
-    BeneficiaryWaterfallEvent, ConflictResolution, CountdownConfig, CustomMetadataEntry,
-    PasskeyLockout, PasskeyRecoveryRequest, PasskeyRotationPolicy, ProtocolConfig, ReleaseTrigger,
-    TwoFactorConfigData, VaultSnapshot, VestingAccelerationConfig, VestingForfeitureConfig,
-    VestingRolloverConfig, VestingStaggerEntry, WithdrawalApprovalRequest, WithdrawalEscrow,
-    WithdrawalProof, WithdrawalRateLimit, WithdrawalRollback, AUCTION_BID_TOPIC,
-    AUCTION_CREATED_TOPIC, AUCTION_FINALIZED_TOPIC, BENEFICIARY_CONFLICT_FILED_TOPIC,
-    BENEFICIARY_CONFLICT_RESOLVED_TOPIC, BEN_COMMITTED_TOPIC, BEN_REVEALED_TOPIC,
-    BIND_PASSKEY_BIOMETRIC_TOPIC, BIO_CHECKIN_TOPIC, BURN_EVENT_TOPIC,
-    CLAIM_BENEFICIARY_VESTING_TOPIC, CLAWBACK_UNVESTED_TOPIC, COUNTDOWN_NOTIF_TOPIC,
-    EMERGENCY_RECOVERY_GENERATED_TOPIC, EMERGENCY_RECOVERY_USED_TOPIC, MAX_VESTING_SCHEDULES,
-    MILESTONE_ADJUST_TOPIC, MILESTONE_CLAIM_TOPIC, MILESTONE_EMERGENCY_TOPIC,
-    MILESTONE_PAUSE_TOPIC, MILESTONE_PROGRESS_TOPIC, MILESTONE_RESUME_TOPIC, MILESTONE_VEST_TOPIC,
-    PASSKEY_COMPROMISED_TOPIC, PASSKEY_EXPIRED_TOPIC, PROTOCOL_CONFIG_APPLIED_TOPIC,
-    PROTOCOL_CONFIG_PROPOSED_TOPIC, SET_BENEFICIARY_VESTING_TOPIC, SET_COUNTDOWN_TOPIC,
-    TWO_FACTOR_DISABLED_TOPIC, TWO_FACTOR_ENABLED_TOPIC, TWO_FACTOR_VERIFIED_TOPIC,
-    UNBIND_PASSKEY_BIOMETRIC_TOPIC, VESTING_ACCELERATED_TOPIC, VESTING_FINALIZED_TOPIC,
-    VESTING_FORFEITURE_TOPIC, VESTING_PENALTY_TOPIC, VESTING_REVERSED_TOPIC,
-    VESTING_ROLLOVER_TOPIC, VESTING_SCHEDULE_ADDED_TOPIC, VESTING_STAGGER_TOPIC,
-    WITHDRAWAL_ESCROW_CREATED_TOPIC, WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC,
-    WITHDRAWAL_RATE_LIMITED_TOPIC, WITHDRAWAL_ROLLBACK_TOPIC,
     // Issue #563: cursor pagination
-    BatchCheckInResult, VaultConfigTemplate, VaultPage, VaultSortField,
+    BatchCheckInResult,
+    BeneficiaryAuction,
+    BeneficiaryAuctionBid,
+    BeneficiaryConditionalAcceptance,
+    BeneficiaryConflict,
+    BeneficiaryConflictClaim,
+    BeneficiaryRebalancedEvent,
+    BeneficiaryTierSetEvent,
+    BeneficiaryTriggerSetEvent,
+    BeneficiaryVestingSchedule,
+    BeneficiaryWaterfallEvent,
+    ConflictResolution,
+    CountdownConfig,
+    CustomMetadataEntry,
     // Issue #560: Merkle history proofs
-    MerkleLeaf, MerkleProof,
+    MerkleLeaf,
+    MerkleProof,
+    PasskeyLockout,
+    PasskeyRecoveryRequest,
+    PasskeyRotationPolicy,
+    ProtocolConfig,
+    ReleaseTrigger,
+    TwoFactorConfigData,
+    VaultConfigTemplate,
+    VaultPage,
+    VaultSnapshot,
+    VaultSortField,
+    VestingAccelerationConfig,
+    VestingForfeitureConfig,
+    VestingRolloverConfig,
+    VestingStaggerEntry,
+    WithdrawalApprovalRequest,
+    WithdrawalEscrow,
+    WithdrawalProof,
+    WithdrawalRateLimit,
+    WithdrawalRollback,
+    AUCTION_BID_TOPIC,
+    AUCTION_CREATED_TOPIC,
+    AUCTION_FINALIZED_TOPIC,
+    BENEFICIARY_CONFLICT_FILED_TOPIC,
+    BENEFICIARY_CONFLICT_RESOLVED_TOPIC,
+    BEN_COMMITTED_TOPIC,
+    BEN_REVEALED_TOPIC,
+    BIND_PASSKEY_BIOMETRIC_TOPIC,
+    BIO_CHECKIN_TOPIC,
+    BURN_EVENT_TOPIC,
+    CLAIM_BENEFICIARY_VESTING_TOPIC,
+    CLAWBACK_UNVESTED_TOPIC,
+    COUNTDOWN_NOTIF_TOPIC,
+    EMERGENCY_RECOVERY_GENERATED_TOPIC,
+    EMERGENCY_RECOVERY_USED_TOPIC,
     // New event topics
-    HISTORY_PROOF_TOPIC, HISTORY_ROOT_TOPIC, VAULT_LIST_TOPIC, VAULT_TMPL_REF_TOPIC,
+    HISTORY_PROOF_TOPIC,
+    HISTORY_ROOT_TOPIC,
+    MAX_VESTING_SCHEDULES,
+    MILESTONE_ADJUST_TOPIC,
+    MILESTONE_CLAIM_TOPIC,
+    MILESTONE_EMERGENCY_TOPIC,
+    MILESTONE_PAUSE_TOPIC,
+    MILESTONE_PROGRESS_TOPIC,
+    MILESTONE_RESUME_TOPIC,
+    MILESTONE_VEST_TOPIC,
+    PASSKEY_COMPROMISED_TOPIC,
+    PASSKEY_EXPIRED_TOPIC,
+    PROTOCOL_CONFIG_APPLIED_TOPIC,
+    PROTOCOL_CONFIG_PROPOSED_TOPIC,
+    SET_BENEFICIARY_VESTING_TOPIC,
+    SET_COUNTDOWN_TOPIC,
+    TWO_FACTOR_DISABLED_TOPIC,
+    TWO_FACTOR_ENABLED_TOPIC,
+    TWO_FACTOR_VERIFIED_TOPIC,
+    UNBIND_PASSKEY_BIOMETRIC_TOPIC,
+    VAULT_LIST_TOPIC,
+    VAULT_TMPL_REF_TOPIC,
     VAULT_TMPL_REG_TOPIC,
+    VESTING_ACCELERATED_TOPIC,
+    VESTING_FINALIZED_TOPIC,
+    VESTING_FORFEITURE_TOPIC,
+    VESTING_PENALTY_TOPIC,
+    VESTING_REVERSED_TOPIC,
+    VESTING_ROLLOVER_TOPIC,
+    VESTING_SCHEDULE_ADDED_TOPIC,
+    VESTING_STAGGER_TOPIC,
+    WITHDRAWAL_ESCROW_CREATED_TOPIC,
+    WITHDRAWAL_ESCROW_VERIFIED_TOPIC,
+    WITHDRAWAL_PROOF_TOPIC,
+    WITHDRAWAL_RATE_LIMITED_TOPIC,
+    WITHDRAWAL_ROLLBACK_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
+#[cfg(test)]
+mod beneficiary_conditional_acceptance_tests;
+#[cfg(test)]
+mod beneficiary_dispute_escalation_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
 #[cfg(test)]
@@ -148,13 +209,17 @@ mod bps_invariant_tests;
 #[cfg(test)]
 mod composition_rules_tests;
 #[cfg(test)]
+mod conditional_withdrawal_release_tests;
+#[cfg(test)]
 mod hibernation_consistency_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
-mod passkey_audit_tests;
+mod multisig_withdrawal_tests;
 #[cfg(test)]
 mod passkey_attestation_tests;
+#[cfg(test)]
+mod passkey_audit_tests;
 #[cfg(test)]
 mod passkey_breach_detection_tests;
 #[cfg(test)]
@@ -172,31 +237,23 @@ mod passkey_risk_scoring_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
-mod slice_failover_tests;
-#[cfg(test)]
 mod slice_consensus_voting_tests;
+#[cfg(test)]
+mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
+mod upgrade_validation_tests;
+#[cfg(test)]
 mod withdrawal_escrow_tests;
-#[cfg(test)]
-mod beneficiary_conditional_acceptance_tests;
-#[cfg(test)]
-mod beneficiary_dispute_escalation_tests;
-#[cfg(test)]
-mod conditional_withdrawal_release_tests;
 #[cfg(test)]
 mod withdrawal_notification_confirmation_tests;
 #[cfg(test)]
-mod upgrade_validation_tests;
-#[cfg(test)]
 mod withdrawal_rate_limit_tests;
 #[cfg(test)]
-mod withdrawal_whitelist_tests;
-#[cfg(test)]
-mod multisig_withdrawal_tests;
-#[cfg(test)]
 mod withdrawal_rollback_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -9915,9 +9972,7 @@ impl TtlVaultContract {
             // distinct. Replacing the stored vector below then makes the prior
             // generation unambiguously invalid, even when codes are regenerated
             // in the same ledger timestamp.
-            let code_number = vault_id
-                .wrapping_mul(timestamp)
-                .wrapping_add(i as u64);
+            let code_number = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
             let code_str = String::from_str(&env, "code");
             let mut suffix = String::from_str(&env, "");
             let mut remaining = code_number;
@@ -9933,7 +9988,10 @@ impl TtlVaultContract {
                 }
                 while digit_count > 0 {
                     digit_count -= 1;
-                    suffix.push_str(&String::from_bytes(&env, &Bytes::from_array(&env, &[digits[digit_count]])));
+                    suffix.push_str(&String::from_bytes(
+                        &env,
+                        &Bytes::from_array(&env, &[digits[digit_count]]),
+                    ));
                 }
             }
             let code_str = code_str.concat(&suffix);
@@ -11988,6 +12046,8 @@ impl TtlVaultContract {
     ///
     /// # Returns
     /// A vector of `StateTransitionEntry` records ordered oldest-first.
+    /// Entries moved out by `archive_vault_history` (#557) are no longer
+    /// included; read them with `get_archived_history`.
     pub fn get_state_transition_log(env: Env, vault_id: u64) -> Vec<StateTransitionEntry> {
         env.storage()
             .persistent()
