@@ -21,11 +21,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token::StellarAssetClient,
-    Address, BytesN, Env,
-};
+use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, BytesN, Env};
 
 fn setup() -> (Env, Address, TtlVaultContractClient<'static>) {
     let env = Env::default();
@@ -105,6 +101,64 @@ fn changing_storage_schema_hash_is_rejected() {
 }
 
 #[test]
+fn changing_function_signatures_is_rejected_even_when_export_count_is_unchanged() {
+    let (env, _admin, client) = setup();
+    let storage_hash = schema_hash(&env, 1);
+    let signature_hash = schema_hash(&env, 2);
+    let changed_signature_hash = schema_hash(&env, 3);
+    client.set_upgrade_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
+
+    client.validate_upgrade_compatibility_with_signatures(
+        &10u32,
+        &5u32,
+        &storage_hash,
+        &signature_hash,
+    );
+    let result = client.try_validate_upgrade_compatibility_with_signatures(
+        &10u32,
+        &5u32,
+        &storage_hash,
+        &changed_signature_hash,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn signature_validation_requires_a_signature_baseline() {
+    let (env, _admin, client) = setup();
+    let storage_hash = schema_hash(&env, 1);
+    let signature_hash = schema_hash(&env, 2);
+    client.set_upgrade_manifest(&10u32, &5u32, &storage_hash);
+
+    let result = client.try_validate_upgrade_compatibility_with_signatures(
+        &10u32,
+        &5u32,
+        &storage_hash,
+        &signature_hash,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn signature_aware_upgrade_rejects_changed_signatures() {
+    let (env, _admin, client) = setup();
+    let storage_hash = schema_hash(&env, 1);
+    let signature_hash = schema_hash(&env, 2);
+    let changed_signature_hash = schema_hash(&env, 3);
+    client.set_upgrade_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
+    let wasm_hash = schema_hash(&env, 4);
+
+    let result = client.try_upgrade_with_manifest_and_signatures(
+        &wasm_hash,
+        &10u32,
+        &5u32,
+        &storage_hash,
+        &changed_signature_hash,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn set_upgrade_manifest_increments_version() {
     let (env, _admin, client) = setup();
     let hash = schema_hash(&env, 1);
@@ -128,7 +182,6 @@ fn upgrade_with_manifest_rejects_invalid_hash() {
     client.set_upgrade_manifest(&10u32, &5u32, &hash);
 
     let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-    let result =
-        client.try_upgrade_with_manifest(&zero_hash, &10u32, &5u32, &hash);
+    let result = client.try_upgrade_with_manifest(&zero_hash, &10u32, &5u32, &hash);
     assert!(result.is_err());
 }
