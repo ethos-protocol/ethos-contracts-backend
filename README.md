@@ -324,3 +324,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-495 -->
 - #495: Add Vault Proof-of-Life Attestation System
+
+<!-- handsoff-issue-596 -->
+- #596: Add Infrastructure as Code (IaC)
