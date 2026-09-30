@@ -243,6 +243,8 @@ mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
+mod upgrade_simulation_tests;
+#[cfg(test)]
 mod upgrade_validation_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
@@ -523,6 +525,9 @@ pub enum ContractError {
     InvalidEffectiveDate = 136,
     // Issue #558: compressed vault payload failed to decode / verify
     CompressionCorrupted = 137,
+    // Upgrade safety: a new contract changed a public function signature.
+    UpgradeFunctionSignaturesChanged = 138,
+    UpgradeFunctionSignaturesNotSet = 139,
 }
 
 #[contract]
@@ -1049,9 +1054,38 @@ impl TtlVaultContract {
             .set(&DataKey::UpgradeManifest, &manifest);
     }
 
+    /// Admin-only. Records the function-signature fingerprint alongside the
+    /// legacy upgrade manifest. The fingerprint is computed from the sorted
+    /// public function names, argument types, and return types in the WASM spec.
+    pub fn set_upgrade_manifest_with_signatures(
+        env: Env,
+        exported_fn_count: u32,
+        error_code_count: u32,
+        storage_schema_hash: BytesN<32>,
+        function_signatures_hash: BytesN<32>,
+    ) {
+        Self::set_upgrade_manifest(
+            env.clone(),
+            exported_fn_count,
+            error_code_count,
+            storage_schema_hash,
+        );
+        env.storage().instance().set(
+            &DataKey::UpgradeFunctionSignaturesHash,
+            &function_signatures_hash,
+        );
+    }
+
     /// Returns the currently recorded upgrade manifest, if any.
     pub fn get_upgrade_manifest(env: Env) -> Option<UpgradeManifest> {
         env.storage().instance().get(&DataKey::UpgradeManifest)
+    }
+
+    /// Returns the recorded public function-signature fingerprint, if set.
+    pub fn get_upgrade_function_signatures_hash(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeFunctionSignaturesHash)
     }
 
     /// Validates that a proposed upgrade is backward-compatible with the
@@ -1093,6 +1127,34 @@ impl TtlVaultContract {
         }
     }
 
+    /// Validates the legacy manifest and requires an identical public function
+    /// signature fingerprint for the proposed contract.
+    pub fn validate_upgrade_compatibility_with_signatures(
+        env: Env,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+        new_function_signatures_hash: BytesN<32>,
+    ) {
+        Self::validate_upgrade_compatibility(
+            env.clone(),
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+        );
+        let current_function_signatures_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeFunctionSignaturesHash)
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::UpgradeFunctionSignaturesNotSet)
+            });
+
+        if new_function_signatures_hash != current_function_signatures_hash {
+            panic_with_error!(&env, ContractError::UpgradeFunctionSignaturesChanged);
+        }
+    }
+
     /// Admin-only. Validates and upgrades the contract to a new WASM hash.
     ///
     /// This only performs the basic non-zero-hash check. Prefer
@@ -1106,6 +1168,9 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .remove(&DataKey::UpgradeFunctionSignaturesHash);
     }
 
     /// Admin-only. Full upgrade-safety path: validates the hash, validates
@@ -1134,12 +1199,49 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .remove(&DataKey::UpgradeFunctionSignaturesHash);
 
         Self::set_upgrade_manifest(
             env,
             new_exported_fn_count,
             new_error_code_count,
             new_storage_schema_hash,
+        );
+    }
+
+    /// Admin-only. Performs an upgrade after validating the full manifest,
+    /// including an exact public function-signature fingerprint.
+    pub fn upgrade_with_manifest_and_signatures(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+        new_function_signatures_hash: BytesN<32>,
+    ) {
+        Self::require_admin(&env);
+        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
+        Self::validate_upgrade_compatibility_with_signatures(
+            env.clone(),
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash.clone(),
+            new_function_signatures_hash.clone(),
+        );
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::set_upgrade_manifest_with_signatures(
+            env,
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+            new_function_signatures_hash,
         );
     }
 

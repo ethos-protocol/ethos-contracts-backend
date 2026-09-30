@@ -549,6 +549,7 @@ pub enum DataKey {
     // Upgrade safety: recorded interface/storage fingerprint of the
     // currently running contract, checked by validate_upgrade.
     UpgradeManifest,
+    UpgradeFunctionSignaturesHash,
 
     // ── Issue #563: Cursor-based pagination ────────────────────────────────────
     // (No extra storage keys needed; pagination is computed from existing keys.)
