@@ -254,6 +254,14 @@ mod withdrawal_rate_limit_tests;
 mod withdrawal_rollback_tests;
 #[cfg(test)]
 mod withdrawal_whitelist_tests;
+#[cfg(test)]
+mod invariant_tests;
+#[cfg(test)]
+mod load_tests;
+#[cfg(test)]
+mod mutation_tests;
+#[cfg(test)]
+mod performance_regression_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
