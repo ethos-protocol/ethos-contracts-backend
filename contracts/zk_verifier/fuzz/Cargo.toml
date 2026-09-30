@@ -26,3 +26,22 @@ name = "fuzz_compression"
 path = "src/fuzz_compression.rs"
 test = false
 doc = false
+
+# issue #572: fuzz targets for core ZK verifier functions
+[[bin]]
+name = "fuzz_verify_claim"
+path = "src/fuzz_verify_claim.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_verify_lattice_proof"
+path = "src/fuzz_verify_lattice_proof.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_attest"
+path = "src/fuzz_attest.rs"
+test = false
+doc = false

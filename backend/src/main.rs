@@ -87,6 +87,8 @@ use ethos_protocol_backend::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod stellar_integration_tests;
 
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
