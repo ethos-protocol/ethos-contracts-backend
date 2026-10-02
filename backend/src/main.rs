@@ -16,6 +16,11 @@ use ethos_protocol_backend::{
         create_alert_rule, delete_alert_rule, evaluate_alerts, get_alert_rule, list_alert_rules,
         list_fired_alerts, AlertRulesState,
     },
+    sla::{
+        create_sla_policy, delete_sla_policy, get_compliance_summary, get_sla_policy,
+        get_sla_report, list_sla_breaches, list_sla_policies, record_sla_measurement,
+        update_sla_policy, SlaState,
+    },
     automated_rollback::{
         create_rollback_plan, get_rollback_plan, list_rollback_history, list_rollback_plans,
         run_post_deployment_tests, trigger_rollback, RollbackState,
@@ -614,6 +619,27 @@ async fn main() {
         )
         .with_state(rollback_state);
 
+    // ── Issue #600: SLA Monitoring and Reporting ───────────────────────────────
+    // Tracks per-service SLA policies, records compliance measurements, detects
+    // breaches in real time, and surfaces compliance reports.
+    let sla_state = Arc::new(SlaState::new());
+    let sla_router = Router::new()
+        .route(
+            "/sla/policies",
+            post(create_sla_policy).get(list_sla_policies),
+        )
+        .route(
+            "/sla/policies/:id",
+            get(get_sla_policy)
+                .put(update_sla_policy)
+                .delete(delete_sla_policy),
+        )
+        .route("/sla/records", post(record_sla_measurement))
+        .route("/sla/report", get(get_sla_report))
+        .route("/sla/breaches", get(list_sla_breaches))
+        .route("/sla/compliance", get(get_compliance_summary))
+        .with_state(sla_state);
+
     let app = build_router(state)
         // .merge(acl_router)
         // .merge(custom_metrics_router)
@@ -622,7 +648,8 @@ async fn main() {
         // .merge(log_router)
         .merge(webauthn_router)
         .merge(cost_router)
-        .merge(dr_router);
+        .merge(dr_router)
+        .merge(sla_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
