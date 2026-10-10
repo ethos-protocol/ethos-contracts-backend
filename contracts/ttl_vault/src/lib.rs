@@ -42,6 +42,9 @@ mod types;
 pub mod vault_compression;
 #[cfg(test)]
 mod vault_compression_tests;
+pub mod vault_governance;
+#[cfg(test)]
+mod vault_governance_tests;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
     BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
