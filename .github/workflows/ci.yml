@@ -49,6 +49,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Issue #672: fail fast when a module path is used in lib.rs without a
+      # matching `mod` declaration (the crate stops compiling otherwise).
+      - name: Check module declarations
+        run: scripts/check_module_declarations.sh
+
       - name: Build crate
         run: cargo build --package ttl-vault --lib
 

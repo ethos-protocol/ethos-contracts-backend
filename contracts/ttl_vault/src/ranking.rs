@@ -80,7 +80,9 @@ pub fn set_rank(env: &Env, caller: &Address, beneficiary: Address, priority: u32
 /// performance sample) so the next [`get_rank`] recomputes instead of returning
 /// a stale position.
 pub fn invalidate_ranks(env: &Env) {
-    env.storage().persistent().set(&RankingKey::RankStale, &true);
+    env.storage()
+        .persistent()
+        .set(&RankingKey::RankStale, &true);
 }
 
 /// `true` when the cached rank positions are stale.
@@ -121,13 +123,16 @@ pub fn recompute_ranks(env: &Env) {
 
     let mut position = 1u32;
     for beneficiary in ordered.iter() {
-        env.storage()
-            .persistent()
-            .set(&RankingKey::CachedRank(beneficiary.address.clone()), &position);
+        env.storage().persistent().set(
+            &RankingKey::CachedRank(beneficiary.address.clone()),
+            &position,
+        );
         position = position.saturating_add(1);
     }
 
-    env.storage().persistent().set(&RankingKey::RankStale, &false);
+    env.storage()
+        .persistent()
+        .set(&RankingKey::RankStale, &false);
 }
 
 /// Return the cached 1-based rank position for `beneficiary`.

@@ -1,7 +1,7 @@
-/// Issue #563 — Cursor-based pagination tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and do **not** run the full
-/// contract binary.  Do not add integration/end-to-end assertions here.
+//! Issue #563 — Cursor-based pagination tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and do **not** run the full
+//! contract binary.  Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;

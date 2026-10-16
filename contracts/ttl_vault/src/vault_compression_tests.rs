@@ -1,7 +1,7 @@
-/// Issue #558 — Vault compression for inactive accounts tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #558 — Vault compression for inactive accounts tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;
@@ -40,8 +40,7 @@ fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
 }
 
 fn go_idle(env: &Env, days: u64) {
-    env.ledger()
-        .with_mut(|l| l.timestamp = 1_000 + days * DAY);
+    env.ledger().with_mut(|l| l.timestamp = 1_000 + days * DAY);
 }
 
 /// Long interval so the vault is not expired while idle in these tests.

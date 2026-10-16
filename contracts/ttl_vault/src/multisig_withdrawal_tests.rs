@@ -25,7 +25,7 @@ fn setup() -> (
     Address, // signer2
     Address, // contract address
     TtlVaultContractClient<'static>,
-    u64,     // vault_id
+    u64, // vault_id
 ) {
     let env = Env::default();
     env.mock_all_auths();
@@ -57,7 +57,16 @@ fn setup() -> (
     );
 
     let client: TtlVaultContractClient<'static> = unsafe { core::mem::transmute(client) };
-    (env, owner, beneficiary, signer1, signer2, contract_address, client, vault_id)
+    (
+        env,
+        owner,
+        beneficiary,
+        signer1,
+        signer2,
+        contract_address,
+        client,
+        vault_id,
+    )
 }
 
 /// Setting a large withdrawal threshold stores the configuration.
@@ -103,7 +112,8 @@ fn test_large_withdrawal_requires_multisig() {
     client.deposit(&owner, &vault_id, &20000i128);
 
     // Beneficiary requests a withdrawal of 10000 tokens (above threshold)
-    let withdrawal_id = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Withdrawal should be pending, not executed
     let vault = client.get_vault(&vault_id);
@@ -133,7 +143,8 @@ fn test_insufficient_signatures_blocks_withdrawal() {
     client.deposit(&owner, &vault_id, &20000i128);
 
     // Beneficiary requests a withdrawal of 10000 tokens
-    let withdrawal_id = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Only signer1 approves (need 2 signatures)
     client.approve_large_withdrawal(&vault_id, &signer1, &withdrawal_id);
@@ -155,7 +166,8 @@ fn test_multisig_approval_expires_after_24_hours() {
     client.deposit(&owner, &vault_id, &20000i128);
 
     // Beneficiary requests a withdrawal of 10000 tokens
-    let withdrawal_id = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Signer1 and Signer2 approve
     client.approve_large_withdrawal(&vault_id, &signer1, &withdrawal_id);
@@ -182,7 +194,8 @@ fn test_signer_rejection_blocks_withdrawal() {
     client.deposit(&owner, &vault_id, &20000i128);
 
     // Beneficiary requests a withdrawal of 10000 tokens
-    let withdrawal_id = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Signer2 rejects the withdrawal
     client.reject_large_withdrawal(&vault_id, &signer2, &withdrawal_id);
@@ -203,10 +216,12 @@ fn test_multiple_concurrent_large_withdrawals() {
     client.deposit(&owner, &vault_id, &40000i128);
 
     // Beneficiary requests first withdrawal of 10000 tokens
-    let withdrawal_id1 = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id1 =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Beneficiary requests second withdrawal of 10000 tokens
-    let withdrawal_id2 = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id2 =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Approve and execute first withdrawal
     client.approve_large_withdrawal(&vault_id, &signer1, &withdrawal_id1);
@@ -259,7 +274,8 @@ fn test_unauthorized_signer_cannot_approve() {
     client.deposit(&owner, &vault_id, &20000i128);
 
     // Beneficiary requests a withdrawal of 10000 tokens
-    let withdrawal_id = client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
+    let withdrawal_id =
+        client.propose_large_withdrawal(&beneficiary, &vault_id, &10000i128, &beneficiary);
 
     // Unauthorized signer attempts to approve
     client.approve_large_withdrawal(&vault_id, &unauthorized, &withdrawal_id);

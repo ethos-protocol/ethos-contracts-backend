@@ -17,6 +17,7 @@ pub mod compliance;
 pub mod compliance_policy;
 #[cfg(test)]
 mod compliance_policy_tests;
+pub mod composition_rules;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
@@ -24,6 +25,9 @@ pub mod credential_lifecycle;
 #[cfg(test)]
 mod credential_lifecycle_tests;
 mod diff_codec;
+pub mod donations;
+#[cfg(test)]
+mod donations_tests;
 pub mod history_archive;
 #[cfg(test)]
 mod history_archive_tests;
@@ -45,6 +49,11 @@ mod vault_compression_tests;
 pub mod vault_governance;
 #[cfg(test)]
 mod vault_governance_tests;
+pub mod vault_nft;
+#[cfg(test)]
+mod vault_nft_tests;
+#[cfg(test)]
+use types::VaultSortField;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
     BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
@@ -105,8 +114,6 @@ use types::{
     WRAPPED_TOKEN_UNREGISTERED_TOPIC, YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
 };
 use types::{
-    // Issue #563: cursor pagination
-    BatchCheckInResult,
     BeneficiaryAuction,
     BeneficiaryAuctionBid,
     BeneficiaryConditionalAcceptance,
@@ -121,18 +128,13 @@ use types::{
     CountdownConfig,
     CustomMetadataEntry,
     // Issue #560: Merkle history proofs
-    MerkleLeaf,
-    MerkleProof,
     PasskeyLockout,
     PasskeyRecoveryRequest,
     PasskeyRotationPolicy,
     ProtocolConfig,
     ReleaseTrigger,
     TwoFactorConfigData,
-    VaultConfigTemplate,
-    VaultPage,
     VaultSnapshot,
-    VaultSortField,
     VestingAccelerationConfig,
     VestingForfeitureConfig,
     VestingRolloverConfig,
@@ -158,8 +160,6 @@ use types::{
     EMERGENCY_RECOVERY_GENERATED_TOPIC,
     EMERGENCY_RECOVERY_USED_TOPIC,
     // New event topics
-    HISTORY_PROOF_TOPIC,
-    HISTORY_ROOT_TOPIC,
     MAX_VESTING_SCHEDULES,
     MILESTONE_ADJUST_TOPIC,
     MILESTONE_CLAIM_TOPIC,
@@ -178,9 +178,6 @@ use types::{
     TWO_FACTOR_ENABLED_TOPIC,
     TWO_FACTOR_VERIFIED_TOPIC,
     UNBIND_PASSKEY_BIOMETRIC_TOPIC,
-    VAULT_LIST_TOPIC,
-    VAULT_TMPL_REF_TOPIC,
-    VAULT_TMPL_REG_TOPIC,
     VESTING_ACCELERATED_TOPIC,
     VESTING_FINALIZED_TOPIC,
     VESTING_FORFEITURE_TOPIC,
@@ -216,9 +213,15 @@ mod conditional_withdrawal_release_tests;
 #[cfg(test)]
 mod hibernation_consistency_tests;
 #[cfg(test)]
+mod invariant_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
+mod load_tests;
+#[cfg(test)]
 mod multisig_withdrawal_tests;
+#[cfg(test)]
+mod mutation_tests;
 #[cfg(test)]
 mod passkey_attestation_tests;
 #[cfg(test)]
@@ -237,6 +240,8 @@ mod passkey_expiry_notification_tests;
 mod passkey_metadata_tests;
 #[cfg(test)]
 mod passkey_risk_scoring_tests;
+#[cfg(test)]
+mod performance_regression_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
@@ -259,14 +264,6 @@ mod withdrawal_rate_limit_tests;
 mod withdrawal_rollback_tests;
 #[cfg(test)]
 mod withdrawal_whitelist_tests;
-#[cfg(test)]
-mod invariant_tests;
-#[cfg(test)]
-mod load_tests;
-#[cfg(test)]
-mod mutation_tests;
-#[cfg(test)]
-mod performance_regression_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -531,6 +528,25 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    // Compliance / AML: blacklist, allowlist, KYC and transaction reporting
+    AddressBlacklisted = 140,
+    AddressNotAllowlisted = 141,
+    InvalidBlacklistReason = 142,
+    KycRequired = 143,
+    KycNotFound = 144,
+    KycProviderNotSet = 145,
+    AlertNotFound = 146,
+    InvalidReportRange = 147,
+    ReportSignerNotSet = 148,
+    // Composition rules: a new rule conflicts with an enabled rule of the same priority
+    ConflictingRule = 149,
+    // Issue #613: vault donations
+    DonationAccountNotSet = 150,
+    DonationsNotPublic = 151,
+    // Issue #614: vault NFTs
+    NftNotFound = 152,
+    NftMetadataTooLong = 153,
+    CannotBuyOwnNft = 154,
 }
 
 #[contract]
@@ -1043,8 +1059,7 @@ impl TtlVaultContract {
             .storage()
             .instance()
             .get::<DataKey, UpgradeManifest>(&DataKey::UpgradeManifest)
-            .map(|m| m.version + 1)
-            .unwrap_or(1);
+            .map_or(1, |m| m.version + 1);
 
         let manifest = UpgradeManifest {
             exported_fn_count,
@@ -1060,7 +1075,7 @@ impl TtlVaultContract {
     /// Admin-only. Records the function-signature fingerprint alongside the
     /// legacy upgrade manifest. The fingerprint is computed from the sorted
     /// public function names, argument types, and return types in the WASM spec.
-    pub fn set_upgrade_manifest_with_signatures(
+    pub fn set_manifest_with_signatures(
         env: Env,
         exported_fn_count: u32,
         error_code_count: u32,
@@ -1085,7 +1100,7 @@ impl TtlVaultContract {
     }
 
     /// Returns the recorded public function-signature fingerprint, if set.
-    pub fn get_upgrade_function_signatures_hash(env: Env) -> Option<BytesN<32>> {
+    pub fn get_upgrade_signatures_hash(env: Env) -> Option<BytesN<32>> {
         env.storage()
             .instance()
             .get(&DataKey::UpgradeFunctionSignaturesHash)
@@ -1132,7 +1147,7 @@ impl TtlVaultContract {
 
     /// Validates the legacy manifest and requires an identical public function
     /// signature fingerprint for the proposed contract.
-    pub fn validate_upgrade_compatibility_with_signatures(
+    pub fn validate_upgrade_signatures(
         env: Env,
         new_exported_fn_count: u32,
         new_error_code_count: u32,
@@ -1216,7 +1231,7 @@ impl TtlVaultContract {
 
     /// Admin-only. Performs an upgrade after validating the full manifest,
     /// including an exact public function-signature fingerprint.
-    pub fn upgrade_with_manifest_and_signatures(
+    pub fn upgrade_with_signatures(
         env: Env,
         new_wasm_hash: BytesN<32>,
         new_exported_fn_count: u32,
@@ -1226,7 +1241,7 @@ impl TtlVaultContract {
     ) {
         Self::require_admin(&env);
         Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
-        Self::validate_upgrade_compatibility_with_signatures(
+        Self::validate_upgrade_signatures(
             env.clone(),
             new_exported_fn_count,
             new_error_code_count,
@@ -1239,7 +1254,7 @@ impl TtlVaultContract {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
-        Self::set_upgrade_manifest_with_signatures(
+        Self::set_manifest_with_signatures(
             env,
             new_exported_fn_count,
             new_error_code_count,
@@ -1979,6 +1994,8 @@ impl TtlVaultContract {
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(check_in_interval),
         );
+        // Issue #614: mint the vault's NFT proof to the owner.
+        vault_nft::mint_for_vault(&env, vault_id, &owner);
         env.events().publish(
             (VAULT_CREATED_TOPIC,),
             (vault_id, owner, beneficiary, check_in_interval, timestamp),
@@ -2250,7 +2267,6 @@ impl TtlVaultContract {
         );
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
-        compliance::record_transaction(&env, amount, true);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -2546,7 +2562,6 @@ impl TtlVaultContract {
 
         // Issue #569: Record successful withdrawal in audit trail
         Self::record_withdrawal_audit(&env, vault_id, &caller, amount, true, "");
-        compliance::record_transaction(&env, amount, false);
 
         // Issue #571: Emit withdrawal notification event
         env.events().publish(
@@ -9713,7 +9728,7 @@ impl TtlVaultContract {
             .get(&DataKey::VaultAuditLogLen(vault_id))
             .unwrap_or(0u32);
         if total > 0 {
-            let num_pages = (total + Self::AUDIT_LOG_PAGE_SIZE - 1) / Self::AUDIT_LOG_PAGE_SIZE;
+            let num_pages = total.div_ceil(Self::AUDIT_LOG_PAGE_SIZE);
             for page_index in 0..num_pages {
                 let page: Vec<AuditEntry> = env
                     .storage()
@@ -10185,28 +10200,29 @@ impl TtlVaultContract {
             // generation unambiguously invalid, even when codes are regenerated
             // in the same ledger timestamp.
             let code_number = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
-            let code_str = String::from_str(&env, "code");
-            let mut suffix = String::from_str(&env, "");
+            // Render "code" followed by the decimal digits of `code_number`.
+            // soroban_sdk::String has no push/concat, so build the bytes directly.
+            // u64 has at most 20 decimal digits, so 24 bytes always fit.
+            let mut buf = [0u8; 24];
+            buf[..4].copy_from_slice(b"code");
+            let mut len = 4usize;
+            let mut digits = [0u8; 20];
+            let mut digit_count = 0usize;
             let mut remaining = code_number;
-            if remaining == 0 {
-                suffix.push_str(&String::from_str(&env, "0"));
-            } else {
-                let mut digits = [0u8; 20];
-                let mut digit_count = 0usize;
-                while remaining > 0 {
-                    digits[digit_count] = b'0' + (remaining % 10) as u8;
-                    digit_count += 1;
-                    remaining /= 10;
-                }
-                while digit_count > 0 {
-                    digit_count -= 1;
-                    suffix.push_str(&String::from_bytes(
-                        &env,
-                        &Bytes::from_array(&env, &[digits[digit_count]]),
-                    ));
+            loop {
+                digits[digit_count] = b'0' + (remaining % 10) as u8;
+                digit_count += 1;
+                remaining /= 10;
+                if remaining == 0 {
+                    break;
                 }
             }
-            let code_str = code_str.concat(&suffix);
+            while digit_count > 0 {
+                digit_count -= 1;
+                buf[len] = digits[digit_count];
+                len += 1;
+            }
+            let code_str = String::from_bytes(&env, &buf[..len]);
             codes.push_back(BackupCode {
                 code: code_str.clone(),
                 used: false,
@@ -15394,9 +15410,11 @@ impl TtlVaultContract {
         if caller != admin {
             return Err(ContractError::NotAdmin);
         }
-        Ok(composition_rules::register_composition_rule(
-            &env, rule_bytes, priority, tag,
-        ))
+        composition_rules::register_composition_rule(&env, rule_bytes, priority, tag).map_err(
+            |composition_rules::CompositionRuleError::ConflictingRule(_)| {
+                ContractError::ConflictingRule
+            },
+        )
     }
 
     /// Enable or disable an existing composition rule.
@@ -15466,6 +15484,137 @@ impl TtlVaultContract {
     /// Retrieve the rule IDs associated with `slice_id`.
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
+    }
+
+    // ── Issue #613: Vault Donation Features ──────────────────────────────────
+
+    /// Owner-only. Configure or replace the donation account for `vault_id`.
+    ///
+    /// `public_visibility` controls whether donation records are listed
+    /// publicly via `list_donations`; totals are always public.
+    pub fn set_donation_account(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        recipient: Address,
+        public_visibility: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        donations::set_donation_account(&env, vault_id, recipient, public_visibility);
+        Ok(())
+    }
+
+    /// Donate `amount` of the vault's token to its donation account.
+    ///
+    /// Funds move directly from `donor` to the donation account, and the call
+    /// returns the issued tax receipt. The donor must pass AML screening.
+    pub fn donate(
+        env: Env,
+        vault_id: u64,
+        donor: Address,
+        amount: i128,
+    ) -> donations::DonationRecord {
+        donor.require_auth();
+        Self::assert_compliant(&env, &donor);
+        let vault = Self::load_vault(&env, vault_id);
+        donations::donate(&env, vault_id, &donor, &vault.token_address, amount)
+    }
+
+    /// Return the donation account configured for `vault_id`, if any.
+    pub fn get_donation_account(env: Env, vault_id: u64) -> Option<donations::DonationAccount> {
+        donations::get_donation_account(&env, vault_id)
+    }
+
+    /// Return the tax receipt for `receipt_no` on `vault_id`, if it exists.
+    pub fn get_donation_receipt(
+        env: Env,
+        vault_id: u64,
+        receipt_no: u64,
+    ) -> Option<donations::DonationRecord> {
+        donations::get_donation(&env, vault_id, receipt_no)
+    }
+
+    /// Total amount donated to `vault_id` across all donors.
+    pub fn get_donation_total(env: Env, vault_id: u64) -> i128 {
+        donations::get_vault_donation_total(&env, vault_id)
+    }
+
+    /// Total amount `donor` has donated to `vault_id`.
+    pub fn get_donor_total(env: Env, vault_id: u64, donor: Address) -> i128 {
+        donations::get_donor_donation_total(&env, vault_id, &donor)
+    }
+
+    /// Paginated public listing of donation records, starting at
+    /// `start_receipt_no` (1-based). Requires public visibility to be enabled.
+    pub fn list_donations(
+        env: Env,
+        vault_id: u64,
+        start_receipt_no: u64,
+        limit: u32,
+    ) -> Vec<donations::DonationRecord> {
+        donations::list_donations(&env, vault_id, start_receipt_no, limit)
+    }
+
+    // ── Issue #614: Vault NFT Minting ─────────────────────────────────────────
+
+    /// Return the NFT minted for `vault_id` on creation, if any.
+    pub fn get_vault_nft(env: Env, vault_id: u64) -> Option<vault_nft::VaultNft> {
+        vault_nft::get_vault_nft(&env, vault_id)
+    }
+
+    /// Return the NFT with `token_id`, if it exists.
+    pub fn get_nft_by_token(env: Env, token_id: u64) -> Option<vault_nft::VaultNft> {
+        vault_nft::get_nft_by_token(&env, token_id)
+    }
+
+    /// Current holder of the NFT for `vault_id`.
+    pub fn get_nft_owner(env: Env, vault_id: u64) -> Option<Address> {
+        vault_nft::get_nft_owner(&env, vault_id)
+    }
+
+    /// Holder-only. Set the metadata stored on the NFT for `vault_id`.
+    pub fn set_nft_metadata(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        metadata: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        match vault_nft::get_nft_owner(&env, vault_id) {
+            None => Err(ContractError::NftNotFound),
+            Some(holder) if holder != caller => Err(ContractError::NotOwner),
+            Some(_) => {
+                vault_nft::set_nft_metadata(&env, vault_id, metadata);
+                Ok(())
+            }
+        }
+    }
+
+    /// Buy the NFT `token_id` from its current holder for `price` of the
+    /// vault's token. Funds go directly to the seller and the sale is recorded.
+    /// The buyer must pass AML screening.
+    pub fn buy_nft(env: Env, token_id: u64, buyer: Address, price: i128) -> vault_nft::NftSale {
+        buyer.require_auth();
+        Self::assert_compliant(&env, &buyer);
+        let nft = vault_nft::get_nft_by_token(&env, token_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NftNotFound));
+        let vault = Self::load_vault(&env, nft.vault_id);
+        vault_nft::buy_nft(&env, token_id, &buyer, &vault.token_address, price)
+    }
+
+    /// Paginated sales history for the NFT `token_id`, starting at
+    /// `start_sale_no` (1-based).
+    pub fn list_nft_sales(
+        env: Env,
+        token_id: u64,
+        start_sale_no: u64,
+        limit: u32,
+    ) -> Vec<vault_nft::NftSale> {
+        vault_nft::list_nft_sales(&env, token_id, start_sale_no, limit)
     }
 
     // ── Issue #32: Credential Anchoring to External Systems ───────────────────
@@ -16326,9 +16475,10 @@ impl TtlVaultContract {
     /// Compressed vaults are decompressed transparently on read, and restored
     /// uncompressed by the next state-changing operation.
     pub fn compress_vault(env: Env, vault_id: u64) -> bool {
-        let ttl = Self::try_load_vault(&env, vault_id)
-            .map(|v| vault_ttl_ledgers(v.check_in_interval))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+        let ttl = Self::try_load_vault(&env, vault_id).map_or_else(
+            || panic_with_error!(&env, ContractError::VaultNotFound),
+            |v| vault_ttl_ledgers(v.check_in_interval),
+        );
         vault_compression::compress(&env, vault_id, ttl)
     }
 

@@ -73,7 +73,9 @@ fn test_hibernation_state_survives_wake_cycle() {
         "TTL must be frozen while hibernating, regardless of elapsed check-in interval"
     );
     // The hibernation entry itself must be unchanged mid-window (no implicit wake).
-    let mid_entry = client.get_hibernation(&vault_id).expect("still hibernating");
+    let mid_entry = client
+        .get_hibernation(&vault_id)
+        .expect("still hibernating");
     assert_eq!(mid_entry.started_at, entry.started_at);
     assert_eq!(mid_entry.duration_seconds, entry.duration_seconds);
 
@@ -133,7 +135,8 @@ fn test_early_exit_preserves_remaining_ttl_budget() {
         "remaining TTL budget must be preserved across early hibernation exit"
     );
 
-    env.ledger().with_mut(|l| l.timestamp = elapsed + interval + 1);
+    env.ledger()
+        .with_mut(|l| l.timestamp = elapsed + interval + 1);
     assert!(client.is_expired(&vault_id));
 }
 
