@@ -55,7 +55,7 @@ the backend source.
 
 | Header | Purpose |
 |---|---|
-| `Authorization: Bearer <token>` | Identifies the caller for rate limiting. On admin endpoints (AML flags, anomaly seasonality/investigations) the token must equal `ADMIN_API_KEY` when that env var is set. |
+| `Authorization: Bearer <token>` | Identifies the caller for rate limiting. On admin endpoints (AML flags, anomaly seasonality/investigations) the token must equal `ADMIN_API_KEY`. If that env var is unset, admin requests are rejected with `401` unless `ALLOW_INSECURE_ADMIN=true` is set, which is for local development only. |
 | `X-User-Tier: free \| pro \| enterprise \| admin` | Rate-limit tier. Only honoured when `Authorization` is present; otherwise the caller is `Unauthenticated`. |
 | `X-Priority: low \| normal \| high \| critical` | Admission priority under load (default `normal`). Low-priority requests are shed first. |
 | `Idempotency-Key: <string>` | Makes `POST /api/vaults/:vault_id/reminder-preferences` safe to retry; repeated keys replay the first response. |
