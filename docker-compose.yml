@@ -36,8 +36,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/src:/app/src
+    # No source bind mounts here: this file runs the image built from the
+    # Dockerfile, so what runs is what was built and scanned. Live reload
+    # against ./backend/src lives in docker-compose.override.yml (#693).
 
   redis:
     image: redis:7-alpine

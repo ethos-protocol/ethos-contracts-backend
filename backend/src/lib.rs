@@ -27,6 +27,7 @@ pub mod consistency;
 pub mod contract_version_check;
 pub mod cost_tracking;
 pub mod db;
+pub mod db_read_pool;
 pub mod deadlock;
 pub mod decompression;
 pub mod degradation;
@@ -92,6 +93,7 @@ pub mod tracing;
 pub mod tracing_sampling;
 pub mod two_factor;
 pub mod webauthn;
+pub mod webauthn_config;
 pub mod webhook;
 pub mod websocket;
 
