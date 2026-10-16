@@ -21,6 +21,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege default: read-only repository access for every job.
+# Jobs that need more scope must declare it explicitly (see #683).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

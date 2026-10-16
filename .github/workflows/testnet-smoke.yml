@@ -8,11 +8,20 @@ on:
 env:
   STELLAR_CLI_VERSION: "21.4.0"
 
+# Workflow-level default is read-only. The smoke-test job also files and
+# comments on a failure issue (github-script step), so it alone gets
+# `issues: write`.
+permissions:
+  contents: read
+
 jobs:
   smoke-test:
     name: Stellar Testnet Smoke Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
 
     steps:
       - uses: actions/checkout@v4
