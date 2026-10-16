@@ -99,7 +99,11 @@ fn invariant_balance_never_negative() {
         .try_withdraw(&vault_id, &owner, &100_000i128)
         .unwrap_err()
         .unwrap();
-    assert_ne!(err, ContractError::NotFound, "Expected insufficient-funds error");
+    assert_ne!(
+        err,
+        ContractError::NotFound,
+        "Expected insufficient-funds error"
+    );
     assert_eq!(
         client.get_vault_balance(&vault_id),
         50_000,
@@ -120,9 +124,21 @@ fn invariant_bps_sum_equals_10000() {
 
     let entries = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 5_000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b2.clone(), bps: 3_000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b3.clone(), bps: 2_000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 5_000,
+            minimum_threshold: 0,
+        },
+        BeneficiaryEntry {
+            address: b2.clone(),
+            bps: 3_000,
+            minimum_threshold: 0,
+        },
+        BeneficiaryEntry {
+            address: b3.clone(),
+            bps: 2_000,
+            minimum_threshold: 0,
+        },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
@@ -141,14 +157,19 @@ fn invariant_bps_rejects_invalid_sum() {
 
     let bad = vec![
         &env,
-        BeneficiaryEntry { address: b1.clone(), bps: 3_000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b2.clone(), bps: 3_000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: b1.clone(),
+            bps: 3_000,
+            minimum_threshold: 0,
+        },
+        BeneficiaryEntry {
+            address: b2.clone(),
+            bps: 3_000,
+            minimum_threshold: 0,
+        },
     ];
     let result = client.try_set_beneficiaries(&vault_id, &owner, &bad);
-    assert!(
-        result.is_err(),
-        "BPS invariant: must reject sum != 10_000"
-    );
+    assert!(result.is_err(), "BPS invariant: must reject sum != 10_000");
 }
 
 // ── Invariant 3: TTL reset on check-in ───────────────────────────────────────
@@ -202,7 +223,10 @@ fn invariant_release_once() {
 
     // Second release must be rejected.
     let second = client.try_trigger_release(&vault_id);
-    assert!(second.is_err(), "Invariant violated: double release succeeded");
+    assert!(
+        second.is_err(),
+        "Invariant violated: double release succeeded"
+    );
 }
 
 // ── Invariant 5: Owner-only ───────────────────────────────────────────────────

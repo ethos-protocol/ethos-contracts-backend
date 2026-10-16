@@ -1,7 +1,7 @@
-/// Issue #560 — Merkle tree for efficient vault history proofs tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and do **not** run the full
-/// contract binary.  Do not add integration/end-to-end assertions here.
+//! Issue #560 — Merkle tree for efficient vault history proofs tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and do **not** run the full
+//! contract binary.  Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;

@@ -355,7 +355,10 @@ fn regression_threshold_one_activates_on_first_failure() {
         &slice_failover::FailoverReason::ThresholdExceeded,
     );
 
-    assert!(activated, "threshold=1 must activate on the very first failure");
+    assert!(
+        activated,
+        "threshold=1 must activate on the very first failure"
+    );
     assert_eq!(
         client.get_active_slice(&primary_id),
         backup_id,
@@ -600,7 +603,10 @@ fn regression_failover_events_emitted_exactly_once() {
             .map(|s| s == slice_failover::FAILOVER_ACTIVATED_TOPIC)
             .unwrap_or(false)
     });
-    assert!(saw_fail_act, "FAILOVER_ACTIVATED_TOPIC must be emitted by activate_failover");
+    assert!(
+        saw_fail_act,
+        "FAILOVER_ACTIVATED_TOPIC must be emitted by activate_failover"
+    );
 
     let events_before_revert = env.events().all().len();
 
@@ -623,7 +629,10 @@ fn regression_failover_events_emitted_exactly_once() {
             .map(|s| s == slice_failover::FAILOVER_REVERTED_TOPIC)
             .unwrap_or(false)
     });
-    assert!(saw_fail_rev, "FAILOVER_REVERTED_TOPIC must be emitted by revert_failover");
+    assert!(
+        saw_fail_rev,
+        "FAILOVER_REVERTED_TOPIC must be emitted by revert_failover"
+    );
 }
 
 /// Regression: explicit activate_failover with an unregistered (primary,backup)

@@ -84,7 +84,10 @@ fn test_hybrid_attestation_passkey_registration_accepted() {
     client.add_passkey(&vault_id, &owner, &passkey_hash);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "hybrid attestation passkey should be added");
+    assert!(
+        vault.passkeys.len() > 0,
+        "hybrid attestation passkey should be added"
+    );
 }
 
 /// Requirement 504, AC4: Attestation validation rejects weak attestations
@@ -118,7 +121,11 @@ fn test_multiple_passkeys_with_different_attestation_levels() {
     client.add_passkey(&vault_id, &owner, &hash_hybrid);
 
     let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.passkeys.len(), 2, "vault should contain both passkeys");
+    assert_eq!(
+        vault.passkeys.len(),
+        2,
+        "vault should contain both passkeys"
+    );
 }
 
 /// Requirement 504, AC6: Attestation validation event is emitted
@@ -218,5 +225,8 @@ fn test_attestation_strength_preserved_across_operations() {
 
     // Verify passkey still exists with original strength
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "passkey should be preserved after check-in");
+    assert!(
+        vault.passkeys.len() > 0,
+        "passkey should be preserved after check-in"
+    );
 }
