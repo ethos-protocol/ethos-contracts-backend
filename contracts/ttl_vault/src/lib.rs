@@ -25,6 +25,9 @@ pub mod credential_lifecycle;
 #[cfg(test)]
 mod credential_lifecycle_tests;
 mod diff_codec;
+pub mod donations;
+#[cfg(test)]
+mod donations_tests;
 pub mod history_archive;
 #[cfg(test)]
 mod history_archive_tests;
@@ -534,6 +537,9 @@ pub enum ContractError {
     ReportSignerNotSet = 148,
     // Composition rules: a new rule conflicts with an enabled rule of the same priority
     ConflictingRule = 149,
+    // Issue #613: vault donations
+    DonationAccountNotSet = 150,
+    DonationsNotPublic = 151,
 }
 
 #[contract]
@@ -15469,6 +15475,79 @@ impl TtlVaultContract {
     /// Retrieve the rule IDs associated with `slice_id`.
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
+    }
+
+    // ── Issue #613: Vault Donation Features ──────────────────────────────────
+
+    /// Owner-only. Configure or replace the donation account for `vault_id`.
+    ///
+    /// `public_visibility` controls whether donation records are listed
+    /// publicly via `list_donations`; totals are always public.
+    pub fn set_donation_account(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        recipient: Address,
+        public_visibility: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        donations::set_donation_account(&env, vault_id, recipient, public_visibility);
+        Ok(())
+    }
+
+    /// Donate `amount` of the vault's token to its donation account.
+    ///
+    /// Funds move directly from `donor` to the donation account, and the call
+    /// returns the issued tax receipt. The donor must pass AML screening.
+    pub fn donate(
+        env: Env,
+        vault_id: u64,
+        donor: Address,
+        amount: i128,
+    ) -> donations::DonationRecord {
+        donor.require_auth();
+        Self::assert_compliant(&env, &donor);
+        let vault = Self::load_vault(&env, vault_id);
+        donations::donate(&env, vault_id, &donor, &vault.token_address, amount)
+    }
+
+    /// Return the donation account configured for `vault_id`, if any.
+    pub fn get_donation_account(env: Env, vault_id: u64) -> Option<donations::DonationAccount> {
+        donations::get_donation_account(&env, vault_id)
+    }
+
+    /// Return the tax receipt for `receipt_no` on `vault_id`, if it exists.
+    pub fn get_donation_receipt(
+        env: Env,
+        vault_id: u64,
+        receipt_no: u64,
+    ) -> Option<donations::DonationRecord> {
+        donations::get_donation(&env, vault_id, receipt_no)
+    }
+
+    /// Total amount donated to `vault_id` across all donors.
+    pub fn get_donation_total(env: Env, vault_id: u64) -> i128 {
+        donations::get_vault_donation_total(&env, vault_id)
+    }
+
+    /// Total amount `donor` has donated to `vault_id`.
+    pub fn get_donor_total(env: Env, vault_id: u64, donor: Address) -> i128 {
+        donations::get_donor_donation_total(&env, vault_id, &donor)
+    }
+
+    /// Paginated public listing of donation records, starting at
+    /// `start_receipt_no` (1-based). Requires public visibility to be enabled.
+    pub fn list_donations(
+        env: Env,
+        vault_id: u64,
+        start_receipt_no: u64,
+        limit: u32,
+    ) -> Vec<donations::DonationRecord> {
+        donations::list_donations(&env, vault_id, start_receipt_no, limit)
     }
 
     // ── Issue #32: Credential Anchoring to External Systems ───────────────────
