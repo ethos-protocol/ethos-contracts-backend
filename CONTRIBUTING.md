@@ -193,6 +193,7 @@ cargo test -p backend
 1. **Open the PR against `main`** with a clear title following the commit message convention.
 2. **Fill in the PR description** (see template below).
 3. **Link the relevant issue(s)** — use `Closes #<number>` in the description so the issue auto-closes on merge.
+3a. **Add a changelog line** for user-visible changes under `## [Unreleased]` in `CHANGELOG.md` (the PR template has a checkbox for this). Maintainers can draft a release section from merged commit subjects with `scripts/generate_release_notes.py --since-ref <commit that added the last entry> --unreleased`.
 4. **Ensure all CI checks pass** before requesting review:
    - `cargo fmt --check`
    - `cargo clippy -- -D warnings`

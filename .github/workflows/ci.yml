@@ -129,7 +129,8 @@ jobs:
 
       - name: Check version consistency
         run: |
-          CHANGELOG_VERSION=$(grep -m 1 "^## \[" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
+          # Skip "## [Unreleased]": only the newest released version must match lib.rs.
+          CHANGELOG_VERSION=$(grep -m 1 "^## \[[0-9]" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
           LIB_VERSION=$(grep -oE 'DataKey::Version.*"([0-9]+\.[0-9]+\.[0-9]+)"' contracts/ttl_vault/src/lib.rs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           if [ "$CHANGELOG_VERSION" != "$LIB_VERSION" ]; then
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
