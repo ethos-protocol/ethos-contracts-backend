@@ -5,6 +5,227 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Implement vault governance features (#615) (#670)
+- Add SLA Monitoring and Reporting (#600) (#662)
+- Automate contract upgrade testing (#661)
+- Implement structured JSON logging system with aggregation and search (#659)
+- Policy versioning, history archival, inactive vault compression, incremental snapshots (#643)
+- Incremental snapshots, history archival, compliance policy versioning, vault compression (#642)
+- Compliance audit trail, SAR, compliance reports and regulatory change management (#641)
+- Implement alert rules, canary, blue-green, and automated rollback (#590-#593) (#639)
+- Implement cost tracking (#594) and disaster recovery plan (#595) (#638)
+- Lazy metadata, materialized views, query plan optimisation, property tests (#637)
+- Implement query pagination, batch check-in, deduplication, and Merkle history proofs (#636)
+- Add compliance controls to ttl_vault: blacklist/allowlist, KYC, transaction reporting, threshold monitoring (#635)
+- Add seasonal anomaly handling, cross-service correlation, investigation audit trail, and AML screening (#634)
+- Add comprehensive passkey feature tests for #500-#503 (#633)
+- Implement tests for issues #508-#511 (#632)
+- Implement withdrawal security feature tests (#631)
+- Add passkey security enhancement tests (#630)
+- Add test suites for SBT delegation, event registry, custody tracking, and Groth16 optimization (#628)
+- Add comprehensive ZK verifier tests for caching, recursion, compression, and threshold validation (#627)
+- Implement comprehensive API endpoint tests for GraphQL, signing, webhooks, and rate limiting (#626)
+- Implement job queue, analytics, fraud detection, and anomaly explanation (#624)
+- Implement comprehensive test suite for anomaly detection enhancements (#623)
+- Add multi-currency deposits, metadata/tags, cloning, and configurable check-in intervals to ttl_vault (#620)
+- Add TTL vault grace period, proxy-owner delegation, and passkey backup codes (#619)
+- Add emergency vault suspension and nested beneficiary inheritance to ttl_vault (#618)
+- Guard fractional ownership history against over-allocation (#45) (#443)
+- Add CAPTCHA bypass detection, IP-reputation score decay, and fix zero-rule secret scanning
+- Add health-routing hysteresis, backup checksum verification, DR automation hooks, and slice inheritance contract entry points
+- Add profiler overhead guard, canary baseline rollback, pool leak detection, WebAuthn downgrade protection
+- Add regression CI gate and WASM size enforcement (#424, #425)
+- Export recovery module for failover integration
+- Add manifest-based upgrade compatibility validation to ttl_vault
+- Add end-to-end Prometheus/Grafana monitoring for contract and API health
+- Add consensus reconciliation, routing hysteresis, backup checksums, DR automation
+- Add batch_conditional_completion module with full test suite
+- Add RPC reachability check to /health endpoint
+- Add backpressure queue with RPC latency simulation tests
+- Export bulkhead queue metrics to prometheus (#364)
+- Add cache partition consistent hashing and rebalancing support (#362)
+- Add multi-level cache consistency verification job
+- Implement query cache invalidation on write
+- Add read replica staleness-aware routing
+- Enforce rate limiting on all routes
+- Validate requests against the OpenAPI schema
+- Require anchoring proof freshness
+- Enforce floor <= cap boundary consistency
+- Ranking staleness, rule conflict detection, GraphQL depth limits, ES snapshotting
+- Correlation IDs, tx recovery, poison messages, batch results
+- Add CDC consumer lag tracking and alerting
+- Add auth token revocation list
+- Reject stale oracle reads in release checks
+- Add fuzz harness verifying proof compression roundtrip
+- Enforce privacy levels in attestation query path (#326)
+- Schedule periodic consistency re-checks for attestations
+- Move feature flag storage to shared SQL store (#274)
+- Wire slice_failover module and add auth-gated entry points (Issue #35)
+- Wire credential lifecycle state machine into contract
+- Wire credential anchoring entry points into TtlVaultContract
+- Implement SAML 2.0 support for enterprise SSO
+- Implement automated documentation generation
+- Add credential metadata compression (closes #26)
+- Add atomic credential release (closes #25)
+- Implement event sourcing (#151) and message queue (#150)
+- Add WebAuthn/FIDO2 support (#148) and webhook signature verification (#149)
+- Implement credential lifecycle, slice failover, composition optimizer, and template inheritance
+- Implement Slice Reputation Decay
+- Add SBT escrow for conditional transfer
+- Implement SBT fractional ownership with basis points
+- Implement batch credential verification with consistency checks
+- Implement SBT metadata compression with delta+RLE encoding
+- Implement slice attribute-based matching for attestors
+- Implement slice consensus voting for modifications
+- Add slice composition cost tracking
+- Implement credential anchoring to external systems
+- Implement tasks #96-#99 — IP reputation, CAPTCHA, secret scanning, compliance reports
+- Implement cache partitioning, fault recovery, metrics, and rate limiting (#92-#95)
+- Implement cache tasks #88-#91
+- Implement multi-level caching, cache invalidation, cache warming, and migration testing (#84-#87)
+- Implement tasks #80-#83 — query cache, backup validation, deadlock detection, consistency verification
+- Implement #72-#75 — cost estimation, request replay, bulk job queuing, time-series optimizations
+- Resolve issues #132, #133, #134, #135
+- Implement tasks #76-#79 — DB infrastructure modules
+- Implement issues #72, #73, #74, #75
+- Add error enrichment: request context, correlation IDs, stack traces, user context
+- Add per-endpoint timeout configuration with override header and violation alerts
+- Add bulkhead isolation: per-endpoint concurrency pools and queue overflow handling
+- Add configurable retry policy framework with exponential backoff + jitter
+- Add graceful degradation and capability negotiation
+- Add operational cost tracking, tagging, reports, and allocation
+- Add continuous profiling, flame graphs, and regression detection
+- Add feature flag storage, evaluation, and admin API
+- Add request prioritization, load shedding, adaptive batching, and predictive scaling
+- Add health-based routing for webhook delivery
+- Add partial success tracking for batch operations
+- Add dead-letter queue with automatic routing and replay
+- Add fallback chain registry for graceful degradation
+- Add resilience modules: chaos tests, circuit breaker observability, saga compensation, adaptive timeouts
+- Add canary deployment strategy with automated rollback and metric progression
+- Add service dependency discovery, graph visualization, and impact analysis
+- Add structured incident response workflow with severity and escalation
+- Add automated on-call rotation scheduling with escalation policies
+- Add structured log parsing, field extraction, and search
+- Add automatic anomaly detection with baseline learning and alerting
+- Add custom metric collection with Grafana dashboard templates and sharing
+- Add dynamic ACL management with admin API and audit trail
+- Implement data retention, field encryption, vuln scanning, secret rotation (#100-#103)
+- Implement comprehensive feature additions for improved API capabilities
+- Implement advanced proof verification features
+- Add slice performance weighting and composition rules engine (#36, #44)
+- Add quantum-resistant, interoperable, auditable, and masked proof verification
+- Proof compression, webhooks, GraphQL API, and streaming (#64 #65 #66 #67)
+- Add sbt contract: composability, conditional batch transfer, timed delegation
+- Implement real oracle-attestation verification in zk_verifier
+- Add missing backend Dockerfile, fix broken docker-compose build
+- Add passkey expiry push notifications (#560)
+- Add passkey audit trail (#558)
+- Add passkey delegation for check-ins (#557)
+- Add passkey escrow with recovery-contact release (#559)
+- Add max_vaults_per_owner limit to ProtocolConfig (#767)
+- Add custom metadata history for vaults (issue #931)
+- Implement contract version check with startup blocking on incompatibility
+- Implement emergency vault recovery code (#934)
+- Implement clone_vault for multi-beneficiary splits
+- Add vault analytics dashboard API (#959)
+- Implement vault state snapshot capability
+- Implement vault notification subscription system
+- Add read-only vault sharing capabilities (#966)
+- Implement 2FA for sensitive vault operations (#965)
+- Add VS Code debug configurations
+- Emit TTL_WARNING_TOPIC in check_in when TTL < EXPIRY_WARNING_THRESHOLD
+- Implement audit log persistence and retention policy (#961)
+
+### Changed
+- Docs/feat: implement issues #584, #585, #586, #588 (#644)
+- Test implementations for 4 backend features (#625)
+- Enforce incident escalation and add docs drift detection (#622)
+- Backend observability and data-retention improvements (#617)
+- Swap slice-inheritance entry points for saga compensation idempotency
+- Verify hook installation and add clean-checkout test
+- Test+ci: add cargo-llvm-cov coverage reporting and threshold gate
+- Docs+ci: automate security-audit-checklist items via clippy gates
+- Make deploy scripts idempotent with dry-run and gated --force
+- Implementcompostion
+- Invalidate prior backup codes on regeneration
+- Restore recovery code system with attempt rate limiting
+- Apply cargo fmt across the workspace
+- Remove stale scratch/status docs from past feature work
+- Zk_verifier: add credential hierarchies with recursive parent validation
+- Zk_verifier: add credential version history with diff capability
+- Zk_verifier: add credential privacy levels with access control
+- Zk_verifier: add historical credential state queries
+- Zk_verifier: add credential dispute resolution with threshold voting
+- Add recovery code system with attempt rate limiting (#51)
+- Add metadata schema versioning with migration tests (#50)
+- Add holder verification cache (#49)
+- Add privacy-preserving identity linkage (#48)
+- Scaffold soulbound token contract with core mint/holder model
+- Zk_verifier: add verify_conditional_proof for branching proof logic
+- Ttl_vault: fix panic-vs-error gap in predict_expiry, document invariant unwraps
+- Bump yanked spin transitive dependency to 0.9.9
+- Avoid is_none_or for wider MSRV compatibility in ttl_vault
+- Split mobile apps into a separate repo
+- Remove stray scratch file and gitignored .vscode configs
+- Refactoring of codebase
+- Initial commit
+- Optimize get_check_in_history_page to avoid full deserialization (#873)
+- Grace commit
+- Implemented Backend Cache for Frequent Vault Queries
+
+### Fixed
+- Paginate VaultAuditLog to bound per-operation write cost (#284)
+- Address #596, #597 (#660)
+- Harden ttl_vault: withdrawal/clawback race tests, passkey scope enforcement, deterministic conflict tie-break (#621)
+- Fix SAML replay TTL, 2FA backup codes, encryption backfill, and secret rotation grace period
+- Fix dependency cycles, cost budgets, scaling backtesting, prefetch limits
+- Resolve issues #398-#401 — security hardening
+- Add degraded fallback path for open breaker states
+- Fix scope: rescope PR to issues #370-373, drop unrelated #374-376 work
+- Fix drifted API example in use-cases.md and add CI schema validation
+- Validate and enforce max override cap in timeout policy upsert (#365)
+- Implement half-open request capping (#363)
+- Sign every outbound webhook payload
+- Harden template inheritance against dangling parents and cycles
+- Prevent revival of revoked/archived credentials via re-initialization
+- Enforce minimum quorum before finalizing slice consensus votes
+- Correct check-in cooldown and reference style in passkey_cap_tests
+- Cap PasskeyUsage and PasskeyAuditLog to 1000 entries each
+- Correct broken tests surfaced by wiring the missing entry points
+- Wire slice failover contract entry points
+- Restore credential lifecycle contract entry points lost in merge
+- Resolve duplicate ContractError discriminant (118) from merge conflict
+- Apply cargo fmt to event sourcing persistence code
+- Resolve CI failures (fmt, clippy) in slice consensus voting
+- Add SQL-backed persistence for event sourcing
+- Resolve Soroban SDK test incompatibilities
+- Correct Soroban SDK compatibility issues in slice consensus voting
+- Implement slice consensus voting contract entry points and execution (Issue #266)
+- Expose template inheritance cycle detection through public contract methods
+- Fix KYC status conflict detection by adding missing is_kyc_status_claim function
+- Verify WebAuthn assertion signatures cryptographically
+- Real lattice proof checks and field masking
+- Persist vaults to SQLite instead of in-memory HashMap
+- Require authentication on withdrawal escrow entry points
+- Resolve PR #276 CI failures by disabling stub implementations
+- Add Clone derive to DegradationState, fix line length formatting
+- Move degradation state to shared SQL-backed registry
+- Fix cargo-deny license check: declare crate licenses, allow real transitive licenses
+- Fix cargo-deny config schema for the Security workflow
+- Fix cargo-audit: drop unused actix-web, bump h2 to patched version
+- Fix failing CI: credential anchoring tests and corrupted OpenAPI spec
+- Fix clippy and rustfmt violations across backend and contracts
+- Fix CI badge URL after repo rename to ethos-contracts-backend
+- Fix CI badge URL after repo rename to ethos-contracts
+- Fix CI toolchain pin and restore ttl_vault/zk_verifier/backend from merge damage
+
+### Security
+- Verify and enforce playground/production storage isolation
+
 ## [1.0.0] - 2026-06-30
 ### Added
 - Initial release of Ethos-Protocol contract.

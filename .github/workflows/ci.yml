@@ -21,6 +21,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege default: read-only repository access for every job.
+# Jobs that need more scope must declare it explicitly (see #683).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -29,17 +34,17 @@ jobs:
     name: Test & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Pinned (not @stable): newer rustc releases reject an unsound transmute
       # in ethnum 1.5.2 (a transitive Soroban SDK dependency) with E0512, which
       # broke every CI run once rustc moved past 1.96.x. Bump deliberately.
-      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: dtolnay/rust-toolchain@3f2778ee6a28c53e512b95bbcf7b2120993da70d # 1.96.1
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -124,7 +129,8 @@ jobs:
 
       - name: Check version consistency
         run: |
-          CHANGELOG_VERSION=$(grep -m 1 "^## \[" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
+          # Skip "## [Unreleased]": only the newest released version must match lib.rs.
+          CHANGELOG_VERSION=$(grep -m 1 "^## \[[0-9]" CHANGELOG.md | sed -E 's/## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')
           LIB_VERSION=$(grep -oE 'DataKey::Version.*"([0-9]+\.[0-9]+\.[0-9]+)"' contracts/ttl_vault/src/lib.rs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           if [ "$CHANGELOG_VERSION" != "$LIB_VERSION" ]; then
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
