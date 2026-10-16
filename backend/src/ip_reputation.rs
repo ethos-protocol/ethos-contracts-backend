@@ -71,7 +71,7 @@ fn score_to_risk(score: f64) -> RiskLevel {
 ///   API and returns the real abuse confidence score.
 /// - Otherwise returns a stub score of `0.0` (`RiskLevel::Low`) so the
 ///   system remains functional without third-party credentials.
-pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputationScore {
+pub async fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputationScore {
     if !config.check_enabled {
         return stub_score(ip, "disabled");
     }
@@ -81,8 +81,18 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
         _ => return stub_score(ip, "stub"),
     };
 
-    // Synchronous HTTP call via reqwest blocking client.
-    let client = reqwest::blocking::Client::new();
+    // Async client so the call does not block the runtime thread serving the
+    // request. The timeout keeps a slow upstream from stalling the handler.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(ip, error = %e, "failed to build AbuseIPDB HTTP client");
+            return stub_score(ip, "abuseipdb-request-error");
+        }
+    };
     let url = "https://api.abuseipdb.com/api/v2/check";
 
     match client
@@ -91,6 +101,7 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
         .header("Accept", "application/json")
         .query(&[("ipAddress", ip), ("maxAgeInDays", "90")])
         .send()
+        .await
     {
         Ok(resp) => {
             let status = resp.status();
@@ -98,7 +109,7 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
                 tracing::warn!(ip, %status, "AbuseIPDB returned non-2xx response");
                 return stub_score(ip, "abuseipdb-error");
             }
-            match resp.json::<serde_json::Value>() {
+            match resp.json::<serde_json::Value>().await {
                 Ok(body) => {
                     let data = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
                     let confidence = data
@@ -278,7 +289,7 @@ pub async fn get_ip_reputation_handler(
     }
 
     let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
-    let mut score = check_ip_reputation(&ip, &config);
+    let mut score = check_ip_reputation(&ip, &config).await;
 
     // When there's no authoritative upstream check (subsystem disabled, or no
     // API key configured), prefer a decayed local score over resetting to a
@@ -550,13 +561,13 @@ mod tests {
         assert_eq!(score_to_risk(100.0), RiskLevel::Critical);
     }
 
-    #[test]
-    fn stub_score_returned_when_disabled() {
+    #[tokio::test]
+    async fn stub_score_returned_when_disabled() {
         let config = IpReputationConfig {
             check_enabled: false,
             ..IpReputationConfig::default()
         };
-        let score = check_ip_reputation("1.2.3.4", &config);
+        let score = check_ip_reputation("1.2.3.4", &config).await;
         assert_eq!(score.source, "disabled");
         assert_eq!(score.score, 0.0);
     }

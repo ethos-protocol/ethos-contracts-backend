@@ -1457,8 +1457,8 @@ mod tests {
         store.submit_feedback(anomaly2, false);
         store.submit_feedback(anomaly3, true);
 
-        let feedback_v1: Vec<_> = store
-            .get_feedback()
+        let all_feedback = store.get_feedback();
+        let feedback_v1: Vec<_> = all_feedback
             .iter()
             .filter(|f| f.anomaly_id.starts_with("alert_v1"))
             .collect();

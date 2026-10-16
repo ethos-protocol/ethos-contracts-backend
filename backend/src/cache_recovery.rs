@@ -418,6 +418,7 @@ mod tests {
                 failure_threshold: 1,
                 success_threshold: 1,
                 open_duration: std::time::Duration::from_millis(1),
+                half_open_max_requests: 1,
             },
         );
 

@@ -98,6 +98,27 @@ pub mod webauthn;
 pub mod webhook;
 pub mod websocket;
 
+pub mod api_versioning;
+pub mod batch;
+pub mod cache_invalidation;
+pub mod cache_metrics;
+pub mod cache_recovery;
+pub mod cache_warming;
+pub mod captcha;
+pub mod cdc;
+pub mod compliance;
+pub mod cost_estimation;
+pub mod custom_metrics;
+pub mod distributed_tx;
+pub mod doc_generator;
+pub mod ip_reputation;
+pub mod jobs;
+pub mod migration_testing;
+pub mod pool_optimizer;
+pub mod read_replica;
+pub mod saml;
+pub mod timeseries;
+
 pub use audit::*;
 pub use db::*;
 pub use handlers::*;
