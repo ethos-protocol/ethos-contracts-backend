@@ -49,6 +49,9 @@ mod vault_compression_tests;
 pub mod vault_governance;
 #[cfg(test)]
 mod vault_governance_tests;
+pub mod vault_nft;
+#[cfg(test)]
+mod vault_nft_tests;
 #[cfg(test)]
 use types::VaultSortField;
 use types::{
@@ -540,6 +543,10 @@ pub enum ContractError {
     // Issue #613: vault donations
     DonationAccountNotSet = 150,
     DonationsNotPublic = 151,
+    // Issue #614: vault NFTs
+    NftNotFound = 152,
+    NftMetadataTooLong = 153,
+    CannotBuyOwnNft = 154,
 }
 
 #[contract]
@@ -1987,6 +1994,8 @@ impl TtlVaultContract {
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(check_in_interval),
         );
+        // Issue #614: mint the vault's NFT proof to the owner.
+        vault_nft::mint_for_vault(&env, vault_id, &owner);
         env.events().publish(
             (VAULT_CREATED_TOPIC,),
             (vault_id, owner, beneficiary, check_in_interval, timestamp),
@@ -15548,6 +15557,64 @@ impl TtlVaultContract {
         limit: u32,
     ) -> Vec<donations::DonationRecord> {
         donations::list_donations(&env, vault_id, start_receipt_no, limit)
+    }
+
+    // ── Issue #614: Vault NFT Minting ─────────────────────────────────────────
+
+    /// Return the NFT minted for `vault_id` on creation, if any.
+    pub fn get_vault_nft(env: Env, vault_id: u64) -> Option<vault_nft::VaultNft> {
+        vault_nft::get_vault_nft(&env, vault_id)
+    }
+
+    /// Return the NFT with `token_id`, if it exists.
+    pub fn get_nft_by_token(env: Env, token_id: u64) -> Option<vault_nft::VaultNft> {
+        vault_nft::get_nft_by_token(&env, token_id)
+    }
+
+    /// Current holder of the NFT for `vault_id`.
+    pub fn get_nft_owner(env: Env, vault_id: u64) -> Option<Address> {
+        vault_nft::get_nft_owner(&env, vault_id)
+    }
+
+    /// Holder-only. Set the metadata stored on the NFT for `vault_id`.
+    pub fn set_nft_metadata(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        metadata: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        match vault_nft::get_nft_owner(&env, vault_id) {
+            None => Err(ContractError::NftNotFound),
+            Some(holder) if holder != caller => Err(ContractError::NotOwner),
+            Some(_) => {
+                vault_nft::set_nft_metadata(&env, vault_id, metadata);
+                Ok(())
+            }
+        }
+    }
+
+    /// Buy the NFT `token_id` from its current holder for `price` of the
+    /// vault's token. Funds go directly to the seller and the sale is recorded.
+    /// The buyer must pass AML screening.
+    pub fn buy_nft(env: Env, token_id: u64, buyer: Address, price: i128) -> vault_nft::NftSale {
+        buyer.require_auth();
+        Self::assert_compliant(&env, &buyer);
+        let nft = vault_nft::get_nft_by_token(&env, token_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NftNotFound));
+        let vault = Self::load_vault(&env, nft.vault_id);
+        vault_nft::buy_nft(&env, token_id, &buyer, &vault.token_address, price)
+    }
+
+    /// Paginated sales history for the NFT `token_id`, starting at
+    /// `start_sale_no` (1-based).
+    pub fn list_nft_sales(
+        env: Env,
+        token_id: u64,
+        start_sale_no: u64,
+        limit: u32,
+    ) -> Vec<vault_nft::NftSale> {
+        vault_nft::list_nft_sales(&env, token_id, start_sale_no, limit)
     }
 
     // ── Issue #32: Credential Anchoring to External Systems ───────────────────
