@@ -621,6 +621,7 @@ mod tests {
                 failure_threshold: 4,
                 success_threshold: 2,
                 open_duration: Duration::from_secs(30),
+                half_open_max_requests: 1,
             },
         ));
 

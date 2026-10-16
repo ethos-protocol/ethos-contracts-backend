@@ -125,7 +125,7 @@ mod tests {
         let breaker = CircuitBreaker::new("test", config);
 
         let snapshot = breaker.snapshot();
-        assert!(snapshot.total_calls >= 0);
+        assert_eq!(snapshot.calls_allowed_total + snapshot.calls_rejected_total, 0);
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
         let breaker = CircuitBreaker::new("test", config);
 
         let snapshot = breaker.snapshot();
-        assert_eq!(snapshot.total_calls, 0);
+        assert_eq!(snapshot.calls_allowed_total + snapshot.calls_rejected_total, 0);
     }
 
     #[test]

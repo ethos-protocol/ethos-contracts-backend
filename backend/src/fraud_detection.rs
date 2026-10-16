@@ -169,7 +169,7 @@ mod tests {
             merchant_id: "amazon".to_string(),
             user_id: "user1".to_string(),
             timestamp: 14400,
-            location: "us",
+            location: "us".to_string(),
         };
 
         let score = detector.get_fraud_score(&tx);
@@ -187,7 +187,7 @@ mod tests {
             merchant_id: "amazon".to_string(),
             user_id: "user1".to_string(),
             timestamp: 14400,
-            location: "us",
+            location: "us".to_string(),
         };
 
         let score = detector.get_fraud_score(&tx);
@@ -203,7 +203,7 @@ mod tests {
             merchant_id: "vendor".to_string(),
             user_id: "user1".to_string(),
             timestamp: 14400,
-            location: "us",
+            location: "us".to_string(),
         };
 
         let score = detector.get_fraud_score(&tx);
@@ -221,7 +221,7 @@ mod tests {
             merchant_id: "vendor".to_string(),
             user_id: "user1".to_string(),
             timestamp: 82800,
-            location: "us",
+            location: "us".to_string(),
         };
 
         let score = detector.get_fraud_score(&tx_night);
@@ -239,7 +239,7 @@ mod tests {
             merchant_id: "vendor".to_string(),
             user_id: "user1".to_string(),
             timestamp: 14400,
-            location: "high_risk",
+            location: "high_risk".to_string(),
         };
 
         let score = detector.get_fraud_score(&tx);
@@ -258,7 +258,7 @@ mod tests {
             merchant_id: "vendor".to_string(),
             user_id: "user1".to_string(),
             timestamp: 14400,
-            location: "us",
+            location: "us".to_string(),
         };
 
         let tx_high = Transaction {
@@ -267,7 +267,7 @@ mod tests {
             merchant_id: "unknown".to_string(),
             user_id: "user1".to_string(),
             timestamp: 82800,
-            location: "high_risk",
+            location: "high_risk".to_string(),
         };
 
         assert!(!detector.is_fraud(&tx_low));

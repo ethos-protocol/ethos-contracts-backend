@@ -217,6 +217,10 @@ fn classify(error: &AppError) -> (StatusCode, String) {
             StatusCode::BAD_REQUEST,
             "two_factor_not_enabled".to_string(),
         ),
+        AppError::TooManyRequests(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_requests".to_string(),
+        ),
         // Wrapped ApiErrors already carry their own status and code.
         AppError::Api(api) => (api.status(), api.code().to_string()),
     }

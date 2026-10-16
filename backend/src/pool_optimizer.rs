@@ -258,10 +258,13 @@ impl Inner {
             return;
         }
         let threshold = Duration::from_secs(self.config.idle_timeout_secs);
+        let min = self.config.min;
+        // Read the length before `retain` borrows `idle` mutably.
+        let total = self.idle.len() as u32;
         let mut culled = 0_u32;
         self.idle.retain(|c| {
             let idle_for = c.meta.last_used_at.elapsed();
-            let keep = idle_for < threshold || (self.idle.len() as u32 - culled) <= self.config.min;
+            let keep = idle_for < threshold || (total - culled) <= min;
             if !keep {
                 culled += 1;
             }
@@ -376,6 +379,7 @@ impl OptimizedConnectionPool {
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
+                    _marker: std::marker::PhantomData,
                 });
             }
 
@@ -390,6 +394,7 @@ impl OptimizedConnectionPool {
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
+                    _marker: std::marker::PhantomData,
                 });
             }
 
