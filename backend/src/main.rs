@@ -135,17 +135,9 @@ async fn encryption_keys_handler(
     }
 }
 
-async fn ready_handler(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "database": "connected",
-        }))),
-        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
+/// GET /ready — 200 when every required subsystem passes, else 503 (#698).
+async fn ready_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    ethos_protocol_backend::readiness::ready_response(&state).await
 }
 
 /// Prometheus text-format metrics for scraping, combining base counters
@@ -337,15 +329,23 @@ async fn main() {
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
-    // Keep sampler and rpc_pool alive for the duration of the process.
-    // They are logged at startup; full integration into AppState is done when
-    // handlers need them directly.
-    let _ = (rpc_pool, sampler);
+    // Keep the sampler alive for the duration of the process. The RPC pool is
+    // shared through AppState so `/ready` can probe it (#698).
+    let _ = sampler;
+    let rpc_pool = Arc::new(rpc_pool);
 
-    let consensus = NodeCache::from_env();
+    // #699: an unrecognised CONSENSUS_STRATEGY aborts startup rather than
+    // silently running with last-write-wins.
+    let consensus = match NodeCache::from_env() {
+        Ok(consensus) => consensus,
+        Err(err) => {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         node_id = consensus.node_id(),
-        strategy = ?consensus.strategy(),
+        strategy = consensus.strategy().as_str(),
         "consensus cache initialized"
     );
 
@@ -410,6 +410,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        rpc_pool,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

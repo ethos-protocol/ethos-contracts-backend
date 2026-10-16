@@ -88,22 +88,93 @@ pub fn log_state_modification(
 }
 
 /// Check that the request carries a valid admin API key.
+///
+/// Fails closed: when `ADMIN_API_KEY` is unset, every request is rejected
+/// unless `ALLOW_INSECURE_ADMIN=true` is set explicitly (#700). That flag is
+/// the opt-in for local development only.
 pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        return Ok(());
+    let allow_insecure = std::env::var("ALLOW_INSECURE_ADMIN")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    check_admin_access(&api_key, allow_insecure, headers)
+}
+
+/// Decide admin access from an explicit key and opt-in flag (#700).
+///
+/// Separated from [`authorize_admin`] so the rules can be tested without
+/// touching process-wide environment variables.
+pub fn check_admin_access(
+    expected_key: &str,
+    allow_insecure: bool,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if expected_key.is_empty() {
+        if allow_insecure {
+            return Ok(());
+        }
+        return Err(admin_unauthorized());
     }
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     match auth_header.strip_prefix("Bearer ") {
-        Some(token) if token == api_key => Ok(()),
-        _ => Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "valid admin API key required",
-        )),
+        Some(token) if token == expected_key => Ok(()),
+        _ => Err(admin_unauthorized()),
+    }
+}
+
+fn admin_unauthorized() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "valid admin API key required",
+    )
+}
+
+#[cfg(test)]
+mod admin_auth_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn empty_key_rejects_requests_without_credentials() {
+        let err = check_admin_access("", false, &HeaderMap::new()).unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn empty_key_rejects_requests_even_with_a_bearer_token() {
+        // With no key configured there is nothing to match against.
+        assert!(check_admin_access("", false, &bearer("anything")).is_err());
+        assert!(check_admin_access("", false, &bearer("")).is_err());
+    }
+
+    #[test]
+    fn empty_key_allows_requests_only_with_explicit_insecure_flag() {
+        assert!(check_admin_access("", true, &HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn configured_key_requires_matching_bearer_token() {
+        assert!(check_admin_access("s3cret", false, &bearer("s3cret")).is_ok());
+        assert!(check_admin_access("s3cret", false, &bearer("wrong")).is_err());
+        assert!(check_admin_access("s3cret", false, &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn insecure_flag_does_not_bypass_a_configured_key() {
+        assert!(check_admin_access("s3cret", true, &HeaderMap::new()).is_err());
     }
 }
 
