@@ -44,6 +44,14 @@ pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
 /// Re-Checks".
 pub const CONSISTENCY_CHECK_INTERVAL: u64 = 30 * 24 * 60 * 60;
 
+/// Bit index of [`AttestationRecord::oracle`] in the field bitmask recorded by
+/// `redact_attestation_record`. `credential_id` (index 0) is never masked.
+pub const ATTESTATION_RECORD_FIELD_ORACLE: u32 = 1;
+
+/// Strkey of the all-zero Ed25519 account, used as the placeholder `oracle`
+/// in a redacted [`AttestationRecord`]. See `masked_oracle`.
+pub const MASKED_ORACLE_STRKEY: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
 const VERIFY_LATTICE_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_latt");
@@ -966,6 +974,7 @@ impl ZkVerifierContract {
         AttestationRecord {
             credential_id: record.credential_id,
             oracle: Self::masked_oracle(env),
+            next_check_due: record.next_check_due,
         }
     }
 
