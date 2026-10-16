@@ -23,6 +23,37 @@ pub enum ConflictStrategy {
     Voting,
 }
 
+impl ConflictStrategy {
+    /// Every accepted `CONSENSUS_STRATEGY` value, for error messages and docs.
+    pub const ACCEPTED: &'static [&'static str] = &["last_write_wins", "voting"];
+
+    /// The canonical name, as accepted by [`parse_conflict_strategy`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConflictStrategy::LastWriteWins => "last_write_wins",
+            ConflictStrategy::Voting => "voting",
+        }
+    }
+}
+
+/// Parse a `CONSENSUS_STRATEGY` value (#699).
+///
+/// An unset or empty value selects the default, `last_write_wins`. Any other
+/// value must match an accepted name (case-insensitive, surrounding whitespace
+/// ignored). Unknown values are an error rather than a silent fallback, so a
+/// typo such as `votng` cannot change the conflict policy unnoticed.
+pub fn parse_conflict_strategy(raw: Option<&str>) -> Result<ConflictStrategy, String> {
+    let value = raw.unwrap_or("").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "last_write_wins" => Ok(ConflictStrategy::LastWriteWins),
+        "voting" => Ok(ConflictStrategy::Voting),
+        other => Err(format!(
+            "unknown CONSENSUS_STRATEGY {other:?}; expected one of: {}",
+            ConflictStrategy::ACCEPTED.join(", ")
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ConflictDetail {
     pub key: String,
@@ -169,16 +200,12 @@ impl NodeCache {
         self.strategy
     }
 
-    pub fn from_env() -> Arc<Self> {
+    /// Build from environment variables. Fails on an unrecognised
+    /// `CONSENSUS_STRATEGY` instead of falling back to a default (#699).
+    pub fn from_env() -> Result<Arc<Self>, String> {
         let node_id = std::env::var("NODE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-        let strategy = match std::env::var("CONSENSUS_STRATEGY")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "voting" => ConflictStrategy::Voting,
-            _ => ConflictStrategy::LastWriteWins,
-        };
+        let strategy =
+            parse_conflict_strategy(std::env::var("CONSENSUS_STRATEGY").ok().as_deref())?;
 
         let backend: Arc<dyn CacheBackend> = if let Ok(redis_url) = std::env::var("REDIS_URL") {
             Arc::new(
@@ -189,7 +216,7 @@ impl NodeCache {
             Arc::new(InMemoryBackend::new())
         };
 
-        Arc::new(Self::new(node_id, backend, strategy))
+        Ok(Arc::new(Self::new(node_id, backend, strategy)))
     }
 
     pub fn put(&self, key: &str, value: &str) -> Result<CacheEntry, String> {
@@ -435,5 +462,71 @@ mod tests {
         let report = node_b.check_and_resolve().unwrap();
         assert_eq!(report.conflicts_resolved, 1);
         assert_eq!(node_b.get("vault:3").unwrap().unwrap().value, "winner");
+    }
+
+    #[test]
+    fn strategy_unset_or_empty_defaults_to_last_write_wins() {
+        assert_eq!(
+            parse_conflict_strategy(None),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("   ")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+    }
+
+    #[test]
+    fn strategy_accepts_each_documented_value() {
+        assert_eq!(
+            parse_conflict_strategy(Some("last_write_wins")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("voting")),
+            Ok(ConflictStrategy::Voting)
+        );
+    }
+
+    #[test]
+    fn strategy_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            parse_conflict_strategy(Some("  VOTING ")),
+            Ok(ConflictStrategy::Voting)
+        );
+        assert_eq!(
+            parse_conflict_strategy(Some("Last_Write_Wins")),
+            Ok(ConflictStrategy::LastWriteWins)
+        );
+    }
+
+    #[test]
+    fn strategy_rejects_unknown_values() {
+        // A typo must fail loudly instead of falling back to last-write-wins.
+        let err = parse_conflict_strategy(Some("votng")).unwrap_err();
+        assert!(
+            err.contains("\"votng\""),
+            "error names the bad value: {err}"
+        );
+        assert!(
+            err.contains("last_write_wins, voting"),
+            "error lists options: {err}"
+        );
+        assert!(parse_conflict_strategy(Some("last-write-wins")).is_err());
+        assert!(parse_conflict_strategy(Some("lww")).is_err());
+    }
+
+    #[test]
+    fn strategy_as_str_round_trips_through_parser() {
+        for strategy in [ConflictStrategy::LastWriteWins, ConflictStrategy::Voting] {
+            assert_eq!(
+                parse_conflict_strategy(Some(strategy.as_str())),
+                Ok(strategy)
+            );
+        }
     }
 }

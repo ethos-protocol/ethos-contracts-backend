@@ -578,7 +578,7 @@ mod tests {
             audit_store: create_audit_store(),
             share_store: create_share_store(),
             share_token_store: create_share_token_store(),
-            consensus: NodeCache::from_env(),
+            consensus: NodeCache::from_env().expect("valid CONSENSUS_STRATEGY"),
             webhook_state: Arc::new(WebhookState::new()),
             graphql_schema,
             metrics: Metrics::new(),

@@ -334,10 +334,18 @@ async fn main() {
     let _ = sampler;
     let rpc_pool = Arc::new(rpc_pool);
 
-    let consensus = NodeCache::from_env();
+    // #699: an unrecognised CONSENSUS_STRATEGY aborts startup rather than
+    // silently running with last-write-wins.
+    let consensus = match NodeCache::from_env() {
+        Ok(consensus) => consensus,
+        Err(err) => {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         node_id = consensus.node_id(),
-        strategy = ?consensus.strategy(),
+        strategy = consensus.strategy().as_str(),
         "consensus cache initialized"
     );
 
