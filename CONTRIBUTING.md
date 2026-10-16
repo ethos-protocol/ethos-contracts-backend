@@ -7,6 +7,7 @@ Thank you for your interest in contributing! This document explains how to get s
 - [Getting Started](#getting-started)
 - [Code Style](#code-style)
 - [Git Workflow](#git-workflow)
+- [Rust Module Declarations](#rust-module-declarations)
 - [Testing Requirements](#testing-requirements)
 - [Pull Request Process](#pull-request-process)
 - [Documentation](#documentation)
@@ -145,6 +146,19 @@ git rebase origin/main
 ```
 
 ---
+
+## Rust Module Declarations
+
+Every `.rs` file under `backend/src/` and `contracts/*/src/` must be reachable
+from its crate root (`lib.rs`) through a `mod` declaration. Files that are not
+declared are never compiled, so their tests silently never run (#673-#676).
+
+- Declare a backend module with `pub mod name;` (or `mod name;` if it is
+  internal) in `backend/src/lib.rs`.
+- Declare test-only modules with `#[cfg(test)] mod name_tests;` in the crate
+  root.
+- Do not add a `pub mod` or `pub use` for a file that does not exist.
+- A file that is not wired in should be deleted, not left behind.
 
 ## Testing Requirements
 

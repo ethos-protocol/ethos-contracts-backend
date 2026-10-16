@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 pub const DEFAULT_LABEL_CARDINALITY_LIMIT: usize = 100;
 
 /// Shared metrics state for the Ethos-Protocol backend.
-#[derive(Default)]
 pub struct Metrics {
     pub vaults_total: AtomicU64,
     pub checkins_total: AtomicU64,
@@ -23,14 +22,33 @@ pub struct Metrics {
     /// Count of failed credential lifecycle transitions. Feeds the
     /// `EthosCredentialLifecycleAnomalies` alert.
     pub credential_lifecycle_errors_total: AtomicU64,
+    /// Distinct values registered per label, enforced by `register_label_value`.
+    label_values: Mutex<HashMap<String, Vec<String>>>,
+    /// Maximum distinct values allowed per label before new ones are dropped.
+    label_cardinality_limit: usize,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            vaults_total: AtomicU64::new(0),
+            checkins_total: AtomicU64::new(0),
+            releases_total: AtomicU64::new(0),
+            active_vaults: AtomicI64::new(0),
+            request_errors_total: AtomicU64::new(0),
+            http_requests_total: AtomicU64::new(0),
+            contract_paused: AtomicU64::new(0),
+            contract_upgrade_events_total: AtomicU64::new(0),
+            credential_lifecycle_errors_total: AtomicU64::new(0),
+            label_values: Mutex::new(HashMap::new()),
+            label_cardinality_limit: DEFAULT_LABEL_CARDINALITY_LIMIT,
+        }
+    }
 }
 
 impl Metrics {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            label_cardinality_limit: DEFAULT_LABEL_CARDINALITY_LIMIT,
-            ..Self::default()
-        })
+        Arc::new(Self::default())
     }
 
     /// Create a `Metrics` instance with a custom per-label cardinality limit.

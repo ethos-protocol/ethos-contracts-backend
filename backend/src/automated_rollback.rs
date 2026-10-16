@@ -367,7 +367,8 @@ pub async fn create_rollback_plan(
         plan.tests.len()
     ));
 
-    let mut store = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap();
+    let store = &mut *guard;
     store.plans.insert(plan.id.clone(), plan.clone());
 
     Ok((StatusCode::CREATED, Json(plan)))
@@ -399,7 +400,8 @@ pub async fn run_post_deployment_tests(
     Path(id): Path<String>,
     Json(body): Json<RunTestsRequest>,
 ) -> Result<Json<RunTestsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let mut store = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap();
+    let store = &mut *guard;
     let plan = store
         .plans
         .get_mut(&id)
@@ -519,7 +521,8 @@ pub async fn trigger_rollback(
     Path(id): Path<String>,
     Json(body): Json<ManualRollbackRequest>,
 ) -> Result<Json<RollbackPlan>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap();
+    let store = &mut *guard;
     let plan = store.plans.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     plan.status = RollbackPlanStatus::ManualRollback;
