@@ -1,7 +1,7 @@
-/// Issue #558 — Vault compression for inactive accounts tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #558 — Vault compression for inactive accounts tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;

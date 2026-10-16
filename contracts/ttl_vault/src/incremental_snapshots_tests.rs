@@ -1,7 +1,7 @@
-/// Issue #559 — Incremental state snapshots tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #559 — Incremental state snapshots tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;

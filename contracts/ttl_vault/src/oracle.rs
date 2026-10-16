@@ -115,10 +115,7 @@ mod tests {
 
     #[test]
     fn far_stale_read_is_rejected() {
-        assert_eq!(
-            check_staleness(MAX * 100, MAX),
-            Err(OracleError::StaleData)
-        );
+        assert_eq!(check_staleness(MAX * 100, MAX), Err(OracleError::StaleData));
     }
 
     #[test]
