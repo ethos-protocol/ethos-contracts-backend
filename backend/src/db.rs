@@ -614,6 +614,7 @@ impl Db {
     }
 }
 
+use crate::db_read_pool::{open_writer, resolve_target, ReadGuard, ReadPool};
 use rusqlite::{params, Connection, OptionalExtension};
 
 fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
@@ -669,13 +670,16 @@ impl PoolConfig {
     }
 }
 
+/// Database handle.
+///
+/// Concurrency model (#696, #697): all writes go through `conn`, a single
+/// mutex-guarded writer connection. Read-only queries check a connection out of
+/// `read_pool` (see [`crate::db_read_pool`]), so readers run in parallel with each
+/// other and with the writer. When the read pool is exhausted, reads fall back to
+/// `conn`.
 pub struct Db {
     conn: std::sync::Mutex<Connection>,
-    // DB_POOL_MIN/DB_POOL_MAX are accepted for forward compatibility but unused:
-    // `conn` is a single mutex-guarded connection, not a real pool. Only
-    // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
-    #[allow(dead_code)]
-    pool_config: PoolConfig,
+    read_pool: ReadPool,
     /// In-memory read cache mirroring the `vaults` table, kept in sync by
     /// `insert_vault`. The `vaults` table (via `conn`) is the durable source
     /// of truth read by `get_vault`; this cache exists only for call sites
@@ -697,18 +701,51 @@ impl Db {
         Self::open_with_pool_config(path, &PoolConfig::default())
     }
 
+    /// Open the database with the given pool settings.
+    ///
+    /// `min` read connections are opened immediately and the read pool grows up
+    /// to `max` on demand. `timeout_secs` is the SQLite busy timeout and also how
+    /// long a read waits for a free pooled connection before falling back to the
+    /// writer.
     pub fn open_with_pool_config(path: &str, config: &PoolConfig) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(config.timeout_secs as u64))?;
+        let timeout = std::time::Duration::from_secs(u64::from(config.timeout_secs));
+        let target = resolve_target(path);
+        let conn = open_writer(&target, timeout)?;
+        let read_pool = ReadPool::new(
+            &target,
+            config.min as usize,
+            config.max as usize,
+            timeout,
+            timeout,
+        )?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
-            pool_config: PoolConfig {
-                min: config.min,
-                max: config.max,
-                timeout_secs: config.timeout_secs,
-            },
+            read_pool,
             vault_store: create_vault_store(),
         })
+    }
+
+    /// Check out a connection for a read-only query: a pooled reader when one is
+    /// available, otherwise the writer.
+    ///
+    /// Do not call this while holding the writer lock (`conn`) or another reader.
+    /// If the pool is exhausted, the fallback would wait on a mutex the current
+    /// thread already holds. Scope the outer guard so it drops first.
+    fn reader(&self) -> ReadGuard<'_> {
+        match self.read_pool.acquire() {
+            Some(conn) => ReadGuard::pooled(&self.read_pool, conn),
+            None => ReadGuard::writer(self.conn.lock().unwrap()),
+        }
+    }
+
+    /// Read connections the pool may open (`DB_POOL_MAX`, at least 1).
+    pub fn max_read_connections(&self) -> usize {
+        self.read_pool.max_size()
+    }
+
+    /// Read connections opened so far, including the `DB_POOL_MIN` set opened at startup.
+    pub fn open_read_connections(&self) -> usize {
+        self.read_pool.open_connections()
     }
 
     /// Insert or replace a vault. Persists to the `vaults` table so the vault

@@ -326,15 +326,18 @@ async fn main() {
     );
 
     let pool_config = PoolConfig::from_env();
-    tracing::info!(
-        min = pool_config.min,
-        max = pool_config.max,
-        timeout_secs = pool_config.timeout_secs,
-        "database pool configuration"
-    );
-
     let db =
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+    // Log what the pool actually runs with, not just what was requested (#696).
+    tracing::info!(
+        requested_min = pool_config.min,
+        requested_max = pool_config.max,
+        timeout_secs = pool_config.timeout_secs,
+        read_connections_max = db.max_read_connections(),
+        read_connections_open = db.open_read_connections(),
+        write_connections = 1,
+        "database connection pool initialized"
+    );
     db.migrate().expect("migration failed");
 
     // Keep sampler and rpc_pool alive for the duration of the process.
