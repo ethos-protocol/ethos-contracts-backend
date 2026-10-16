@@ -92,6 +92,7 @@ pub mod tracing;
 pub mod tracing_sampling;
 pub mod two_factor;
 pub mod webauthn;
+pub mod webauthn_config;
 pub mod webhook;
 pub mod websocket;
 

@@ -513,7 +513,11 @@ async fn main() {
     //     .with_state(log_store);
 
     // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
-    let webauthn_state = Arc::new(WebAuthnState::from_env());
+    // Fail startup on a missing or inconsistent relying-party config (#695).
+    let webauthn_state = Arc::new(
+        WebAuthnState::from_env()
+            .unwrap_or_else(|err| panic!("invalid WebAuthn configuration: {err}")),
+    );
     let webauthn_router = Router::new()
         .route("/webauthn/register/begin", post(begin_registration))
         .route("/webauthn/register/complete", post(complete_registration))

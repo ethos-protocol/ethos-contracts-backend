@@ -45,6 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::Verifier;
 
+use crate::webauthn_config::{RelyingPartyConfig, WebAuthnConfigError};
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Seconds before a pending challenge expires.
@@ -173,13 +175,14 @@ impl WebAuthnState {
         }
     }
 
-    pub fn from_env() -> Self {
-        let rp_id = std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".to_string());
-        let rp_name =
-            std::env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Ethos Protocol".to_string());
-        let origin = std::env::var("WEBAUTHN_ORIGIN")
-            .unwrap_or_else(|_| "http://localhost:3000".to_string());
-        Self::new(rp_id, rp_name, origin)
+    /// Build the relying-party configuration from the process environment.
+    ///
+    /// Fails instead of falling back to `localhost` outside `RUST_ENV=development`,
+    /// so a deployment that forgets `WEBAUTHN_RP_ID` / `WEBAUTHN_ORIGIN` cannot
+    /// start with passkeys scoped to the wrong origin (#695).
+    pub fn from_env() -> Result<Self, WebAuthnConfigError> {
+        let rp = RelyingPartyConfig::from_env()?;
+        Ok(Self::new(rp.rp_id, rp.rp_name, rp.origin))
     }
 }
 
