@@ -445,7 +445,7 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Option<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
@@ -523,7 +523,7 @@ impl Db {
         &self,
         owner_id: u64,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT last_active_at
@@ -556,7 +556,7 @@ impl Db {
     pub fn all_enabled_insurance_policies(
         &self,
     ) -> Result<Vec<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
@@ -777,7 +777,7 @@ impl Db {
 
     /// Retrieve a vault by string ID from the `vaults` table.
     pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding
             .prepare(
                 r"SELECT id, owner, beneficiary, balance, check_in_interval, last_check_in,
@@ -1396,7 +1396,7 @@ impl Db {
     /// rollback + re-apply cycle.
     #[cfg(test)]
     pub(crate) fn schema_object_names(&self) -> Vec<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn
             .prepare(
                 "SELECT name FROM sqlite_master \
@@ -1415,7 +1415,7 @@ impl Db {
     /// schemas before/after a rollback + re-apply cycle.
     #[cfg(test)]
     pub(crate) fn table_columns(&self, table: &str) -> Vec<(String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
@@ -1450,7 +1450,7 @@ impl Db {
     }
 
     pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
@@ -1480,7 +1480,7 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Option<String>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         conn.query_row(
             "SELECT normalized_frequency FROM reminder_preferences WHERE vault_id = ?1",
             params![vault_id.cast_signed()],
@@ -1489,7 +1489,7 @@ impl Db {
     }
 
     pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
@@ -1528,7 +1528,7 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
@@ -1592,7 +1592,7 @@ impl Db {
     }
 
     pub fn get_subscription(&self, vault_id: u64) -> Result<Option<Subscription>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT vault_id, owner, channels, frequency
                FROM vault_subscriptions
@@ -1634,7 +1634,7 @@ impl Db {
     }
 
     pub fn check_idempotency(&self, key: &str) -> Option<crate::models::IdempotencyRecord> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding
             .prepare("SELECT key, status_code, response_body, created_at FROM idempotency_keys WHERE key = ?1")
             .ok()?;
@@ -1753,7 +1753,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Option<TwoFactorConfig>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at, backup_codes
@@ -1845,7 +1845,7 @@ impl Db {
         &self,
         query: &AuditLogQuery,
     ) -> Result<Vec<AuditLogEntry>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
 
         let mut sql = String::from(
             "SELECT id, timestamp, user_id, action, resource, result, ip_address, details FROM audit_logs WHERE 1=1"
@@ -2033,7 +2033,7 @@ impl Db {
         &self,
         tenant_id: &str,
     ) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             "SELECT id, name, owner, created_at, updated_at, is_active FROM tenants WHERE id = ?1",
         )?;
@@ -2088,7 +2088,7 @@ impl Db {
     }
 
     pub fn get_tenant_vaults(&self, tenant_id: &str) -> Result<Vec<String>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt =
             binding.prepare("SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1")?;
         let iter = stmt.query_map(params![tenant_id], |r| r.get(0))?;
@@ -2206,7 +2206,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             "SELECT user_id, vault_id, status, last_seen, session_id FROM user_presence WHERE vault_id = ?1",
         )?;
@@ -2278,7 +2278,7 @@ impl Db {
         query: &str,
         limit: u32,
     ) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, vault_id, title, content FROM full_text_search_index
                WHERE title LIKE ?1 OR content LIKE ?1
@@ -2329,7 +2329,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt =
             binding.prepare("SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1")?;
         let facet_names: Vec<String> = stmt
@@ -2391,7 +2391,7 @@ impl Db {
         &self,
         data_type: &str,
     ) -> Result<Option<crate::models::DataRetentionPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
                FROM data_retention_policies WHERE data_type = ?1",
@@ -2407,7 +2407,7 @@ impl Db {
     pub fn list_retention_policies(
         &self,
     ) -> Result<Vec<crate::models::DataRetentionPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
                FROM data_retention_policies ORDER BY data_type",
@@ -2515,7 +2515,7 @@ impl Db {
         data_type: &str,
     ) -> Result<Vec<crate::models::RetentionException>, rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, data_type, record_id, reason, expires_at, created_at, created_by
                FROM retention_exceptions
@@ -2553,7 +2553,7 @@ impl Db {
         data_type: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::models::RetentionDeletionLog>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let (sql, param): (String, Option<String>) = if let Some(dt) = data_type {
             (
                 format!(
@@ -2629,7 +2629,7 @@ impl Db {
     pub fn list_encryption_key_versions(
         &self,
     ) -> Result<Vec<crate::models::EncryptionKeyInfo>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT version, status, created_at, rotated_at
                FROM encryption_key_versions ORDER BY version DESC",
@@ -2714,7 +2714,7 @@ impl Db {
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationPolicy>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
                      notify_channels, created_at, updated_at, max_token_lifetime_hours
@@ -2733,7 +2733,7 @@ impl Db {
     pub fn list_secret_rotation_policies(
         &self,
     ) -> Result<Vec<crate::models::SecretRotationPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
                      notify_channels, created_at, updated_at, max_token_lifetime_hours
@@ -2805,7 +2805,7 @@ impl Db {
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationLog>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
                FROM secret_rotation_logs WHERE secret_type = ?1
@@ -2825,7 +2825,7 @@ impl Db {
         limit: u32,
     ) -> Result<Vec<crate::models::SecretRotationLog>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
                FROM secret_rotation_logs WHERE secret_type = ?1
@@ -2978,7 +2978,7 @@ impl Db {
         &self,
         name: &str,
     ) -> Result<crate::degradation::CapabilityStatus, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT name, level, reason, fallback_available, updated_at 
              FROM capability_statuses 
@@ -3024,7 +3024,7 @@ impl Db {
     pub fn list_capability_statuses(
         &self,
     ) -> Result<Vec<crate::degradation::CapabilityStatus>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT name, level, reason, fallback_available, updated_at 
              FROM capability_statuses
@@ -3072,7 +3072,7 @@ impl Db {
     /// string per violation.  Returns an empty `Vec` if the database is
     /// clean.
     pub fn run_consistency_pragma(&self) -> Result<Vec<String>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
         let rows = stmt.query_map([], |r| {
             // Columns: table, rowid, parent, fkid
@@ -3129,7 +3129,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<(u64, String, String, String, u32)>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             r"
             SELECT sequence, event_type, timestamp, data, schema_version
@@ -3189,7 +3189,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             r"
             SELECT snapshot_sequence, taken_at, state
@@ -3345,7 +3345,7 @@ impl Db {
         // mutex guard is released before we call get_feature_flag_history,
         // which also needs to acquire the lock.
         let maybe_flag = {
-            let binding = self.conn.lock().unwrap();
+            let binding = self.reader();
             let mut stmt = binding.prepare(
                 r"SELECT key, description, enabled, rollout_percentage, version, created_at, updated_at
                    FROM feature_flags WHERE key = ?1",
@@ -3408,7 +3408,7 @@ impl Db {
         &self,
     ) -> Result<Vec<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
         let keys: Vec<String> = {
-            let binding = self.conn.lock().unwrap();
+            let binding = self.reader();
             let mut stmt = binding.prepare("SELECT key FROM feature_flags ORDER BY key")?;
             let iter = stmt.query_map([], |r| r.get(0))?;
             let mut keys = Vec::new();
@@ -3432,7 +3432,7 @@ impl Db {
         &self,
         key: &str,
     ) -> Result<Vec<crate::feature_flags::FlagVersionSnapshot>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT version, enabled, rollout_percentage, updated_at, updated_by
                FROM feature_flag_history
