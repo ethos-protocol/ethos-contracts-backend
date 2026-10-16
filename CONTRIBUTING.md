@@ -230,6 +230,19 @@ Closes #<number>
 - "Request changes" feedback must be resolved before merge.
 - Approvals from maintainers with write access are required to merge.
 
+### GitHub Actions pinning
+
+Third-party actions in `.github/workflows/` are pinned to a full commit SHA with the
+version kept in a trailing comment, so a moved or compromised tag cannot change what CI runs:
+
+```yaml
+- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+```
+
+- **Adding or changing an action:** resolve the tag to its commit SHA and keep the `# <version>` comment in sync.
+- **Updates:** the weekly `github-actions` Dependabot job (`.github/dependabot.yml`) proposes new SHAs.
+- **Per release:** re-check every pin against its upstream tag before tagging a release.
+
 ---
 
 ## Documentation
