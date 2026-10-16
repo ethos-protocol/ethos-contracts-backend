@@ -57,7 +57,7 @@ use ethos_protocol_backend::{
     // },
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
-        create_vault_store, AppState, Db, PoolConfig,
+        create_vault_store, resolve_db_path, AppState, Db, PoolConfig,
     },
     decompression::DecompressionConfig,
     degradation::{
@@ -333,8 +333,30 @@ async fn main() {
         "database pool configuration"
     );
 
+    // #690: vault, subscription and audit data must survive restarts, so the
+    // database is a file on a persistent volume. `:memory:` needs an explicit opt-in.
+    let allow_ephemeral_db = std::env::var("ALLOW_EPHEMERAL_DB").is_ok_and(|v| v == "true");
+    let db_path =
+        match resolve_db_path(std::env::var("DB_PATH").ok().as_deref(), allow_ephemeral_db) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                std::process::exit(1);
+            }
+        };
+    if let Some(parent) = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::error!(dir = %parent.display(), "cannot create database directory: {err}");
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(db_path = %db_path, "opening database");
+
     let db =
-        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+        Arc::new(Db::open_with_pool_config(&db_path, &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
     // Keep sampler and rpc_pool alive for the duration of the process.

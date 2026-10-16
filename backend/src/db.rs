@@ -634,6 +634,34 @@ fn vault_status_from_str(s: &str) -> crate::models::VaultStatus {
     }
 }
 
+/// SQLite file the server opens when `DB_PATH` is unset. It lives on a mounted
+/// volume (see docker-compose.yml and backend/Dockerfile), so vaults,
+/// notification subscriptions and audit rows survive restarts (#690).
+pub const DEFAULT_DB_PATH: &str = "/var/lib/ethos-protocol/ethos-protocol.db";
+
+/// Sentinel for an in-process SQLite database. Everything written to it is lost
+/// when the process exits.
+pub const EPHEMERAL_DB_PATH: &str = ":memory:";
+
+/// Resolves the SQLite path the server opens at startup (#690).
+///
+/// * `DB_PATH` unset or blank → [`DEFAULT_DB_PATH`].
+/// * `DB_PATH=:memory:` → refused unless `allow_ephemeral` is set (from
+///   `ALLOW_EPHEMERAL_DB=true`), so data loss on restart is always an explicit choice.
+pub fn resolve_db_path(db_path: Option<&str>, allow_ephemeral: bool) -> Result<String, String> {
+    let path = match db_path.map(str::trim) {
+        None | Some("") => DEFAULT_DB_PATH,
+        Some(path) => path,
+    };
+    if path == EPHEMERAL_DB_PATH && !allow_ephemeral {
+        return Err(format!(
+            "DB_PATH is {EPHEMERAL_DB_PATH}, which keeps all data in memory and loses it on restart. \
+             Point DB_PATH at a file on a persistent volume, or set ALLOW_EPHEMERAL_DB=true to accept this."
+        ));
+    }
+    Ok(path.to_string())
+}
+
 pub struct PoolConfig {
     pub min: u32,
     pub max: u32,
@@ -3577,5 +3605,67 @@ mod tests {
         assert_eq!(seen_by_a.id, vault2.id);
 
         let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn resolve_db_path_defaults_to_mounted_volume_file() {
+        assert_eq!(resolve_db_path(None, false).unwrap(), DEFAULT_DB_PATH);
+        assert_eq!(
+            resolve_db_path(Some("   "), false).unwrap(),
+            DEFAULT_DB_PATH
+        );
+    }
+
+    #[test]
+    fn resolve_db_path_uses_configured_file() {
+        assert_eq!(
+            resolve_db_path(Some(" /data/ethos.db "), false).unwrap(),
+            "/data/ethos.db"
+        );
+    }
+
+    #[test]
+    fn resolve_db_path_refuses_memory_without_explicit_opt_in() {
+        let err = resolve_db_path(Some(":memory:"), false).unwrap_err();
+        assert!(
+            err.contains("ALLOW_EPHEMERAL_DB=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_db_path_allows_memory_with_explicit_opt_in() {
+        assert_eq!(
+            resolve_db_path(Some(":memory:"), true).unwrap(),
+            EPHEMERAL_DB_PATH
+        );
+    }
+
+    #[test]
+    fn vault_survives_restart_when_opened_via_startup_path() {
+        // Mirrors main(): resolve DB_PATH, create its directory, open with the
+        // startup pool config, then reopen the same file after a "restart".
+        let dir = std::env::temp_dir().join(format!("ethos_db_startup_{}", uuid::Uuid::new_v4()));
+        let file = dir.join("ethos-protocol.db");
+        let path = resolve_db_path(Some(file.to_str().unwrap()), false).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = make_test_vault("startup-path-vault");
+        {
+            let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
+            db.migrate().unwrap();
+            db.insert_vault(vault.clone());
+        }
+
+        let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
+        db.migrate().unwrap();
+        let reloaded = db
+            .get_vault(&vault.id)
+            .expect("vault should be readable after restart");
+        assert_eq!(reloaded.owner, vault.owner);
+        assert_eq!(reloaded.balance, vault.balance);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

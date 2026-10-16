@@ -26,6 +26,13 @@ title = "Ethos-Protocol gitleaks fixture-coverage config"
   tags = ["database", "connection-string"]
 
 [[rules]]
+  id = "ethos-local-postgres-credential-pair"
+  description = "Hard-coded Ethos local Postgres credential pair (formerly in docker-compose.yml, #688)"
+  # Written as `ethos_pass(?:word)` so this file does not contain the literal pair it detects.
+  regex = '''ethos_user:ethos_pass(?:word)'''
+  tags = ["database", "credentials"]
+
+[[rules]]
   id = "abuseipdb-api-key"
   description = "AbuseIPDB API key (ABUSEIPDB_API_KEY, consumed by backend/src/ip_reputation.rs)"
   regex = '''(?i)abuseipdb[a-z0-9_ =:"'\-]{0,20}\b([a-f0-9]{80})\b'''

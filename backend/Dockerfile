@@ -13,9 +13,9 @@
 #   REMINDER_ENCRYPTION_SECRET
 # Additional vars read by the backend but not yet documented in .env.example:
 #   NODE_ID, CONSENSUS_STRATEGY, REDIS_URL, ADMIN_API_KEY
-# NOTE: the backend currently opens SQLite at ":memory:" (backend/src/main.rs) --
-# DATABASE_URL / the Postgres service in docker-compose.yml are not read by this
-# binary. Vault data does not persist across container restarts.
+# Database: the backend opens the SQLite file at DB_PATH (default
+# /var/lib/ethos-protocol/ethos-protocol.db, a mounted volume). It refuses to
+# start with DB_PATH=:memory: unless ALLOW_EPHEMERAL_DB=true is set (#690).
 
 ARG RUST_VERSION=1.96.1
 
@@ -54,9 +54,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /app/target/release/ethos-protocol-backend /usr/local/bin/ethos-protocol-backend
 
+# SQLite database lives on a volume owned by the runtime user (#690). Mount a
+# named volume here so data survives container restarts.
+RUN mkdir -p /var/lib/ethos-protocol && chown ethos:ethos /var/lib/ethos-protocol
+VOLUME ["/var/lib/ethos-protocol"]
+
 USER ethos
 EXPOSE 3000
-ENV RUST_LOG=info
+ENV RUST_LOG=info \
+    DB_PATH=/var/lib/ethos-protocol/ethos-protocol.db
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1

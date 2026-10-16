@@ -70,13 +70,12 @@ docker-compose up -d
 ```
 
 This will start:
-- **PostgreSQL** on `localhost:5432`
-- **Backend** on `localhost:3000`
+- **Backend** on `localhost:3000`, with its SQLite database on the `ethos_data` volume (see [ADR-0006](docs/adr/0006-sqlite-backend-storage.md))
 - **Stellar Quickstart** on `localhost:8000`
 
 The `docker-compose.override.yml` configures development-specific settings (standalone Stellar, loose auth, mounted volumes).
 
-Database health check ensures the service is ready before the backend starts.
+The backend stores all data in a single SQLite file set by `DB_PATH` (default `/var/lib/ethos-protocol/ethos-protocol.db`). Set `ALLOW_EPHEMERAL_DB=true` only if you want `DB_PATH=:memory:`, which loses data on restart.
 
 ### Setup Environment
 
