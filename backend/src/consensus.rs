@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+/// Key used by [`NodeCache::probe`]. Never written by application code.
+const READINESS_PROBE_KEY: &str = "__readiness_probe__";
+
 /// A versioned cache entry shared across backend nodes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -201,6 +204,12 @@ impl NodeCache {
 
     pub fn get(&self, key: &str) -> Result<Option<CacheEntry>, String> {
         self.backend.get_entry(key)
+    }
+
+    /// Verify the backing store is reachable (#698). Reads a key that is never
+    /// written, so the probe exercises the backend without mutating state.
+    pub fn probe(&self) -> Result<(), String> {
+        self.backend.get_entry(READINESS_PROBE_KEY).map(|_| ())
     }
 
     pub fn sync_local_from_remote(&self) -> Result<(), String> {

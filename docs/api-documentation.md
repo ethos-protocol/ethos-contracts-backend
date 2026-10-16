@@ -143,12 +143,34 @@ curl -X GET http://localhost:3000/health
 
 ### `GET /ready`
 
-Readiness probe. Checks database connectivity.
+Readiness probe. Each subsystem is checked independently with a 2-second timeout.
+
+| Check | Required | Passes when |
+|---|---|---|
+| `database` | yes | SQLite answers `SELECT 1` |
+| `consensus_cache` | yes | The cache backend (Redis or in-memory) is reachable |
+| `notification_scheduler` | yes | The scheduler has ticked within the last 3 minutes |
+| `webhook_queue` | yes | Webhook registry and dead-letter stores are usable |
+| `rpc_pool` | no | The configured `RPC_ENDPOINT` returns 2xx (healthy when unset) |
 
 | Status | Meaning |
 |---|---|
-| `200` | Ready: `{"status":"ok","version":"0.1.0","database":"connected"}` |
-| `503` | Database unreachable; take the instance out of rotation. |
+| `200` | Every required check passed. `status` is `"ok"`, or `"degraded"` when only a non-required check failed. |
+| `503` | At least one required check failed or timed out; take the instance out of rotation. |
+
+Each entry in `checks` reports `required`, `status` (`ok`, `failed`, or `timeout`), `latency_ms`, and a fixed `error` message when it did not pass.
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "database": "connected",
+  "checks": {
+    "database": { "required": true, "status": "ok", "latency_ms": 0 },
+    "rpc_pool": { "required": false, "status": "ok", "latency_ms": 1 }
+  }
+}
+```
 
 ```bash
 curl -X GET http://localhost:3000/ready

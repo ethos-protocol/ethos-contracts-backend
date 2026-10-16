@@ -598,6 +598,10 @@ mod tests {
             message_queue: Arc::new(
                 MessageQueueState::new().expect("failed to initialize message queue"),
             ),
+            rpc_pool: Arc::new(
+                crate::rpc_pool::RpcPool::new(&crate::rpc_pool::RpcPoolConfig::default())
+                    .expect("failed to build RPC pool"),
+            ),
             degradation_state,
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
