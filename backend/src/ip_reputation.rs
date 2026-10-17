@@ -254,6 +254,7 @@ pub fn is_ip_blocked(ip: &str, rules: &[IpBlockRule]) -> bool {
 // ── Query parameter structs ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpQuery {
     pub ip: String,
 }

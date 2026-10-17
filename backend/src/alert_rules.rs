@@ -485,6 +485,7 @@ fn dispatch_notification(channel: &AlertChannel, rule: &AlertRule, message: &str
 
 /// Request body for `POST /alerts/rules`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAlertRuleRequest {
     pub name: String,
     pub event_type: CriticalEventType,
@@ -573,6 +574,7 @@ pub async fn delete_alert_rule(
 
 /// Request body for `POST /alerts/evaluate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateAlertsRequest {
     pub metrics: CurrentMetrics,
 }

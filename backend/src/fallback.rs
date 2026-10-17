@@ -55,6 +55,7 @@ pub struct FallbackChain {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterFallbackChainRequest {
     pub name: String,
     pub resource: String,
@@ -85,6 +86,7 @@ pub struct FallbackExecutionResult {
 /// so operators can validate cascade behavior without needing every
 /// downstream target to actually be down.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TestFallbackChainRequest {
     #[serde(default)]
     pub simulate_failures: Vec<String>,

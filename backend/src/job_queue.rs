@@ -39,6 +39,7 @@ pub struct Job {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateJobRequest {
     pub job_type: String,
     pub payload: serde_json::Value,

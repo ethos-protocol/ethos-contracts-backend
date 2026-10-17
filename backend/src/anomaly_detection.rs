@@ -179,6 +179,7 @@ pub struct Alert {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObserveRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -419,6 +420,7 @@ pub struct InvestigationEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvestigationRequest {
     pub investigator: String,
     pub action: InvestigationAction,
@@ -747,6 +749,7 @@ pub async fn get_baseline(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeasonalityRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -755,6 +758,7 @@ pub struct SeasonalityRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeasonalThresholdRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -764,6 +768,7 @@ pub struct SeasonalThresholdRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricQuery {
     #[serde(default)]
     pub service: Option<String>,
@@ -824,6 +829,7 @@ pub async fn get_seasonal_pattern(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemAnomalyQuery {
     /// Look-back window in seconds (default one hour).
     #[serde(default)]

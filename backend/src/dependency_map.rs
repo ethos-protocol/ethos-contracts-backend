@@ -163,6 +163,7 @@ impl DependencyGraph {
 /// Request body for `POST /dependencies/discover` — records one observed
 /// call between services (e.g. reported by an instrumentation middleware).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoverDependencyRequest {
     pub from: String,
     pub to: String,
@@ -171,6 +172,7 @@ pub struct DiscoverDependencyRequest {
 
 /// Request body for `POST /dependencies/impact`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactAnalysisRequest {
     pub service: String,
 }

@@ -15,6 +15,7 @@ use std::sync::{Arc, RwLock};
 
 /// A query for searching logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogQuery {
     pub min_level: Option<LogLevel>,
     pub max_level: Option<LogLevel>,

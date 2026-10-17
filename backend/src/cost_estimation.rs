@@ -143,6 +143,7 @@ pub struct CostScenario {
 // ── Request / Response ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EstimateCostRequest {
     pub operation: OperationType,
     /// Optional vault ID — used to look up vault-specific data if available.

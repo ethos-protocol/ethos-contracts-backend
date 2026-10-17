@@ -63,6 +63,7 @@ pub struct WebhookRegistration {
 
 /// Request body for `POST /webhooks`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterWebhookRequest {
     pub url: String,
     pub vault_id: Option<String>,
@@ -598,6 +599,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Request body for the `POST /webhooks/verify` endpoint.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyWebhookRequest {
     /// Raw payload body that was received.
     pub body: String,
@@ -697,6 +699,15 @@ mod tests {
 
     fn ts_now() -> String {
         Utc::now().timestamp().to_string()
+    }
+
+    #[test]
+    fn registration_rejects_misspelled_fields() {
+        let request = serde_json::from_str::<RegisterWebhookRequest>(
+            r#"{"url":"https://example.test/hook","secret_key":"secret"}"#,
+        );
+
+        assert!(request.is_err());
     }
 
     fn sample_payload(id: &str) -> WebhookPayload {

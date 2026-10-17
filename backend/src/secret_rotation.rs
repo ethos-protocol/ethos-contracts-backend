@@ -304,6 +304,7 @@ pub async fn rotation_history(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordRotationRequest {
     pub notes: Option<String>,
 }

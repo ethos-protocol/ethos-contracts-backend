@@ -30,6 +30,8 @@ use std::sync::Mutex;
 
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -42,18 +44,19 @@ pub struct CostEntry {
     /// Arbitrary attribution tags, e.g. `{"team": "vaults", "region": "us-east-1"}`.
     pub tags: HashMap<String, String>,
     /// Cost amount in the smallest currency unit's decimal form (e.g. USD dollars).
-    pub amount: f64,
+    pub amount: Decimal,
     pub currency: String,
     pub recorded_at: DateTime<Utc>,
 }
 
 /// Request body for `POST /admin/cost/entries`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordCostRequest {
     pub operation: String,
     #[serde(default)]
     pub tags: HashMap<String, String>,
-    pub amount: f64,
+    pub amount: Decimal,
     #[serde(default = "default_currency")]
     pub currency: String,
 }
@@ -65,18 +68,19 @@ fn default_currency() -> String {
 /// Aggregate cost report.
 #[derive(Debug, Serialize)]
 pub struct CostReport {
-    pub total_amount: f64,
+    pub total_amount: Decimal,
     pub currency: String,
     pub entry_count: usize,
-    pub by_operation: HashMap<String, f64>,
-    pub by_tag: HashMap<String, HashMap<String, f64>>,
+    pub by_operation: HashMap<String, Decimal>,
+    pub by_tag: HashMap<String, HashMap<String, Decimal>>,
 }
 
 /// Request body for `POST /admin/cost/allocate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllocateCostRequest {
     /// The shared cost amount to split up.
-    pub total_amount: f64,
+    pub total_amount: Decimal,
     /// Tag key to allocate by (e.g. "team"). Allocation is proportional to
     /// each tag value's share of previously recorded cost under that key.
     pub tag_key: String,
@@ -86,9 +90,9 @@ pub struct AllocateCostRequest {
 #[derive(Debug, Serialize)]
 pub struct CostAllocation {
     pub tag_key: String,
-    pub total_amount: f64,
+    pub total_amount: Decimal,
     /// tag value -> allocated amount
-    pub allocations: HashMap<String, f64>,
+    pub allocations: HashMap<String, Decimal>,
 }
 
 /// What a `BudgetThreshold` measures cost against: either all entries for a
@@ -105,9 +109,7 @@ impl BudgetScope {
     fn matches(&self, entry: &CostEntry) -> bool {
         match self {
             BudgetScope::Operation(operation) => &entry.operation == operation,
-            BudgetScope::Tag { key, value } => {
-                entry.tags.get(key).is_some_and(|v| v == value)
-            }
+            BudgetScope::Tag { key, value } => entry.tags.get(key).is_some_and(|v| v == value),
         }
     }
 }
@@ -119,15 +121,16 @@ pub struct BudgetThreshold {
     /// Human-readable category name, e.g. "vaults-gas" or "acme-corp-api".
     pub category: String,
     pub scope: BudgetScope,
-    pub limit: f64,
+    pub limit: Decimal,
 }
 
 /// Request body for `POST /admin/cost/budget-thresholds`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetBudgetThresholdRequest {
     pub category: String,
     pub scope: BudgetScope,
-    pub limit: f64,
+    pub limit: Decimal,
 }
 
 /// A threshold whose configured `limit` has been reached or exceeded by
@@ -136,8 +139,8 @@ pub struct SetBudgetThresholdRequest {
 pub struct BudgetBreach {
     pub category: String,
     pub scope: BudgetScope,
-    pub limit: f64,
-    pub current_total: f64,
+    pub limit: Decimal,
+    pub current_total: Decimal,
 }
 
 // ── Gas (on-chain fee) tracking ───────────────────────────────────────────────
@@ -166,6 +169,7 @@ pub struct GasCostEntry {
 
 /// Request body for `POST /admin/cost/gas`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordGasCostRequest {
     pub operation: String,
     pub tx_hash: String,
@@ -218,7 +222,7 @@ pub struct CostDashboard {
 
 #[derive(Debug, Serialize)]
 pub struct CostDashboardSummary {
-    pub total_amount: f64,
+    pub total_amount: Decimal,
     pub currency: String,
     pub entry_count: usize,
 }
@@ -232,7 +236,7 @@ pub struct GasDashboardSummary {
 #[derive(Debug, Serialize)]
 pub struct OperationCostItem {
     pub operation: String,
-    pub total: f64,
+    pub total: Decimal,
 }
 
 // ── Optimization suggestions ──────────────────────────────────────────────────
@@ -324,7 +328,11 @@ impl CostState {
                 let total: u64 = fees.iter().sum();
                 let max = *fees.iter().max().unwrap_or(&0);
                 let min = *fees.iter().min().unwrap_or(&0);
-                let avg = if tx_count > 0 { total / tx_count as u64 } else { 0 };
+                let avg = if tx_count > 0 {
+                    total / tx_count as u64
+                } else {
+                    0
+                };
                 GasOperationStats {
                     operation,
                     tx_count,
@@ -363,7 +371,11 @@ impl CostState {
                 total,
             })
             .collect();
-        fiat_ops.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+        fiat_ops.sort_by(|a, b| {
+            b.total
+                .partial_cmp(&a.total)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         fiat_ops.truncate(5);
 
         // Top-5 gas operations by total fee (descending)
@@ -373,7 +385,7 @@ impl CostState {
             .take(5)
             .map(|s| OperationCostItem {
                 operation: s.operation.clone(),
-                total: s.total_fee_stroops as f64,
+                total: Decimal::from(s.total_fee_stroops),
             })
             .collect();
 
@@ -412,10 +424,13 @@ impl CostState {
         let breaches = self.check_budget_breaches();
 
         // 1. Dominant fiat operations
-        if fiat.total_amount > 0.0 {
+        if fiat.total_amount > Decimal::ZERO {
             for (op, &op_total) in &fiat.by_operation {
                 let fraction = op_total / fiat.total_amount;
-                if fraction > 0.5 {
+                if fraction > Decimal::new(5, 1) {
+                    let fraction_f64 = fraction
+                        .to_f64()
+                        .expect("a cost fraction is representable as f64");
                     suggestions.push(OptimizationSuggestion {
                         id: Uuid::new_v4().to_string(),
                         severity: OptimizationSeverity::High,
@@ -425,11 +440,11 @@ impl CostState {
                              ({:.4} / {:.4} USD). Review whether this operation can be \
                              batched, cached, or replaced with a cheaper alternative.",
                             op,
-                            fraction * 100.0,
+                            fraction_f64 * 100.0,
                             op_total,
                             fiat.total_amount
                         ),
-                        estimated_saving_fraction: fraction * 0.3,
+                        estimated_saving_fraction: fraction_f64 * 0.3,
                         applies_to: Some(op.clone()),
                     });
                 }
@@ -480,25 +495,28 @@ impl CostState {
         }
 
         // 4. High fiat cost operations with no matching gas entries
-        let gas_ops_with_data: std::collections::HashSet<&str> =
-            gas.by_operation.iter().map(|s| s.operation.as_str()).collect();
-        if fiat.total_amount > 0.0 {
+        let gas_ops_with_data: std::collections::HashSet<&str> = gas
+            .by_operation
+            .iter()
+            .map(|s| s.operation.as_str())
+            .collect();
+        if fiat.total_amount > Decimal::ZERO {
             for (op, &op_total) in &fiat.by_operation {
                 let fraction = op_total / fiat.total_amount;
-                if fraction > 0.2 && !gas_ops_with_data.contains(op.as_str()) {
+                if fraction > Decimal::new(2, 1) && !gas_ops_with_data.contains(op.as_str()) {
+                    let fraction_f64 = fraction
+                        .to_f64()
+                        .expect("a cost fraction is representable as f64");
                     suggestions.push(OptimizationSuggestion {
                         id: Uuid::new_v4().to_string(),
                         severity: OptimizationSeverity::Low,
-                        title: format!(
-                            "No gas data for high-cost operation '{}'",
-                            op
-                        ),
+                        title: format!("No gas data for high-cost operation '{}'", op),
                         description: format!(
                             "Operation '{}' accounts for {:.1}% of fiat costs but has no \
                              associated gas entries. Add gas instrumentation to this call \
                              site for a full cost picture.",
                             op,
-                            fraction * 100.0
+                            fraction_f64 * 100.0
                         ),
                         estimated_saving_fraction: 0.0,
                         applies_to: Some(op.clone()),
@@ -532,7 +550,7 @@ impl CostState {
         thresholds
             .iter()
             .filter_map(|threshold| {
-                let current_total: f64 = entries
+                let current_total: Decimal = entries
                     .iter()
                     .filter(|e| threshold.scope.matches(e))
                     .map(|e| e.amount)
@@ -556,9 +574,9 @@ impl CostState {
     pub fn report(&self) -> CostReport {
         let entries = self.entries.lock().unwrap();
 
-        let mut total_amount = 0.0;
-        let mut by_operation: HashMap<String, f64> = HashMap::new();
-        let mut by_tag: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut total_amount = Decimal::ZERO;
+        let mut by_operation: HashMap<String, Decimal> = HashMap::new();
+        let mut by_tag: HashMap<String, HashMap<String, Decimal>> = HashMap::new();
         let currency = entries
             .first()
             .map(|e| e.currency.clone())
@@ -566,11 +584,13 @@ impl CostState {
 
         for entry in entries.iter() {
             total_amount += entry.amount;
-            *by_operation.entry(entry.operation.clone()).or_insert(0.0) += entry.amount;
+            *by_operation
+                .entry(entry.operation.clone())
+                .or_insert(Decimal::ZERO) += entry.amount;
 
             for (tag_key, tag_value) in entry.tags.iter() {
                 let key_map = by_tag.entry(tag_key.clone()).or_default();
-                *key_map.entry(tag_value.clone()).or_insert(0.0) += entry.amount;
+                *key_map.entry(tag_value.clone()).or_insert(Decimal::ZERO) += entry.amount;
             }
         }
 
@@ -586,20 +606,20 @@ impl CostState {
     /// Allocate `total_amount` across the values of `tag_key` proportional
     /// to each value's historical share of recorded cost. Falls back to an
     /// even split if no historical entries carry `tag_key`.
-    pub fn allocate(&self, total_amount: f64, tag_key: &str) -> CostAllocation {
+    pub fn allocate(&self, total_amount: Decimal, tag_key: &str) -> CostAllocation {
         let entries = self.entries.lock().unwrap();
 
-        let mut by_value: HashMap<String, f64> = HashMap::new();
+        let mut by_value: HashMap<String, Decimal> = HashMap::new();
         for entry in entries.iter() {
             if let Some(value) = entry.tags.get(tag_key) {
-                *by_value.entry(value.clone()).or_insert(0.0) += entry.amount;
+                *by_value.entry(value.clone()).or_insert(Decimal::ZERO) += entry.amount;
             }
         }
 
         let mut allocations = HashMap::new();
-        let historical_total: f64 = by_value.values().sum();
+        let historical_total: Decimal = by_value.values().sum();
 
-        if historical_total > 0.0 {
+        if historical_total > Decimal::ZERO {
             for (value, cost) in by_value.iter() {
                 allocations.insert(value.clone(), total_amount * (cost / historical_total));
             }
@@ -624,7 +644,9 @@ impl Default for CostState {
 /// Turn a budget breach into an incident creation request, so a threshold
 /// crossing can be filed through the standard incident workflow
 /// (`incidents::create_incident`).
-pub fn breach_to_incident_request(breach: &BudgetBreach) -> crate::incidents::CreateIncidentRequest {
+pub fn breach_to_incident_request(
+    breach: &BudgetBreach,
+) -> crate::incidents::CreateIncidentRequest {
     crate::incidents::CreateIncidentRequest {
         title: format!("Budget threshold breached: {}", breach.category),
         description: format!(
@@ -639,7 +661,9 @@ pub fn breach_to_incident_request(breach: &BudgetBreach) -> crate::incidents::Cr
 /// Turn a budget breach into an on-call escalation trigger
 /// (`oncall::trigger_escalation`), so a threshold crossing can page whoever
 /// is on call for cost overruns.
-pub fn breach_to_escalation_request(breach: &BudgetBreach) -> crate::oncall::TriggerEscalationRequest {
+pub fn breach_to_escalation_request(
+    breach: &BudgetBreach,
+) -> crate::oncall::TriggerEscalationRequest {
     crate::oncall::TriggerEscalationRequest {
         reason: format!(
             "budget threshold '{}' breached: {:.4} >= {:.4}",
@@ -662,7 +686,7 @@ pub async fn record_cost_entry(
             Json(serde_json::json!({ "error": "operation must not be empty" })),
         ));
     }
-    if body.amount < 0.0 {
+    if body.amount < Decimal::ZERO {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": "amount must be non-negative" })),
@@ -682,8 +706,8 @@ pub async fn record_cost_entry(
     for breach in state.check_budget_breaches() {
         tracing::warn!(
             category = %breach.category,
-            limit = breach.limit,
-            current_total = breach.current_total,
+            limit = %breach.limit,
+            current_total = %breach.current_total,
             "cost budget threshold breached"
         );
     }
@@ -722,7 +746,7 @@ pub async fn set_budget_threshold(
             Json(serde_json::json!({ "error": "category must not be empty" })),
         ));
     }
-    if body.limit < 0.0 {
+    if body.limit < Decimal::ZERO {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": "limit must be non-negative" })),
@@ -741,9 +765,7 @@ pub async fn set_budget_threshold(
 
 /// `GET /admin/cost/budget-breaches` — evaluate all configured thresholds
 /// against currently recorded cost and return the ones that are breached.
-pub async fn get_budget_breaches(
-    State(state): State<Arc<CostState>>,
-) -> Json<Vec<BudgetBreach>> {
+pub async fn get_budget_breaches(State(state): State<Arc<CostState>>) -> Json<Vec<BudgetBreach>> {
     Json(state.check_budget_breaches())
 }
 
@@ -780,16 +802,12 @@ pub async fn record_gas_cost(
 }
 
 /// `GET /admin/cost/gas/report` — aggregate gas cost report.
-pub async fn get_gas_cost_report(
-    State(state): State<Arc<CostState>>,
-) -> Json<GasCostReport> {
+pub async fn get_gas_cost_report(State(state): State<Arc<CostState>>) -> Json<GasCostReport> {
     Json(state.gas_report())
 }
 
 /// `GET /admin/cost/dashboard` — unified cost dashboard.
-pub async fn get_cost_dashboard(
-    State(state): State<Arc<CostState>>,
-) -> Json<CostDashboard> {
+pub async fn get_cost_dashboard(State(state): State<Arc<CostState>>) -> Json<CostDashboard> {
     Json(state.dashboard())
 }
 
@@ -804,14 +822,18 @@ pub async fn get_optimization_suggestions(
 mod tests {
     use super::*;
 
-    fn entry(operation: &str, team: &str, amount: f64) -> CostEntry {
+    fn d(value: i64) -> Decimal {
+        Decimal::from(value)
+    }
+
+    fn entry(operation: &str, team: &str, amount: impl Into<Decimal>) -> CostEntry {
         let mut tags = HashMap::new();
         tags.insert("team".to_string(), team.to_string());
         CostEntry {
             id: Uuid::new_v4().to_string(),
             operation: operation.to_string(),
             tags,
-            amount,
+            amount: amount.into(),
             currency: "USD".to_string(),
             recorded_at: Utc::now(),
         }
@@ -820,37 +842,62 @@ mod tests {
     #[test]
     fn report_aggregates_totals_and_tags() {
         let state = CostState::new();
-        state.record(entry("db.query", "vaults", 1.0));
-        state.record(entry("db.query", "vaults", 2.0));
-        state.record(entry("api.call", "billing", 3.0));
+        state.record(entry("db.query", "vaults", 1));
+        state.record(entry("db.query", "vaults", 2));
+        state.record(entry("api.call", "billing", 3));
 
         let report = state.report();
-        assert_eq!(report.total_amount, 6.0);
+        assert_eq!(report.total_amount, d(6));
         assert_eq!(report.entry_count, 3);
-        assert_eq!(report.by_operation.get("db.query"), Some(&3.0));
-        assert_eq!(report.by_tag.get("team").unwrap().get("vaults"), Some(&3.0));
+        assert_eq!(report.by_operation.get("db.query"), Some(&d(3)));
+        assert_eq!(
+            report.by_tag.get("team").unwrap().get("vaults"),
+            Some(&d(3))
+        );
         assert_eq!(
             report.by_tag.get("team").unwrap().get("billing"),
-            Some(&3.0)
+            Some(&d(3))
         );
     }
 
     #[test]
     fn allocation_is_proportional_to_historical_share() {
         let state = CostState::new();
-        state.record(entry("db.query", "vaults", 3.0));
-        state.record(entry("db.query", "billing", 1.0));
+        state.record(entry("db.query", "vaults", 3));
+        state.record(entry("db.query", "billing", 1));
 
-        let allocation = state.allocate(100.0, "team");
-        assert_eq!(allocation.allocations.get("vaults"), Some(&75.0));
-        assert_eq!(allocation.allocations.get("billing"), Some(&25.0));
+        let allocation = state.allocate(d(100), "team");
+        assert_eq!(allocation.allocations.get("vaults"), Some(&d(75)));
+        assert_eq!(allocation.allocations.get("billing"), Some(&d(25)));
     }
 
     #[test]
     fn allocation_with_no_history_is_empty() {
         let state = CostState::new();
-        let allocation = state.allocate(100.0, "team");
+        let allocation = state.allocate(d(100), "team");
         assert!(allocation.allocations.is_empty());
+    }
+
+    #[test]
+    fn decimal_cost_totals_and_budget_boundaries_are_exact() {
+        let state = CostState::new();
+        let tenth: Decimal = serde_json::from_str("0.1").unwrap();
+        assert_eq!(serde_json::to_string(&tenth).unwrap(), "0.1");
+        state.record(entry("api.call", "billing", tenth));
+        state.record(entry("api.call", "billing", tenth));
+        state.record(entry("api.call", "billing", tenth));
+        state.set_budget_threshold(BudgetThreshold {
+            category: "fractional".to_string(),
+            scope: BudgetScope::Operation("api.call".to_string()),
+            limit: Decimal::new(3, 1),
+        });
+
+        let report = state.report();
+        assert_eq!(report.total_amount, Decimal::new(3, 1));
+        assert_eq!(
+            state.check_budget_breaches()[0].current_total,
+            Decimal::new(3, 1)
+        );
     }
 
     // ── Gas tracking tests ────────────────────────────────────────────────
@@ -915,7 +962,11 @@ mod tests {
         state.record_gas(gas_entry("op.medium", 500, 3));
 
         let report = state.gas_report();
-        let ops: Vec<&str> = report.by_operation.iter().map(|s| s.operation.as_str()).collect();
+        let ops: Vec<&str> = report
+            .by_operation
+            .iter()
+            .map(|s| s.operation.as_str())
+            .collect();
         // Most expensive first
         assert_eq!(ops[0], "op.expensive");
         assert_eq!(ops[1], "op.medium");
@@ -937,7 +988,7 @@ mod tests {
         let state = CostState::new();
         let dash = state.dashboard();
         assert_eq!(dash.fiat_summary.entry_count, 0);
-        assert_eq!(dash.fiat_summary.total_amount, 0.0);
+        assert_eq!(dash.fiat_summary.total_amount, Decimal::ZERO);
         assert_eq!(dash.gas_summary.tx_count, 0);
         assert_eq!(dash.gas_summary.total_fee_stroops, 0);
         assert_eq!(dash.active_thresholds, 0);
@@ -949,13 +1000,13 @@ mod tests {
     #[test]
     fn dashboard_reflects_recorded_data() {
         let state = CostState::new();
-        state.record(entry("db.query", "vaults", 10.0));
-        state.record(entry("api.call", "billing", 5.0));
+        state.record(entry("db.query", "vaults", 10));
+        state.record(entry("api.call", "billing", 5));
         state.record_gas(gas_entry("vault.create", 1_000, 1));
 
         let dash = state.dashboard();
         assert_eq!(dash.fiat_summary.entry_count, 2);
-        assert_eq!(dash.fiat_summary.total_amount, 15.0);
+        assert_eq!(dash.fiat_summary.total_amount, d(15));
         assert_eq!(dash.gas_summary.tx_count, 1);
         assert_eq!(dash.gas_summary.total_fee_stroops, 1_000);
     }
@@ -963,18 +1014,18 @@ mod tests {
     #[test]
     fn dashboard_shows_active_and_breached_thresholds() {
         let state = CostState::new();
-        state.record(entry("db.query", "vaults", 100.0));
+        state.record(entry("db.query", "vaults", 100));
         // Set a threshold that is breached
         state.set_budget_threshold(BudgetThreshold {
             category: "over".to_string(),
             scope: BudgetScope::Operation("db.query".to_string()),
-            limit: 50.0,
+            limit: d(50),
         });
         // Set a threshold that is not breached
         state.set_budget_threshold(BudgetThreshold {
             category: "ok".to_string(),
             scope: BudgetScope::Operation("db.query".to_string()),
-            limit: 200.0,
+            limit: d(200),
         });
 
         let dash = state.dashboard();
@@ -986,12 +1037,12 @@ mod tests {
     fn dashboard_top_fiat_operations_capped_at_5() {
         let state = CostState::new();
         for i in 0..10u32 {
-            state.record(entry(&format!("op.{}", i), "team", (i + 1) as f64));
+            state.record(entry(&format!("op.{}", i), "team", i64::from(i + 1)));
         }
         let dash = state.dashboard();
         assert_eq!(dash.top_fiat_operations.len(), 5);
         // Highest should be first (op.9 = 10.0)
-        assert_eq!(dash.top_fiat_operations[0].total, 10.0);
+        assert_eq!(dash.top_fiat_operations[0].total, d(10));
     }
 
     // ── Optimization suggestion tests ─────────────────────────────────────
@@ -1006,13 +1057,13 @@ mod tests {
     fn high_severity_suggestion_for_dominant_fiat_operation() {
         let state = CostState::new();
         // op.heavy dominates with > 50 % of cost
-        state.record(entry("op.heavy", "team", 80.0));
-        state.record(entry("op.light", "team", 10.0));
+        state.record(entry("op.heavy", "team", 80));
+        state.record(entry("op.light", "team", 10));
 
         let suggestions = state.optimization_suggestions();
-        let high = suggestions
-            .iter()
-            .find(|s| s.severity == OptimizationSeverity::High && s.applies_to.as_deref() == Some("op.heavy"));
+        let high = suggestions.iter().find(|s| {
+            s.severity == OptimizationSeverity::High && s.applies_to.as_deref() == Some("op.heavy")
+        });
         assert!(high.is_some(), "expected a High suggestion for op.heavy");
     }
 
@@ -1023,48 +1074,57 @@ mod tests {
         state.record_gas(gas_entry("op.light", 5_000, 2));
 
         let suggestions = state.optimization_suggestions();
-        let high = suggestions
-            .iter()
-            .find(|s| s.severity == OptimizationSeverity::High && s.applies_to.as_deref() == Some("op.heavy"));
-        assert!(high.is_some(), "expected a High suggestion for dominant gas op");
+        let high = suggestions.iter().find(|s| {
+            s.severity == OptimizationSeverity::High && s.applies_to.as_deref() == Some("op.heavy")
+        });
+        assert!(
+            high.is_some(),
+            "expected a High suggestion for dominant gas op"
+        );
     }
 
     #[test]
     fn medium_severity_suggestion_for_breached_threshold() {
         let state = CostState::new();
-        state.record(entry("db.query", "vaults", 100.0));
+        state.record(entry("db.query", "vaults", 100));
         state.set_budget_threshold(BudgetThreshold {
             category: "vaults-db".to_string(),
             scope: BudgetScope::Operation("db.query".to_string()),
-            limit: 50.0,
+            limit: d(50),
         });
 
         let suggestions = state.optimization_suggestions();
         let med = suggestions
             .iter()
             .find(|s| s.severity == OptimizationSeverity::Medium);
-        assert!(med.is_some(), "expected a Medium suggestion for breached threshold");
+        assert!(
+            med.is_some(),
+            "expected a Medium suggestion for breached threshold"
+        );
     }
 
     #[test]
     fn low_severity_suggestion_for_missing_gas_instrumentation() {
         let state = CostState::new();
         // op.heavy has > 20 % of fiat cost but zero gas entries
-        state.record(entry("op.heavy", "team", 80.0));
-        state.record(entry("op.light", "team", 5.0));
+        state.record(entry("op.heavy", "team", 80));
+        state.record(entry("op.light", "team", 5));
 
         let suggestions = state.optimization_suggestions();
-        let low = suggestions
-            .iter()
-            .find(|s| s.severity == OptimizationSeverity::Low && s.applies_to.as_deref() == Some("op.heavy"));
-        assert!(low.is_some(), "expected a Low suggestion for missing gas data");
+        let low = suggestions.iter().find(|s| {
+            s.severity == OptimizationSeverity::Low && s.applies_to.as_deref() == Some("op.heavy")
+        });
+        assert!(
+            low.is_some(),
+            "expected a Low suggestion for missing gas data"
+        );
     }
 
     #[test]
     fn no_low_instrumentation_suggestion_when_gas_data_exists() {
         let state = CostState::new();
-        state.record(entry("op.heavy", "team", 80.0));
-        state.record(entry("op.light", "team", 5.0));
+        state.record(entry("op.heavy", "team", 80));
+        state.record(entry("op.light", "team", 5));
         // Add gas data for op.heavy — the Low suggestion should be suppressed
         state.record_gas(gas_entry("op.heavy", 1_000, 1));
 
@@ -1074,6 +1134,9 @@ mod tests {
                 && s.applies_to.as_deref() == Some("op.heavy")
                 && s.description.contains("gas instrumentation")
         });
-        assert!(instrumentation_hint.is_none(), "no Low instrumentation suggestion expected when gas data present");
+        assert!(
+            instrumentation_hint.is_none(),
+            "no Low instrumentation suggestion expected when gas data present"
+        );
     }
 }

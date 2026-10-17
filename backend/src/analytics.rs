@@ -31,6 +31,7 @@ pub struct EndpointStats {
 
 /// Query parameters for filtering analytics data.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyticsQuery {
     pub endpoint: Option<String>,
     pub method: Option<String>,

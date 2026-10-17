@@ -356,6 +356,7 @@ impl AmlScreener {
 // ── HTTP handlers ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlagRequest {
     pub address: String,
     pub reason: String,

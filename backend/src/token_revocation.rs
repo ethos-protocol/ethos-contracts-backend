@@ -123,6 +123,7 @@ pub fn validate_ws_token_with_revocation(
 /// Request body for `POST /auth/revoke`. Supply either a full `token` (its
 /// `jti`/`exp` are extracted) or a bare `jti`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevokeRequest {
     pub token: Option<String>,
     pub jti: Option<String>,

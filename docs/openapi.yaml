@@ -213,6 +213,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete reminder preferences for a vault
+      operationId: deletePreferences
+      tags:
+        - Reminder Preferences
+      responses:
+        '204':
+          description: Preferences deleted successfully
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/notifications/register:
     post:
@@ -1155,7 +1169,585 @@ paths:
         '404':
           description: Log entry not found
 
+  /admin/capabilities:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/cost/entries:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/allocate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/budget-thresholds:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/budget-breaches:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/gas:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/gas/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/dashboard:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/optimizations:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/dr/actions:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/actions/{token}/confirm:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/rto-rpo:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/test-schedule:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/playbooks:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/flags:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/flags/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/flags/{key}/evaluate:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /alerts/rules:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/rules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/evaluate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/fired:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /aml/check/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /aml/flags:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /aml/flags/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /anomaly/observe:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/alerts:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/baseline/{metric}:
+    parameters:
+      - name: metric
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/seasonality:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/seasonality/threshold:
+    put:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/system:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/root-causes:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/investigations/{anomaly_id}:
+    parameters:
+      - name: anomaly_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /capabilities/negotiate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /capabilities/{name}/fallback:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /deployments/canary:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}/evaluate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/switch:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/health:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}/run-tests:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/history:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /graphql:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /graphql/playground:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /health/consensus:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /metrics:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /sla/policies:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/policies/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    put:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/records:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/breaches:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/compliance:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /stream/vaults:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /stream/events:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /webauthn/register/begin:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/register/complete:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/authenticate/begin:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/authenticate/complete:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}/{cred_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: cred_id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}/{cred_id}/backup:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: cred_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /webhooks:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webhooks/verify:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
 components:
+  responses:
+    RouterSurface:
+      description: Response for this backend router operation.
   schemas:
     # ── Time-Series schemas ────────────────────────────────────────────────
 

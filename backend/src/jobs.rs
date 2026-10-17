@@ -262,6 +262,7 @@ pub fn process_job(store: &JobStore, id: &str) {
 // ── HTTP request / response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateJobRequest {
     pub operation: BulkOperationType,
     /// The items to process. For `update_ttl`, list of vault IDs; for
@@ -284,6 +285,7 @@ pub struct JobStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListJobsQuery {
     pub status: Option<JobStatus>,
 }

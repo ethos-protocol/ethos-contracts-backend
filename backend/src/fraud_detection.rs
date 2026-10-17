@@ -38,6 +38,7 @@ pub struct FraudScoreResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScoringRequest {
     pub transaction: Transaction,
 }

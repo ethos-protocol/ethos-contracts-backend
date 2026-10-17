@@ -42,6 +42,7 @@ pub struct AnomalyExplanation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExplainRequest {
     pub metric: String,
     pub value: f64,

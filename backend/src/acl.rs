@@ -51,6 +51,7 @@ pub struct AclAuditEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAclRuleRequest {
     pub subject: String,
     pub resource: String,

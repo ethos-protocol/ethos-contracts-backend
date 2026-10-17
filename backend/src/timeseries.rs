@@ -310,6 +310,7 @@ impl TimeSeriesEngine {
 // ── Request / Response types for HTTP handlers ───────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     pub series: String,
     pub timestamp: Option<DateTime<Utc>>,
@@ -318,6 +319,7 @@ pub struct IngestRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     pub series: String,
     pub resolution: Option<Resolution>,
@@ -334,6 +336,7 @@ pub struct QueryResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetRetentionRequest {
     pub raw_retention_days: u32,
     pub hourly_retention_days: Option<u32>,

@@ -130,6 +130,7 @@ pub struct RoutingMetrics {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestRoutingRequest {
     pub endpoint: String,
 }

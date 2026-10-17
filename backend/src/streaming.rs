@@ -68,6 +68,7 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
 // ── Query parameters ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamQuery {
     /// Opaque cursor returned by the previous response.
     pub cursor: Option<String>,

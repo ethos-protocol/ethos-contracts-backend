@@ -130,11 +130,15 @@ impl QuotaEntry {
 
     /// Reset or update the entry for a new window if the previous one expired.
     fn maybe_reset(&mut self, window_duration: Duration) {
-        if self.window_start.elapsed() >= self.window_duration {
+        if self.is_expired() {
             self.count = 0;
             self.window_start = Instant::now();
             self.window_duration = window_duration;
         }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.window_start.elapsed() >= self.window_duration
     }
 
     /// Seconds until the current window resets.
@@ -329,6 +333,7 @@ impl RateLimiter {
         let quota_key = format!("{user_id}:{endpoint}");
 
         let mut quotas = self.quotas.lock().unwrap();
+        quotas.retain(|_, entry| !entry.is_expired());
         let entry = quotas
             .entry(quota_key)
             .or_insert_with(|| QuotaEntry::new(limit.window));
@@ -370,6 +375,7 @@ impl RateLimiter {
         let quota_key = format!("{user_id}:{endpoint}");
 
         let mut quotas = self.quotas.lock().unwrap();
+        quotas.retain(|_, entry| !entry.is_expired());
         match quotas.get_mut(&quota_key) {
             Some(entry) => {
                 entry.maybe_reset(limit.window);
@@ -398,7 +404,9 @@ impl RateLimiter {
 
     /// Return the number of active quota entries.
     pub fn active_quota_count(&self) -> usize {
-        self.quotas.lock().unwrap().len()
+        let mut quotas = self.quotas.lock().unwrap();
+        quotas.retain(|_, entry| !entry.is_expired());
+        quotas.len()
     }
 }
 
@@ -754,6 +762,30 @@ mod tests {
         assert_eq!(limiter.active_quota_count(), 1);
     }
 
+    #[test]
+    fn test_expired_quotas_are_removed_when_new_keys_are_seen() {
+        let limiter = make_limiter(100, 60);
+        limiter
+            .check_and_record("rotated-key-1", UserTier::Free, ENDPOINT)
+            .unwrap();
+
+        {
+            let mut quotas = limiter.quotas.lock().unwrap();
+            let entry = quotas.values_mut().next().unwrap();
+            entry.window_start = Instant::now() - entry.window_duration;
+        }
+
+        limiter
+            .check_and_record("rotated-key-2", UserTier::Free, ENDPOINT)
+            .unwrap();
+
+        assert_eq!(limiter.active_quota_count(), 1);
+        assert!(limiter
+            .quota_status("rotated-key-1", UserTier::Free, ENDPOINT)
+            .unwrap()
+            .is_none());
+    }
+
     // ── Window reset (time-based) ─────────────────────────────────────────────
 
     #[test]
@@ -1025,7 +1057,10 @@ mod tests {
         let status_quota = limiter
             .quota_status("user1", UserTier::Free, "GET /api/status")
             .unwrap();
-        assert!(status_quota.is_none(), "status endpoint should not have quota yet");
+        assert!(
+            status_quota.is_none(),
+            "status endpoint should not have quota yet"
+        );
 
         // Can still make requests to status
         limiter
@@ -1041,21 +1076,22 @@ mod tests {
         let mut limiter = RateLimiter::new(default);
 
         let mut cfg = EndpointConfig::new();
-        cfg.set_tier_limit(UserTier::Free, TierLimit::new(1000, Duration::from_secs(60)));
+        cfg.set_tier_limit(
+            UserTier::Free,
+            TierLimit::new(1000, Duration::from_secs(60)),
+        );
         limiter.register_endpoint("POST /api/bulk-operation", cfg);
 
         // Attempt 100 operations. With cost 1 each, all should succeed.
         for i in 0..100 {
-            let result = limiter.check_and_record(
-                "attacker",
-                UserTier::Free,
-                "POST /api/bulk-operation",
-            );
+            let result =
+                limiter.check_and_record("attacker", UserTier::Free, "POST /api/bulk-operation");
             assert!(result.is_ok(), "request {} should be allowed", i);
         }
 
         // Further requests should be rejected
-        let result = limiter.check_and_record("attacker", UserTier::Free, "POST /api/bulk-operation");
+        let result =
+            limiter.check_and_record("attacker", UserTier::Free, "POST /api/bulk-operation");
         assert!(result.is_err(), "should exceed quota");
     }
 

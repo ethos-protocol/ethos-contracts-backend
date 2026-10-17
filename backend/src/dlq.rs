@@ -57,6 +57,7 @@ pub struct DlqEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListDlqQuery {
     pub status: Option<String>,
     pub source: Option<String>,
@@ -64,6 +65,7 @@ pub struct ListDlqQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayDlqRequest {
     /// Replay a specific entry by id.
     pub id: Option<String>,

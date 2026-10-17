@@ -66,6 +66,7 @@ pub struct FeatureFlag {
 
 /// Request body for `POST /admin/flags`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertFlagRequest {
     pub key: String,
     pub description: Option<String>,
@@ -82,6 +83,7 @@ fn default_rollout() -> u8 {
 
 /// Request body for `POST /admin/flags/:key/evaluate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateFlagRequest {
     pub subject_id: String,
 }

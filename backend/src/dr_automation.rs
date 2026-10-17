@@ -78,6 +78,7 @@ impl DrStep {
 
 /// `POST /admin/dr/actions` request body.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestDrActionRequest {
     pub step: DrStep,
     /// Required for `RestoreVault`; ignored otherwise.

@@ -141,11 +141,13 @@ pub fn matches_pattern(text: &str, pattern: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     pub lines: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchQuery {
     pub level: Option<String>,
     pub query: Option<String>,

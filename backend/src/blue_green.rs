@@ -185,6 +185,7 @@ impl Default for BlueGreenState {
 
 /// `POST /deployments/blue-green`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateBlueGreenRequest {
     pub service: String,
     /// Version currently running in the active (blue) slot.
@@ -204,6 +205,7 @@ fn default_active_slot() -> ActiveSlot {
 
 /// `POST /deployments/blue-green/:id/switch`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SwitchTrafficRequest {
     /// Human-readable reason for this traffic switch.
     pub reason: String,
@@ -216,12 +218,14 @@ fn default_true() -> bool { true }
 
 /// `POST /deployments/blue-green/:id/rollback`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackBlueGreenRequest {
     pub reason: String,
 }
 
 /// `POST /deployments/blue-green/:id/health`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportHealthRequest {
     pub slot: ActiveSlot,
     pub health: SlotHealth,
