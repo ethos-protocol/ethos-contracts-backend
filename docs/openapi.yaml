@@ -45,6 +45,20 @@ tags:
     description: Pre-flight Stellar/Soroban operation cost estimation (#72)
   - name: Request Replay
     description: API request replay for debugging and regression testing (#73)
+  - name: Two-Factor Authentication
+    description: Vault second-factor setup, verification, and session management
+  - name: AML Screening
+    description: Address sanctions screening and manual flag management
+  - name: WebAuthn
+    description: Passkey registration, authentication, and credential management
+  - name: Webhooks
+    description: Webhook registration and signature verification
+  - name: Cost Tracking
+    description: Operational cost, budget, and gas reporting
+  - name: Disaster Recovery
+    description: Disaster recovery actions, targets, schedules, and playbooks
+  - name: Feature Flags
+    description: Feature flag configuration and subject evaluation
 
 paths:
   /health:
@@ -1155,6 +1169,861 @@ paths:
         '404':
           description: Log entry not found
 
+  # ── Two-Factor Authentication ─────────────────────────────────────────────
+
+  /api/vaults/{vault_id}/2fa/status:
+    get:
+      summary: Get vault two-factor status
+      operationId: getTwoFactorStatus
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current two-factor configuration and verification status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorStatus'
+
+  /api/vaults/{vault_id}/2fa/enable:
+    post:
+      summary: Begin two-factor setup
+      description: Creates a pending configuration. TOTP backup codes are returned only in this response.
+      operationId: enableTwoFactor
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnableTwoFactorRequest'
+      responses:
+        '200':
+          description: Setup details; TOTP backup codes must be saved by the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnableTwoFactorResponse'
+        '400':
+          description: Required phone or email is missing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/2fa/verify:
+    post:
+      summary: Verify a second-factor code
+      operationId: verifyTwoFactor
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyTwoFactorRequest'
+      responses:
+        '200':
+          description: Code accepted and factor enabled
+        '400':
+          description: Invalid or expired code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No two-factor configuration exists for this vault
+
+  /api/vaults/{vault_id}/2fa/disable:
+    post:
+      summary: Disable two-factor authentication
+      operationId: disableTwoFactor
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Two-factor configuration removed
+
+  /api/vaults/{vault_id}/2fa/challenge:
+    post:
+      summary: Check whether the vault requires a second-factor challenge
+      operationId: challengeTwoFactor
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Challenge and verification status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorStatus'
+
+  /api/vaults/{vault_id}/2fa/session/clear:
+    post:
+      summary: Clear the vault's verified two-factor session
+      operationId: clearTwoFactorSession
+      tags:
+        - Two-Factor Authentication
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Verification session cleared
+
+  # ── AML Screening ─────────────────────────────────────────────────────────
+
+  /aml/check/{address}:
+    get:
+      summary: Screen an address for sanctions
+      operationId: screenAmlAddress
+      tags:
+        - AML Screening
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: AML screening result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmlScreeningResult'
+        '400':
+          description: Invalid address or provider error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /aml/flags:
+    get:
+      summary: List manually flagged addresses
+      operationId: listAmlFlags
+      tags:
+        - AML Screening
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Manual address flags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AmlFlag'
+        '401':
+          description: Admin authorization required when ADMIN_API_KEY is configured
+    post:
+      summary: Manually flag an address
+      operationId: flagAmlAddress
+      tags:
+        - AML Screening
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FlagAddressRequest'
+      responses:
+        '201':
+          description: Address flagged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmlFlag'
+        '400':
+          description: Invalid address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Admin authorization required when ADMIN_API_KEY is configured
+
+  /aml/flags/{address}:
+    delete:
+      summary: Remove a manual address flag
+      operationId: unflagAmlAddress
+      tags:
+        - AML Screening
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Flag removed
+        '401':
+          description: Admin authorization required when ADMIN_API_KEY is configured
+        '404':
+          description: Address was not manually flagged
+
+  # ── WebAuthn ──────────────────────────────────────────────────────────────
+
+  /webauthn/register/begin:
+    post:
+      summary: Begin passkey registration
+      operationId: beginWebAuthnRegistration
+      tags:
+        - WebAuthn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginWebAuthnRegistrationRequest'
+      responses:
+        '200':
+          description: Registration challenge and relying-party options
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeginWebAuthnRegistrationResponse'
+        '422':
+          description: User ID or name is empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webauthn/register/complete:
+    post:
+      summary: Complete passkey registration
+      operationId: completeWebAuthnRegistration
+      tags:
+        - WebAuthn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteWebAuthnRegistrationRequest'
+      responses:
+        '201':
+          description: Credential registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompleteWebAuthnRegistrationResponse'
+        '400':
+          description: Challenge expired or authenticator response invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webauthn/authenticate/begin:
+    post:
+      summary: Begin passkey authentication
+      operationId: beginWebAuthnAuthentication
+      tags:
+        - WebAuthn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginWebAuthnAuthenticationRequest'
+      responses:
+        '200':
+          description: Authentication challenge and allowed credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeginWebAuthnAuthenticationResponse'
+        '404':
+          description: User has no registered credentials
+
+  /webauthn/authenticate/complete:
+    post:
+      summary: Complete passkey authentication
+      operationId: completeWebAuthnAuthentication
+      tags:
+        - WebAuthn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteWebAuthnAuthenticationRequest'
+      responses:
+        '200':
+          description: Authentication succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompleteWebAuthnAuthenticationResponse'
+        '400':
+          description: Challenge or authenticator assertion invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webauthn/credentials/{user_id}:
+    get:
+      summary: List a user's passkey credentials
+      operationId: listWebAuthnCredentials
+      tags:
+        - WebAuthn
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User credentials (empty if none are registered)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebAuthnCredential'
+
+  /webauthn/credentials/{user_id}/{cred_id}:
+    delete:
+      summary: Remove a passkey credential
+      operationId: removeWebAuthnCredential
+      tags:
+        - WebAuthn
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cred_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Credential removed
+        '404':
+          description: User or credential not found
+        '409':
+          description: Removing this credential would leave the user without an authenticator
+
+  /webauthn/credentials/{user_id}/{cred_id}/backup:
+    post:
+      summary: Mark or register a backup authenticator
+      operationId: addBackupWebAuthnAuthenticator
+      tags:
+        - WebAuthn
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cred_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddBackupAuthenticatorRequest'
+      responses:
+        '200':
+          description: Existing credential marked as a backup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupAuthenticatorResponse'
+        '202':
+          description: Registration challenge issued for a new backup credential
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupAuthenticatorResponse'
+
+  # ── Webhooks ──────────────────────────────────────────────────────────────
+
+  /webhooks:
+    get:
+      summary: List webhook registrations
+      operationId: listWebhooks
+      tags:
+        - Webhooks
+      responses:
+        '200':
+          description: Registered webhook subscriptions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebhookRegistration'
+    post:
+      summary: Register a webhook
+      operationId: registerWebhook
+      tags:
+        - Webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterWebhookRequest'
+      responses:
+        '201':
+          description: Webhook registered; generated signing secret is returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookRegistration'
+        '422':
+          description: URL must not be empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webhooks/{id}:
+    delete:
+      summary: Deactivate a webhook
+      operationId: deleteWebhook
+      tags:
+        - Webhooks
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Webhook deactivated
+        '404':
+          description: Webhook not found
+
+  /webhooks/verify:
+    post:
+      summary: Verify an incoming webhook signature
+      operationId: verifyWebhookSignature
+      tags:
+        - Webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyWebhookRequest'
+      responses:
+        '200':
+          description: Signature and timestamp are valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookVerificationResult'
+        '401':
+          description: Signature or timestamp is invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookVerificationResult'
+
+  # ── Cost Tracking ─────────────────────────────────────────────────────────
+
+  /admin/cost/entries:
+    post:
+      summary: Record an operational cost entry
+      operationId: recordCostEntry
+      tags:
+        - Cost Tracking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordCostRequest'
+      responses:
+        '201':
+          description: Cost entry recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostEntry'
+        '422':
+          description: Invalid cost entry
+
+  /admin/cost/report:
+    get:
+      summary: Get aggregated operational costs
+      operationId: getCostReport
+      tags:
+        - Cost Tracking
+      responses:
+        '200':
+          description: Aggregated fiat cost report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostReport'
+
+  /admin/cost/allocate:
+    post:
+      summary: Allocate shared costs by attribution tag
+      operationId: allocateCost
+      tags:
+        - Cost Tracking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocateCostRequest'
+      responses:
+        '200':
+          description: Proportional cost allocation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostAllocation'
+        '422':
+          description: Invalid tag key or amount
+
+  /admin/cost/budget-thresholds:
+    post:
+      summary: Create or replace a budget threshold
+      operationId: setCostBudgetThreshold
+      tags:
+        - Cost Tracking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetBudgetThresholdRequest'
+      responses:
+        '201':
+          description: Budget threshold configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetThreshold'
+        '422':
+          description: Invalid budget threshold
+
+  /admin/cost/budget-breaches:
+    get:
+      summary: List currently breached budget thresholds
+      operationId: getCostBudgetBreaches
+      tags:
+        - Cost Tracking
+      responses:
+        '200':
+          description: Current budget breaches
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BudgetBreach'
+
+  /admin/cost/gas:
+    post:
+      summary: Record an on-chain gas fee
+      operationId: recordGasCost
+      tags:
+        - Cost Tracking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordGasCostRequest'
+      responses:
+        '201':
+          description: Gas fee recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GasCostEntry'
+        '422':
+          description: Invalid gas fee entry
+
+  /admin/cost/gas/report:
+    get:
+      summary: Get aggregated gas fees
+      operationId: getGasCostReport
+      tags:
+        - Cost Tracking
+      responses:
+        '200':
+          description: Per-operation gas fee statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GasCostReport'
+
+  /admin/cost/dashboard:
+    get:
+      summary: Get the unified cost dashboard
+      operationId: getCostDashboard
+      tags:
+        - Cost Tracking
+      responses:
+        '200':
+          description: Fiat and gas cost summaries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostDashboard'
+
+  /admin/cost/optimizations:
+    get:
+      summary: List cost optimization suggestions
+      operationId: getCostOptimizationSuggestions
+      tags:
+        - Cost Tracking
+      responses:
+        '200':
+          description: Heuristic cost optimization suggestions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OptimizationSuggestion'
+
+  # ── Disaster Recovery ─────────────────────────────────────────────────────
+
+  /admin/dr/actions:
+    post:
+      summary: Request a disaster recovery action
+      description: Issues a short-lived confirmation token before a destructive action is executed.
+      operationId: requestDrAction
+      tags:
+        - Disaster Recovery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestDrActionRequest'
+      responses:
+        '200':
+          description: Confirmation token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestDrActionResponse'
+        '400':
+          description: vault_id is required for restore_vault
+
+  /admin/dr/actions/{token}/confirm:
+    post:
+      summary: Confirm and execute a disaster recovery action
+      operationId: confirmDrAction
+      tags:
+        - Disaster Recovery
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Action execution result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DrActionResult'
+        '404':
+          description: Unknown or already-used confirmation token
+        '410':
+          description: Confirmation token expired
+
+  /admin/dr/rto-rpo:
+    get:
+      summary: Get recovery time and recovery point objectives
+      operationId: getDrRtoRpo
+      tags:
+        - Disaster Recovery
+      responses:
+        '200':
+          description: Current RTO/RPO targets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RtoRpoTargets'
+
+  /admin/dr/test-schedule:
+    get:
+      summary: List disaster recovery test schedule
+      operationId: getDrTestSchedule
+      tags:
+        - Disaster Recovery
+      responses:
+        '200':
+          description: Scheduled disaster recovery tests
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DrTestEntry'
+
+  /admin/dr/playbooks:
+    get:
+      summary: List incident response playbooks
+      operationId: listDrPlaybooks
+      tags:
+        - Disaster Recovery
+      responses:
+        '200':
+          description: Structured response playbooks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IncidentPlaybook'
+
+  # ── Feature Flags ─────────────────────────────────────────────────────────
+
+  /admin/flags:
+    get:
+      summary: List feature flags
+      operationId: listFeatureFlags
+      tags:
+        - Feature Flags
+      responses:
+        '200':
+          description: Configured feature flags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FeatureFlag'
+    post:
+      summary: Create or update a feature flag
+      operationId: upsertFeatureFlag
+      tags:
+        - Feature Flags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertFeatureFlagRequest'
+      responses:
+        '200':
+          description: Feature flag created or updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeatureFlag'
+        '422':
+          description: Invalid key or rollout percentage
+
+  /admin/flags/{key}:
+    get:
+      summary: Get a feature flag
+      operationId: getFeatureFlag
+      tags:
+        - Feature Flags
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Feature flag definition and version history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeatureFlag'
+        '404':
+          description: Feature flag not found
+
+  /admin/flags/{key}/evaluate:
+    post:
+      summary: Evaluate a feature flag for a subject
+      operationId: evaluateFeatureFlag
+      tags:
+        - Feature Flags
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluateFeatureFlagRequest'
+      responses:
+        '200':
+          description: Subject-specific flag evaluation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeatureFlagEvaluation'
+        '404':
+          description: Feature flag not found
+
 components:
   schemas:
     # ── Time-Series schemas ────────────────────────────────────────────────
@@ -2252,6 +3121,1031 @@ components:
         - last_check_in
         - scenarios
         - simulated_at
+
+    # ── Two-Factor Authentication schemas ──────────────────────────────────
+
+    TwoFactorMethod:
+      type: string
+      enum: [totp, sms, email]
+
+    EnableTwoFactorRequest:
+      type: object
+      properties:
+        method:
+          $ref: '#/components/schemas/TwoFactorMethod'
+        phone:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+      required:
+        - method
+
+    EnableTwoFactorResponse:
+      type: object
+      properties:
+        vault_id:
+          type: string
+        method:
+          $ref: '#/components/schemas/TwoFactorMethod'
+        secret:
+          type: string
+          nullable: true
+          description: TOTP secret; returned only during setup
+        provisioning_uri:
+          type: string
+          nullable: true
+        backup_codes:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Plaintext backup codes returned once during TOTP setup
+      required:
+        - vault_id
+        - method
+
+    VerifyTwoFactorRequest:
+      type: object
+      properties:
+        otp:
+          type: string
+      required:
+        - otp
+
+    TwoFactorStatus:
+      type: object
+      properties:
+        vault_id:
+          type: string
+        enabled:
+          type: boolean
+        method:
+          allOf:
+            - $ref: '#/components/schemas/TwoFactorMethod'
+          nullable: true
+        verified:
+          type: boolean
+        phone:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+      required:
+        - vault_id
+        - enabled
+        - verified
+
+    # ── AML Screening schemas ──────────────────────────────────────────────
+
+    FlagAddressRequest:
+      type: object
+      properties:
+        address:
+          type: string
+        reason:
+          type: string
+        flagged_by:
+          type: string
+      required:
+        - address
+        - reason
+        - flagged_by
+
+    SanctionIdentification:
+      type: object
+      properties:
+        category:
+          type: string
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        url:
+          type: string
+          nullable: true
+
+    AmlSource:
+      type: string
+      enum: [manual_flag, chainalysis, cache, manual_list_only, provider_unavailable]
+
+    AmlScreeningResult:
+      type: object
+      properties:
+        address:
+          type: string
+        compliant:
+          type: boolean
+        source:
+          $ref: '#/components/schemas/AmlSource'
+        identifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/SanctionIdentification'
+        reason:
+          type: string
+          nullable: true
+        checked_at:
+          type: string
+          format: date-time
+      required:
+        - address
+        - compliant
+        - source
+        - identifications
+        - checked_at
+
+    AmlFlag:
+      type: object
+      properties:
+        address:
+          type: string
+        reason:
+          type: string
+        flagged_by:
+          type: string
+        flagged_at:
+          type: string
+          format: date-time
+      required:
+        - address
+        - reason
+        - flagged_by
+        - flagged_at
+
+    # ── WebAuthn schemas ───────────────────────────────────────────────────
+
+    BeginWebAuthnRegistrationRequest:
+      type: object
+      properties:
+        user_id:
+          type: string
+        user_name:
+          type: string
+        label:
+          type: string
+          nullable: true
+        is_backup:
+          type: boolean
+          default: false
+      required:
+        - user_id
+        - user_name
+
+    BeginWebAuthnRegistrationResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        rp:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+          required: [id, name]
+        user:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            display_name:
+              type: string
+          required: [id, name, display_name]
+        challenge:
+          type: string
+        pub_key_cred_params:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              alg:
+                type: integer
+            required: [type, alg]
+        timeout_ms:
+          type: integer
+        attestation:
+          type: string
+      required:
+        - session_id
+        - rp
+        - user
+        - challenge
+        - pub_key_cred_params
+        - timeout_ms
+        - attestation
+
+    CompleteWebAuthnRegistrationRequest:
+      type: object
+      properties:
+        session_id:
+          type: string
+        credential_id:
+          type: string
+        client_data_json:
+          type: string
+        attestation_object:
+          type: string
+        label:
+          type: string
+          nullable: true
+        is_backup:
+          type: boolean
+          default: false
+      required:
+        - session_id
+        - credential_id
+        - client_data_json
+        - attestation_object
+
+    CompleteWebAuthnRegistrationResponse:
+      type: object
+      properties:
+        credential_id:
+          type: string
+        user_id:
+          type: string
+        is_backup:
+          type: boolean
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - credential_id
+        - user_id
+        - is_backup
+        - created_at
+
+    BeginWebAuthnAuthenticationRequest:
+      type: object
+      properties:
+        user_id:
+          type: string
+      required:
+        - user_id
+
+    BeginWebAuthnAuthenticationResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        challenge:
+          type: string
+        timeout_ms:
+          type: integer
+        rp_id:
+          type: string
+        allow_credentials:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              id:
+                type: string
+            required: [type, id]
+        user_verification:
+          type: string
+      required:
+        - session_id
+        - challenge
+        - timeout_ms
+        - rp_id
+        - allow_credentials
+        - user_verification
+
+    CompleteWebAuthnAuthenticationRequest:
+      type: object
+      properties:
+        session_id:
+          type: string
+        credential_id:
+          type: string
+        client_data_json:
+          type: string
+        authenticator_data:
+          type: string
+        signature:
+          type: string
+      required:
+        - session_id
+        - credential_id
+        - client_data_json
+        - authenticator_data
+        - signature
+
+    CompleteWebAuthnAuthenticationResponse:
+      type: object
+      properties:
+        user_id:
+          type: string
+        credential_id:
+          type: string
+        sign_count:
+          type: integer
+        authenticated_at:
+          type: string
+          format: date-time
+      required:
+        - user_id
+        - credential_id
+        - sign_count
+        - authenticated_at
+
+    WebAuthnCredential:
+      type: object
+      properties:
+        credential_id:
+          type: string
+        user_id:
+          type: string
+        public_key:
+          type: string
+        algorithm:
+          type: string
+          enum: [ES256, RS256, ED_DSA]
+        sign_count:
+          type: integer
+        is_backup:
+          type: boolean
+        label:
+          type: string
+          nullable: true
+        aaguid:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - credential_id
+        - user_id
+        - public_key
+        - algorithm
+        - sign_count
+        - is_backup
+        - created_at
+
+    AddBackupAuthenticatorRequest:
+      type: object
+      properties:
+        user_id:
+          type: string
+        label:
+          type: string
+          nullable: true
+      required:
+        - user_id
+
+    BackupAuthenticatorResponse:
+      type: object
+      properties:
+        credential_id:
+          type: string
+        session_id:
+          type: string
+        challenge:
+          type: string
+        is_backup:
+          type: boolean
+        message:
+          type: string
+        pub_key_cred_params:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    # ── Webhook schemas ────────────────────────────────────────────────────
+
+    WebhookEventType:
+      type: string
+      enum:
+        - vault_created
+        - vault_checked_in
+        - vault_released
+        - vault_deposit
+        - vault_withdrawal
+        - beneficiary_updated
+        - vault_paused
+        - vault_resumed
+
+    WebhookSignatureAlgorithm:
+      type: string
+      enum: [sha256, sha1, sha512]
+
+    RegisterWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        vault_id:
+          type: string
+          nullable: true
+        event_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookEventType'
+          default: []
+        secret:
+          type: string
+          nullable: true
+        algorithm:
+          $ref: '#/components/schemas/WebhookSignatureAlgorithm'
+      required:
+        - url
+
+    WebhookRegistration:
+      type: object
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+        vault_id:
+          type: string
+          nullable: true
+        event_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookEventType'
+        secret:
+          type: string
+          nullable: true
+        algorithm:
+          $ref: '#/components/schemas/WebhookSignatureAlgorithm'
+        created_at:
+          type: string
+          format: date-time
+        active:
+          type: boolean
+      required:
+        - id
+        - url
+        - event_types
+        - algorithm
+        - created_at
+        - active
+
+    VerifyWebhookRequest:
+      type: object
+      properties:
+        body:
+          type: string
+        secret:
+          type: string
+        signature:
+          type: string
+        timestamp:
+          type: string
+          nullable: true
+      required:
+        - body
+        - secret
+        - signature
+
+    WebhookVerificationResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        algorithm:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+      required:
+        - valid
+
+    # ── Cost Tracking schemas ──────────────────────────────────────────────
+
+    RecordCostRequest:
+      type: object
+      properties:
+        operation:
+          type: string
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+        amount:
+          type: number
+          format: double
+        currency:
+          type: string
+          default: USD
+      required: [operation, amount]
+
+    CostEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+        amount:
+          type: number
+          format: double
+        currency:
+          type: string
+        recorded_at:
+          type: string
+          format: date-time
+      required: [id, operation, tags, amount, currency, recorded_at]
+
+    CostReport:
+      type: object
+      properties:
+        total_amount:
+          type: number
+          format: double
+        currency:
+          type: string
+        entry_count:
+          type: integer
+        by_operation:
+          type: object
+          additionalProperties:
+            type: number
+        by_tag:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: number
+      required: [total_amount, currency, entry_count, by_operation, by_tag]
+
+    AllocateCostRequest:
+      type: object
+      properties:
+        total_amount:
+          type: number
+          format: double
+        tag_key:
+          type: string
+      required: [total_amount, tag_key]
+
+    CostAllocation:
+      type: object
+      properties:
+        tag_key:
+          type: string
+        total_amount:
+          type: number
+          format: double
+        allocations:
+          type: object
+          additionalProperties:
+            type: number
+      required: [tag_key, total_amount, allocations]
+
+    BudgetScope:
+      oneOf:
+        - type: object
+          properties:
+            operation:
+              type: string
+          required: [operation]
+        - type: object
+          properties:
+            tag:
+              type: object
+              properties:
+                key:
+                  type: string
+                value:
+                  type: string
+              required: [key, value]
+          required: [tag]
+
+    SetBudgetThresholdRequest:
+      type: object
+      properties:
+        category:
+          type: string
+        scope:
+          $ref: '#/components/schemas/BudgetScope'
+        limit:
+          type: number
+          format: double
+      required: [category, scope, limit]
+
+    BudgetThreshold:
+      type: object
+      properties:
+        category:
+          type: string
+        scope:
+          $ref: '#/components/schemas/BudgetScope'
+        limit:
+          type: number
+          format: double
+      required: [category, scope, limit]
+
+    BudgetBreach:
+      allOf:
+        - $ref: '#/components/schemas/BudgetThreshold'
+        - type: object
+          properties:
+            current_total:
+              type: number
+              format: double
+          required: [current_total]
+
+    RecordGasCostRequest:
+      type: object
+      properties:
+        operation:
+          type: string
+        tx_hash:
+          type: string
+        fee_stroops:
+          type: integer
+          format: int64
+          minimum: 0
+        ledger_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+      required: [operation, tx_hash, fee_stroops, ledger_sequence]
+
+    GasCostEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+        tx_hash:
+          type: string
+        fee_stroops:
+          type: integer
+          format: int64
+        ledger_sequence:
+          type: integer
+          format: int64
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+        recorded_at:
+          type: string
+          format: date-time
+      required: [id, operation, tx_hash, fee_stroops, ledger_sequence, tags, recorded_at]
+
+    GasCostReport:
+      type: object
+      properties:
+        total_fee_stroops:
+          type: integer
+          format: int64
+        tx_count:
+          type: integer
+        by_operation:
+          type: array
+          items:
+            type: object
+            properties:
+              operation:
+                type: string
+              tx_count:
+                type: integer
+              total_fee_stroops:
+                type: integer
+                format: int64
+              avg_fee_stroops:
+                type: integer
+                format: int64
+              max_fee_stroops:
+                type: integer
+                format: int64
+              min_fee_stroops:
+                type: integer
+                format: int64
+            required: [operation, tx_count, total_fee_stroops, avg_fee_stroops, max_fee_stroops, min_fee_stroops]
+      required: [total_fee_stroops, tx_count, by_operation]
+
+    CostDashboard:
+      type: object
+      properties:
+        fiat_summary:
+          type: object
+          properties:
+            total_amount:
+              type: number
+              format: double
+            currency:
+              type: string
+            entry_count:
+              type: integer
+          required: [total_amount, currency, entry_count]
+        gas_summary:
+          type: object
+          properties:
+            total_fee_stroops:
+              type: integer
+              format: int64
+            tx_count:
+              type: integer
+          required: [total_fee_stroops, tx_count]
+        active_thresholds:
+          type: integer
+        breached_thresholds:
+          type: integer
+        top_fiat_operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationCostItem'
+        top_gas_operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationCostItem'
+        generated_at:
+          type: string
+          format: date-time
+      required: [fiat_summary, gas_summary, active_thresholds, breached_thresholds, top_fiat_operations, top_gas_operations, generated_at]
+
+    OperationCostItem:
+      type: object
+      properties:
+        operation:
+          type: string
+        total:
+          type: number
+          format: double
+      required: [operation, total]
+
+    OptimizationSuggestion:
+      type: object
+      properties:
+        id:
+          type: string
+        severity:
+          type: string
+          enum: [high, medium, low]
+        title:
+          type: string
+        description:
+          type: string
+        estimated_saving_fraction:
+          type: number
+          format: double
+        applies_to:
+          type: string
+          nullable: true
+      required: [id, severity, title, description, estimated_saving_fraction]
+
+    # ── Disaster Recovery schemas ──────────────────────────────────────────
+
+    DrStep:
+      type: string
+      enum: [pause_contract, unpause_contract, restore_vault]
+
+    RequestDrActionRequest:
+      type: object
+      properties:
+        step:
+          $ref: '#/components/schemas/DrStep'
+        vault_id:
+          type: integer
+          format: int64
+          nullable: true
+        requested_by:
+          type: string
+      required: [step, requested_by]
+
+    RequestDrActionResponse:
+      type: object
+      properties:
+        step:
+          $ref: '#/components/schemas/DrStep'
+        confirmation_token:
+          type: string
+          format: uuid
+        expires_at:
+          type: string
+          format: date-time
+      required: [step, confirmation_token, expires_at]
+
+    DrActionResult:
+      type: object
+      properties:
+        step:
+          $ref: '#/components/schemas/DrStep'
+        success:
+          type: boolean
+        output:
+          type: string
+        executed_at:
+          type: string
+          format: date-time
+      required: [step, success, output, executed_at]
+
+    RtoRpoTargets:
+      type: object
+      properties:
+        p0_rto_minutes:
+          type: integer
+        p0_rpo_minutes:
+          type: integer
+        p1_rto_minutes:
+          type: integer
+        p1_rpo_minutes:
+          type: integer
+        p2_rto_minutes:
+          type: integer
+        p2_rpo_minutes:
+          type: integer
+        p3_rto_minutes:
+          type: integer
+        p3_rpo_minutes:
+          type: integer
+        last_reviewed:
+          type: string
+          format: date
+      required: [p0_rto_minutes, p0_rpo_minutes, p1_rto_minutes, p1_rpo_minutes, p2_rto_minutes, p2_rpo_minutes, p3_rto_minutes, p3_rpo_minutes, last_reviewed]
+
+    DrTestEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        cadence:
+          type: string
+          enum: [weekly, monthly, quarterly, annually]
+        step:
+          $ref: '#/components/schemas/DrStep'
+        owner:
+          type: string
+        last_run:
+          type: string
+          nullable: true
+        next_due:
+          type: string
+      required: [id, name, description, cadence, step, owner, next_due]
+
+    IncidentPlaybook:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        severity:
+          type: string
+          enum: [P0, P1, P2, P3]
+        triggers:
+          type: array
+          items:
+            type: string
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              order:
+                type: integer
+              action:
+                type: string
+              automated:
+                type: boolean
+              dr_step:
+                allOf:
+                  - $ref: '#/components/schemas/DrStep'
+                nullable: true
+            required: [order, action, automated]
+        escalation_contacts:
+          type: array
+          items:
+            type: string
+        runbook_refs:
+          type: array
+          items:
+            type: string
+      required: [id, name, description, severity, triggers, steps, escalation_contacts, runbook_refs]
+
+    # ── Feature Flag schemas ───────────────────────────────────────────────
+
+    UpsertFeatureFlagRequest:
+      type: object
+      properties:
+        key:
+          type: string
+        description:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+          default: false
+        rollout_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 100
+        updated_by:
+          type: string
+          nullable: true
+      required: [key]
+
+    FeatureFlagVersionSnapshot:
+      type: object
+      properties:
+        version:
+          type: integer
+        enabled:
+          type: boolean
+        rollout_percentage:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+          nullable: true
+      required: [version, enabled, rollout_percentage, updated_at]
+
+    FeatureFlag:
+      type: object
+      properties:
+        key:
+          type: string
+        description:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        rollout_percentage:
+          type: integer
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeatureFlagVersionSnapshot'
+      required: [key, enabled, rollout_percentage, version, created_at, updated_at, history]
+
+    EvaluateFeatureFlagRequest:
+      type: object
+      properties:
+        subject_id:
+          type: string
+      required: [subject_id]
+
+    FeatureFlagEvaluation:
+      type: object
+      properties:
+        key:
+          type: string
+        subject_id:
+          type: string
+        enabled:
+          type: boolean
+        reason:
+          type: string
+        flag_version:
+          type: integer
+      required: [key, subject_id, enabled, reason, flag_version]
 
   securitySchemes:
     ApiKeyAuth:
