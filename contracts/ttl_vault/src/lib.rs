@@ -10106,8 +10106,11 @@ impl TtlVaultContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `vault_ids` - Vector of vault IDs to check
+    /// * `vault_ids` - Vector of up to 50 vault IDs to check
     pub fn emit_expiry_warnings(env: Env, vault_ids: Vec<u64>) {
+        if vault_ids.len() > 50 {
+            panic_with_error!(&env, ContractError::BatchSizeExceeded);
+        }
         let warning_threshold: u64 = 604_800; // 7 days in seconds
 
         for vault_id in vault_ids.iter() {

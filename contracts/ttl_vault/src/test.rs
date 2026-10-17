@@ -7271,3 +7271,23 @@ fn test_get_vault_batch_status_enforces_maximum_batch_size() {
         soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
     );
 }
+
+#[test]
+fn test_emit_expiry_warnings_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..50 {
+        vault_ids.push_back(vault_id);
+    }
+
+    client.emit_expiry_warnings(&vault_ids);
+    vault_ids.push_back(50);
+    let err = client
+        .try_emit_expiry_warnings(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
+}
