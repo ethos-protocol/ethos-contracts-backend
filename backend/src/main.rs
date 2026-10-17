@@ -41,6 +41,7 @@ use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
+    cost_estimation::estimate_cost_handler,
     cost_tracking::{
         allocate_cost, get_budget_breaches, get_cost_dashboard, get_cost_report,
         get_gas_cost_report, get_optimization_suggestions, record_cost_entry, record_gas_cost,
@@ -67,6 +68,10 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    jobs::{
+        cancel_job_handler, create_job_handler, create_job_store, get_job_handler,
+        list_jobs_handler,
+    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -75,6 +80,10 @@ use ethos_protocol_backend::{
     },
     priority::{PriorityConfig, PriorityEnforcer},
     rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
+    replay::{
+        batch_replay_handler, create_request_log_store, get_log_handler, list_logs_handler,
+        replay_handler,
+    },
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
@@ -82,6 +91,13 @@ use ethos_protocol_backend::{
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
+    timeseries::{
+        benchmark_handler, compress_handler, create_timeseries_store, ingest_handler,
+        query_handler, set_retention_handler,
+    },
+    two_factor::{
+        challenge_2fa, clear_2fa_session, disable_2fa, enable_2fa, get_2fa_status, verify_2fa,
+    },
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
@@ -185,12 +201,40 @@ pub fn build_router(state: AppState) -> Router {
     // let retry_state = RetryPolicyState::new();
     // let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
     let _timeout_state = TimeoutState::new();
+    let two_factor_router = Router::new()
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(clear_2fa_session),
+        )
+        .with_state(Arc::clone(&state.db));
 
     Router::new()
+        .merge(two_factor_router)
         // ── Feature flags (#274) ─────────────────────────────────────────────
         .route("/admin/flags", post(upsert_flag).get(list_flags))
         .route("/admin/flags/:key", get(get_flag))
         .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
+        .route("/estimate-cost", post(estimate_cost_handler))
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
@@ -253,6 +297,45 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+fn build_operational_router() -> Router {
+    let timeseries_router = Router::new()
+        .route("/timeseries/ingest", post(ingest_handler))
+        .route("/timeseries/query", post(query_handler))
+        .route(
+            "/timeseries/:series/compress",
+            post(compress_handler),
+        )
+        .route(
+            "/timeseries/:series/retention",
+            post(set_retention_handler),
+        )
+        .route(
+            "/timeseries/:series/benchmark",
+            post(benchmark_handler),
+        )
+        .with_state(create_timeseries_store());
+
+    let jobs_router = Router::new()
+        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route(
+            "/jobs/:job_id",
+            get(get_job_handler).delete(cancel_job_handler),
+        )
+        .with_state(create_job_store());
+
+    let replay_router = Router::new()
+        .route("/replay", post(replay_handler))
+        .route("/replay/batch", post(batch_replay_handler))
+        .route("/replay/logs", get(list_logs_handler))
+        .route("/replay/logs/:log_id", get(get_log_handler))
+        .with_state(create_request_log_store());
+
+    Router::new()
+        .merge(timeseries_router)
+        .merge(jobs_router)
+        .merge(replay_router)
 }
 
 /// Rate limiter used by [`enforce_rate_limit`] for the whole app (#348).
@@ -641,6 +724,7 @@ async fn main() {
         .with_state(sla_state);
 
     let app = build_router(state)
+        .merge(build_operational_router())
         // .merge(acl_router)
         // .merge(custom_metrics_router)
         .merge(anomaly_router)

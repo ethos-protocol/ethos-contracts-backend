@@ -36,8 +36,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use crate::clock::{Clock, SystemClock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -257,14 +259,20 @@ pub type SlaStore = Arc<Mutex<SlaInner>>;
 #[derive(Clone)]
 pub struct SlaState {
     pub store: SlaStore,
+    clock: Arc<dyn Clock>,
 }
 
 impl SlaState {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         let mut inner = SlaInner::default();
-        seed_default_policies(&mut inner);
+        seed_default_policies(&mut inner, clock.now());
         Self {
             store: Arc::new(Mutex::new(inner)),
+            clock,
         }
     }
 }
@@ -277,9 +285,7 @@ impl Default for SlaState {
 
 /// Seed sensible out-of-the-box SLA policies covering the most important
 /// Ethos-Protocol service dimensions.
-fn seed_default_policies(inner: &mut SlaInner) {
-    let now = Utc::now();
-
+fn seed_default_policies(inner: &mut SlaInner, now: DateTime<Utc>) {
     let defaults = vec![
         SlaPolicy {
             id: Uuid::new_v4().to_string(),
@@ -431,7 +437,7 @@ pub async fn create_sla_policy(
         ));
     }
 
-    let now = Utc::now();
+    let now = state.clock.now();
     let policy = SlaPolicy {
         id: Uuid::new_v4().to_string(),
         name: body.name,
@@ -525,7 +531,7 @@ pub async fn update_sla_policy(
     if let Some(enabled) = body.enabled {
         policy.enabled = enabled;
     }
-    policy.updated_at = Utc::now();
+    policy.updated_at = state.clock.now();
 
     Ok(Json(policy.clone()))
 }
@@ -572,12 +578,13 @@ pub async fn record_sla_measurement(
         ));
     }
 
+    let now = state.clock.now();
     let measurement = SlaMeasurement {
         id: Uuid::new_v4().to_string(),
         policy_id: body.policy_id.clone(),
         value: body.value,
         context: body.context,
-        recorded_at: Utc::now(),
+        recorded_at: now,
     };
 
     inner.measurements.push(measurement.clone());
@@ -599,7 +606,7 @@ pub async fn record_sla_measurement(
                 "SLA breach for '{}' on service '{}': observed {:.4} is {} target {:.4}",
                 policy.name, policy.service, body.value, direction_word, policy.target
             ),
-            breached_at: Utc::now(),
+            breached_at: now,
         };
         inner.breaches.push(breach);
     }
@@ -613,7 +620,7 @@ pub async fn get_sla_report(
     Query(query): Query<SlaReportQuery>,
 ) -> Json<SlaReport> {
     let inner = state.store.lock().expect("sla store poisoned");
-    let now = Utc::now();
+    let now = state.clock.now();
 
     let policies: Vec<&SlaPolicy> = inner
         .policies
@@ -705,7 +712,7 @@ pub async fn get_compliance_summary(
     Query(query): Query<SlaReportQuery>,
 ) -> Json<Vec<SlaComplianceSummary>> {
     let inner = state.store.lock().expect("sla store poisoned");
-    let now = Utc::now();
+    let now = state.clock.now();
 
     let mut summaries: Vec<SlaComplianceSummary> = inner
         .policies
@@ -730,8 +737,12 @@ pub async fn get_compliance_summary(
 mod tests {
     use super::*;
 
+    fn test_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
     fn make_policy(direction: SlaDirection, target: f64) -> SlaPolicy {
-        let now = Utc::now();
+        let now = test_now();
         SlaPolicy {
             id: "test-policy".into(),
             name: "Test".into(),
@@ -754,7 +765,7 @@ mod tests {
             policy_id: policy_id.into(),
             value,
             context: None,
-            recorded_at: Utc::now() - chrono::Duration::seconds(offset_secs),
+            recorded_at: test_now() - chrono::Duration::seconds(offset_secs),
         }
     }
 
@@ -775,7 +786,7 @@ mod tests {
     #[test]
     fn test_compute_summary_no_measurements() {
         let policy = make_policy(SlaDirection::AtMost, 500.0);
-        let summary = compute_summary(&policy, &[], Utc::now());
+        let summary = compute_summary(&policy, &[], test_now());
         assert_eq!(summary.measurements_in_window, 0);
         // No data is treated as 100% compliant (optimistic default).
         assert!((summary.compliance_pct - 100.0).abs() < f64::EPSILON);
@@ -791,7 +802,7 @@ mod tests {
             make_measurement("test-policy", 300.0, 200),
             make_measurement("test-policy", 499.0, 300),
         ];
-        let summary = compute_summary(&policy, &measurements, Utc::now());
+        let summary = compute_summary(&policy, &measurements, test_now());
         assert_eq!(summary.measurements_in_window, 3);
         assert_eq!(summary.compliant_count, 3);
         assert!((summary.compliance_pct - 100.0).abs() < f64::EPSILON);
@@ -806,7 +817,7 @@ mod tests {
             make_measurement("test-policy", 600.0, 200),  // breaching
             make_measurement("test-policy", 600.0, 100),  // breaching (latest)
         ];
-        let summary = compute_summary(&policy, &measurements, Utc::now());
+        let summary = compute_summary(&policy, &measurements, test_now());
         assert_eq!(summary.measurements_in_window, 3);
         assert_eq!(summary.compliant_count, 1);
         // latest value (most recent by recorded_at) is 600 → currently breaching
@@ -821,20 +832,21 @@ mod tests {
         // 10 minutes ago — inside window.
         let recent = make_measurement("test-policy", 100.0, 600);
         let measurements = vec![old, recent];
-        let summary = compute_summary(&policy, &measurements, Utc::now());
+        let summary = compute_summary(&policy, &measurements, test_now());
         assert_eq!(summary.measurements_in_window, 1);
         assert!(!summary.currently_breaching);
     }
 
     #[test]
     fn test_seed_default_policies() {
-        let state = SlaState::new();
+        let state = SlaState::with_clock(Arc::new(crate::clock::ManualClock::new(test_now())));
         let inner = state.store.lock().unwrap();
         assert!(
             inner.policies.len() >= 4,
             "expected at least 4 default policies, got {}",
             inner.policies.len()
         );
+        assert!(inner.policies.values().all(|policy| policy.created_at == test_now()));
     }
 
     #[test]
@@ -857,7 +869,7 @@ mod tests {
                     "SLA breach for '{}' on service '{}': observed {:.4} is above maximum target {:.4}",
                     policy.name, policy.service, value, policy.target
                 ),
-                breached_at: Utc::now(),
+                breached_at: test_now(),
             };
             inner.breaches.push(breach);
         }
