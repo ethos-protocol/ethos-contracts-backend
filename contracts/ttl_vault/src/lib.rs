@@ -1440,8 +1440,10 @@ impl TtlVaultContract {
     ///
     /// # Panics
     /// * Panics if vault has no staking or yield distribution configured
+    /// * Panics if the vault owner has not authorized distribution
     pub fn distribute_yield(env: Env, vault_id: u64) {
         let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
 
         let staking_key = DataKey::TokenStaking(vault_id);
         let staking = env
@@ -1461,9 +1463,11 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
 
-        // Calculate yield: (staked_amount * annual_yield_bps * time_elapsed) / (10000 * 365 * 86400)
+        // Calculate only yield accrued since the last distribution, or staking
+        // activation if that happened more recently.
         let now = env.ledger().timestamp();
-        let time_elapsed = now.saturating_sub(staking.staking_start);
+        let accrual_start = yield_config.last_distribution.max(staking.staking_start);
+        let time_elapsed = now.saturating_sub(accrual_start);
         let yield_amount = (staking.staked_amount as i128)
             .checked_mul(staking.annual_yield_bps as i128)
             .and_then(|v| v.checked_mul(time_elapsed as i128))

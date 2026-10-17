@@ -7037,6 +7037,69 @@ fn test_check_in_with_geo_does_not_store_location() {
 }
 
 #[test]
+#[should_panic]
+fn test_distribute_yield_requires_owner_authorization() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    client.distribute_yield(&vault_id);
+}
+
+#[test]
+fn test_distribute_yield_only_accounts_for_undistributed_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract_address);
+    client.initialize(&token_address, &admin);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    client.enable_token_staking(
+        &vault_id,
+        &owner,
+        &Address::generate(&env),
+        &10_000u32,
+    );
+    client.set_yield_distribution(&vault_id, &YieldDistributionMode::Reinvest);
+
+    env.as_contract(&contract_address, || {
+        let key = DataKey::TokenStaking(vault_id);
+        let mut staking = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenStaking>(&key)
+            .unwrap();
+        staking.staked_amount = 10_000;
+        env.storage().persistent().set(&key, &staking);
+    });
+
+    let year_seconds = 365 * 24 * 60 * 60;
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + year_seconds);
+    client.distribute_yield(&vault_id);
+    let distributed_once = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    client.distribute_yield(&vault_id);
+    let distributed_twice = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    assert_eq!(distributed_once, 10_000);
+    assert_eq!(distributed_twice, distributed_once);
+}
+
+#[test]
 fn test_accelerate_ttl_decay_reduces_ttl() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
