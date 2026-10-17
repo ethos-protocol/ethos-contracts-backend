@@ -3320,6 +3320,23 @@ fn test_security_token_whitelist_enforcement() {
 }
 
 #[test]
+fn test_whitelist_token_emits_event() {
+    let (env, _, _, _, token_address, client) = setup();
+
+    client.whitelist_token(&token_address);
+
+    let event = env.events().all().iter().find(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val(&env).ok())
+            .map(|topic: soroban_sdk::Symbol| topic == types::TOKEN_WHITELISTED_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(event.is_some(), "token whitelist event not emitted");
+}
+
+#[test]
 fn test_cross_chain_wrapped_token_support() {
     let (env, owner, beneficiary, _, xlm_token, client) = setup();
 
@@ -7227,4 +7244,3 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
-

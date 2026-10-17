@@ -805,6 +805,8 @@ impl TtlVaultContract {
         Self::require_admin(&env);
         let key = DataKey::TokenWhitelist(token_address.clone());
         env.storage().persistent().set(&key, &true);
+        env.events()
+            .publish((types::TOKEN_WHITELISTED_TOPIC,), token_address);
         env.storage()
             .persistent()
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);

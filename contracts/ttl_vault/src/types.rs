@@ -142,6 +142,7 @@ pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
 pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
 pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
 pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
+pub const TOKEN_WHITELISTED_TOPIC: Symbol = symbol_short!("tok_wlad");
 pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
 pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
 pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
