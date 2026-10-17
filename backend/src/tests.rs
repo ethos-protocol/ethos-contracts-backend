@@ -249,6 +249,17 @@ async fn test_dlq_operator_route_is_mounted_and_authorized() {
 }
 
 #[tokio::test]
+async fn test_retention_deletion_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/api/retention/deletion-log").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected retention deletion-log response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
 async fn test_set_empty_channels_rejected() {
     let app = test_app();
     let body = json!({

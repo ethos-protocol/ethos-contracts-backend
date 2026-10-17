@@ -235,6 +235,23 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/dlq/replay",
             post(ethos_protocol_backend::dlq::replay_dlq_entries),
         )
+        // ── Data retention operator routes (#100) ────────────────────────────
+        .route(
+            "/api/retention/policies/:data_type",
+            put(ethos_protocol_backend::retention::upsert_policy),
+        )
+        .route(
+            "/api/retention/purge/:data_type",
+            post(ethos_protocol_backend::retention::trigger_purge),
+        )
+        .route(
+            "/api/retention/exceptions/:data_type",
+            post(ethos_protocol_backend::retention::add_exception),
+        )
+        .route(
+            "/api/retention/deletion-log",
+            get(ethos_protocol_backend::retention::get_deletion_log),
+        )
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
