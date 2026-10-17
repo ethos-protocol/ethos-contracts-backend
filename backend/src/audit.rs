@@ -98,13 +98,23 @@ pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     match auth_header.strip_prefix("Bearer ") {
-        Some(token) if token == api_key => Ok(()),
+        Some(token) if constant_time_eq(token.as_bytes(), api_key.as_bytes()) => Ok(()),
         _ => Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "valid admin API key required",
         )),
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut difference = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        let left = a.get(index).copied().unwrap_or_default();
+        let right = b.get(index).copied().unwrap_or_default();
+        difference |= (left ^ right) as usize;
+    }
+    difference == 0
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -128,4 +138,17 @@ fn extract_user_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_comparison_requires_exact_match() {
+        assert!(constant_time_eq(b"admin-key", b"admin-key"));
+        assert!(!constant_time_eq(b"Xadmin-key", b"admin-key"));
+        assert!(!constant_time_eq(b"admin-keY", b"admin-key"));
+        assert!(!constant_time_eq(b"admin", b"admin-key"));
+    }
 }

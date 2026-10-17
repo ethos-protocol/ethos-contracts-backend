@@ -69,8 +69,8 @@ fn score_to_risk(score: f64) -> RiskLevel {
 ///
 /// - If `ABUSEIPDB_API_KEY` is set in the environment, calls the AbuseIPDB v2
 ///   API and returns the real abuse confidence score.
-/// - Otherwise returns a stub score of `0.0` (`RiskLevel::Low`) so the
-///   system remains functional without third-party credentials.
+/// - Otherwise returns an unverified, fail-closed score so missing provider
+///   configuration cannot be interpreted as a clean reputation result.
 pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputationScore {
     if !config.check_enabled {
         return stub_score(ip, "disabled");
@@ -129,17 +129,19 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
     }
 }
 
-/// Build a zero-risk stub score used when no API key is configured or the
-/// subsystem is disabled.
+/// Build an unverified fail-closed score when no authoritative result exists.
 fn stub_score(ip: &str, source: &str) -> IpReputationScore {
     IpReputationScore {
         ip: ip.to_string(),
-        score: 0.0,
-        risk_level: RiskLevel::Low,
-        is_blocked: false,
+        score: 100.0,
+        risk_level: RiskLevel::Critical,
+        is_blocked: true,
         last_checked: Utc::now(),
         source: source.to_string(),
-        details: serde_json::json!({ "note": "stub — no API key configured" }),
+        details: serde_json::json!({
+            "verified": false,
+            "note": "AbuseIPDB reputation is unavailable and must be treated as unverified."
+        }),
     }
 }
 
@@ -293,13 +295,19 @@ pub async fn get_ip_reputation_handler(
             existing.risk_level = score_to_risk(decayed);
             existing.last_checked = now;
             score = existing.clone();
+            score.is_blocked = true;
+            score.details = serde_json::json!({
+                "verified": false,
+                "note": "AbuseIPDB reputation is unavailable; the local score is unverified.",
+                "local_details": score.details
+            });
         }
     }
 
     // Annotate with current block status.
     {
         let rules = IP_BLOCK_RULES.lock().unwrap();
-        score.is_blocked = is_ip_blocked(&ip, &rules);
+        score.is_blocked |= is_ip_blocked(&ip, &rules);
     }
 
     // Cache the refreshed score.
@@ -558,7 +566,10 @@ mod tests {
         };
         let score = check_ip_reputation("1.2.3.4", &config);
         assert_eq!(score.source, "disabled");
-        assert_eq!(score.score, 0.0);
+        assert_eq!(score.score, 100.0);
+        assert_eq!(score.risk_level, RiskLevel::Critical);
+        assert!(score.is_blocked);
+        assert_eq!(score.details["verified"], false);
     }
 
     #[test]

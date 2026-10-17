@@ -205,12 +205,28 @@ fn verify_pending_otp(vault_id: &str, code: &str) -> bool {
 
     if let Some(codes) = store.get_mut(vault_id) {
         codes.retain(|otp| otp.expires_at > now);
-        if let Some(pos) = codes.iter().position(|otp| otp.code == code) {
-            codes.remove(pos);
+        let mut matched_pos = codes.len();
+        for (pos, otp) in codes.iter().enumerate() {
+            let match_mask = 0usize
+                .wrapping_sub(constant_time_eq(otp.code.as_bytes(), code.as_bytes()) as usize);
+            matched_pos = (matched_pos & !match_mask) | (pos & match_mask);
+        }
+        if matched_pos < codes.len() {
+            codes.remove(matched_pos);
             return true;
         }
     }
     false
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut difference = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        let left = a.get(index).copied().unwrap_or_default();
+        let right = b.get(index).copied().unwrap_or_default();
+        difference |= (left ^ right) as usize;
+    }
+    difference == 0
 }
 
 // ── Route handlers ───────────────────────────────────────────────────────────
@@ -557,6 +573,47 @@ mod tests {
             db.get_2fa_config("vault-1").unwrap().unwrap().backup_codes.len(),
             1
         );
+    }
+
+    #[test]
+    fn pending_otp_comparison_checks_full_values_and_lengths() {
+        assert!(constant_time_eq(b"123456", b"123456"));
+        assert!(!constant_time_eq(b"023456", b"123456"));
+        assert!(!constant_time_eq(b"123450", b"123456"));
+        assert!(!constant_time_eq(b"12345", b"123456"));
+    }
+
+    #[test]
+    fn pending_otp_is_consumed_after_full_scan() {
+        let vault_id = "pending-otp-scan-test";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut store = PENDING_OTPS.lock().unwrap();
+            store.insert(
+                vault_id.to_string(),
+                vec![
+                    PendingOtp {
+                        code: "111111".to_string(),
+                        expires_at: now + 60,
+                    },
+                    PendingOtp {
+                        code: "222222".to_string(),
+                        expires_at: now + 60,
+                    },
+                    PendingOtp {
+                        code: "333333".to_string(),
+                        expires_at: now + 60,
+                    },
+                ],
+            );
+        }
+
+        assert!(verify_pending_otp(vault_id, "333333"));
+        assert!(!verify_pending_otp(vault_id, "333333"));
+        PENDING_OTPS.lock().unwrap().remove(vault_id);
     }
 
     /// Regression test: two threads racing to consume the same backup code
