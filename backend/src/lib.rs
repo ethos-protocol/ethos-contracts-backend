@@ -70,6 +70,7 @@ pub mod predictive_scaling;
 pub mod priority;
 pub mod profiler;
 pub mod query_cache;
+pub mod read_replica;
 pub mod replay;
 pub mod request_queue;
 pub mod request_signing;

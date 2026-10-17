@@ -679,6 +679,7 @@ impl PoolConfig {
 
 pub struct Db {
     conn: std::sync::Mutex<Connection>,
+    read_router: Option<crate::read_replica::ReadReplicaRouter>,
     // DB_POOL_MIN/DB_POOL_MAX are accepted for forward compatibility but unused:
     // `conn` is a single mutex-guarded connection, not a real pool. Only
     // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
@@ -706,10 +707,74 @@ impl Db {
     }
 
     pub fn open_with_pool_config(path: &str, config: &PoolConfig) -> Result<Self, rusqlite::Error> {
+        let primary_path = std::env::var("PRIMARY_DB_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| path.to_string());
+        let replica_paths: Vec<_> = std::env::var("READ_REPLICA_URLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !replica_paths.is_empty() && primary_path == ":memory:" {
+            return Err(rusqlite::Error::InvalidPath(
+                "READ_REPLICA_URLS requires a file-backed primary database".into(),
+            ));
+        }
+
+        let read_router = if replica_paths.is_empty() {
+            None
+        } else {
+            let router = crate::read_replica::ReadReplicaRouter::from_env_with_primary(&primary_path);
+            if router.replica_count() != replica_paths.len() {
+                return Err(rusqlite::Error::InvalidPath(
+                    "one or more READ_REPLICA_URLS could not be opened".into(),
+                ));
+            }
+            router.check_all_replicas();
+            Some(router)
+        };
+
+        Self::open_with_router(&primary_path, config, read_router)
+    }
+
+    /// Open a database with an explicit set of replica paths. Reads use the
+    /// configured replica-routing policy; all writes still use `path`.
+    pub fn open_with_read_replicas(
+        path: &str,
+        config: &PoolConfig,
+        replica_paths: &[&str],
+        strategy: crate::read_replica::ReplicaRoutingStrategy,
+        lag_threshold_ms: u64,
+    ) -> Result<Self, rusqlite::Error> {
+        let router = crate::read_replica::ReadReplicaRouter::new_with_primary(
+            Some(path),
+            replica_paths,
+            strategy,
+            lag_threshold_ms,
+        );
+        if router.replica_count() != replica_paths.len() {
+            return Err(rusqlite::Error::InvalidPath(
+                "one or more read replica paths could not be opened".into(),
+            ));
+        }
+        router.check_all_replicas();
+        Self::open_with_router(path, config, Some(router))
+    }
+
+    fn open_with_router(
+        path: &str,
+        config: &PoolConfig,
+        read_router: Option<crate::read_replica::ReadReplicaRouter>,
+    ) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(config.timeout_secs as u64))?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
+            read_router,
             pool_config: PoolConfig {
                 min: config.min,
                 max: config.max,
@@ -717,6 +782,32 @@ impl Db {
             },
             vault_store: create_vault_store(),
         })
+    }
+
+    /// Return the active read-replica router, if `READ_REPLICA_URLS` or an
+    /// explicit replica configuration was supplied.
+    pub fn read_replica_router(&self) -> Option<&crate::read_replica::ReadReplicaRouter> {
+        self.read_router.as_ref()
+    }
+
+    fn with_read_connection<T>(
+        &self,
+        query: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, rusqlite::Error> {
+        if let Some(router) = &self.read_router {
+            if let Ok(target) = router
+                .select_target_for_read(&crate::read_replica::ReadOptions::eventual())
+            {
+                let conn = target.conn.lock().unwrap();
+                let result = query(&conn);
+                if result.is_ok() {
+                    target.metrics.lock().unwrap().total_reads += 1;
+                }
+                return result;
+            }
+        }
+
+        query(&self.conn.lock().unwrap())
     }
 
     /// Insert or replace a vault. Persists to the `vaults` table so the vault
@@ -748,33 +839,32 @@ impl Db {
 
     /// Retrieve a vault by string ID from the `vaults` table.
     pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding
-            .prepare(
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
                 r"SELECT id, owner, beneficiary, balance, check_in_interval, last_check_in,
                          created_at, status, ttl_remaining
                   FROM vaults WHERE id = ?1",
-            )
-            .ok()?;
-        stmt.query_row(params![vault_id], |r| {
-            let balance_str: String = r.get(3)?;
-            let last_check_in_str: String = r.get(5)?;
-            let created_at_str: String = r.get(6)?;
-            let status_str: String = r.get(7)?;
-            Ok(crate::models::Vault {
-                id: r.get(0)?,
-                owner: r.get(1)?,
-                beneficiary: r.get(2)?,
-                balance: balance_str.parse().unwrap_or(0),
-                check_in_interval: r.get::<_, i64>(4)? as u64,
-                last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                status: vault_status_from_str(&status_str),
-                ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+            )?;
+            stmt.query_row(params![vault_id], |r| {
+                let balance_str: String = r.get(3)?;
+                let last_check_in_str: String = r.get(5)?;
+                let created_at_str: String = r.get(6)?;
+                let status_str: String = r.get(7)?;
+                Ok(crate::models::Vault {
+                    id: r.get(0)?,
+                    owner: r.get(1)?,
+                    beneficiary: r.get(2)?,
+                    balance: balance_str.parse().unwrap_or(0),
+                    check_in_interval: r.get::<_, i64>(4)? as u64,
+                    last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    status: vault_status_from_str(&status_str),
+                    ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+                })
             })
         })
         .ok()
@@ -1421,26 +1511,26 @@ impl Db {
     }
 
     pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE vault_id = ?1 AND deleted_at IS NULL",
-        )?;
-        let row = stmt.query_row(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at: None,
+            )?;
+            stmt.query_row(params![vault_id.cast_signed()], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at: None,
+                })
             })
-        })?;
-        Ok(row)
+        })
     }
 
     /// Reads the raw `normalized_frequency` column for `vault_id`. Only used
@@ -1460,31 +1550,32 @@ impl Db {
     }
 
     pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE deleted_at IS NULL",
-        )?;
-        let iter = stmt.query_map([], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at: None,
-            })
-        })?;
+            )?;
+            let iter = stmt.query_map([], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at: None,
+                })
+            })?;
 
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            for item in iter {
+                out.push(item?);
+            }
+            Ok(out)
+        })
     }
 
     pub fn soft_delete_reminder(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
@@ -1499,37 +1590,38 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE vault_id = ?1",
-        )?;
-        let iter = stmt.query_map(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            let deleted_at_str: Option<String> = r.get(4)?;
-            let deleted_at = deleted_at_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-            });
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at,
-            })
-        })?;
+            )?;
+            let iter = stmt.query_map(params![vault_id.cast_signed()], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                let deleted_at_str: Option<String> = r.get(4)?;
+                let deleted_at = deleted_at_str.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                });
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at,
+                })
+            })?;
 
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            for item in iter {
+                out.push(item?);
+            }
+            Ok(out)
+        })
     }
 
     pub fn upsert_subscription(&self, sub: &Subscription) -> Result<(), rusqlite::Error> {
@@ -3585,5 +3677,72 @@ mod tests {
         assert_eq!(seen_by_a.id, vault2.id);
 
         let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_reads_use_replica_and_fall_back_to_primary() {
+        let primary_path = std::env::temp_dir().join(format!(
+            "ethos_replica_primary_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let replica_path = std::env::temp_dir().join(format!(
+            "ethos_replica_copy_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let primary_path_str = primary_path.to_str().unwrap();
+        let replica_path_str = replica_path.to_str().unwrap();
+        let primary = Db::open(primary_path_str).unwrap();
+        primary.migrate().unwrap();
+        let replica = Db::open(replica_path_str).unwrap();
+        replica.migrate().unwrap();
+
+        primary
+            .upsert(&ReminderPreferences {
+                vault_id: 1,
+                channels: vec![Channel::Email],
+                hours_before_expiry: 24,
+                frequency: Frequency::Daily,
+                deleted_at: None,
+            })
+            .unwrap();
+        replica
+            .upsert(&ReminderPreferences {
+                vault_id: 1,
+                channels: vec![Channel::Sms],
+                hours_before_expiry: 24,
+                frequency: Frequency::Daily,
+                deleted_at: None,
+            })
+            .unwrap();
+
+        let routed = Db::open_with_read_replicas(
+            primary_path_str,
+            &PoolConfig::default(),
+            &[replica_path_str],
+            crate::read_replica::ReplicaRoutingStrategy::RoundRobin,
+            500,
+        )
+        .unwrap();
+        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Sms]);
+        assert_eq!(
+            routed
+                .read_replica_router()
+                .unwrap()
+                .all_metrics()[1]
+                .total_reads,
+            1
+        );
+
+        routed
+            .read_replica_router()
+            .unwrap()
+            .mark_unreachable(replica_path_str);
+        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Email]);
+
+        drop(routed);
+        drop(replica);
+        drop(primary);
+        let _ = std::fs::remove_file(replica_path);
+        let _ = std::fs::remove_file(primary_path);
     }
 }
