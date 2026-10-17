@@ -92,6 +92,8 @@ pub struct AppState {
     pub incident_state: Arc<crate::incidents::IncidentState>,
     /// Enterprise SAML service-provider configuration and replay state.
     pub saml_state: Arc<crate::saml::SamlState>,
+    /// Fraud scoring model shared by the fraud-scoring endpoint.
+    pub fraud_detector: Arc<crate::fraud_detection::FraudDetector>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {

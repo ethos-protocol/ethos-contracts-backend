@@ -45,8 +45,79 @@ tags:
     description: Pre-flight Stellar/Soroban operation cost estimation (#72)
   - name: Request Replay
     description: API request replay for debugging and regression testing (#73)
+  - name: Fraud Detection
+    description: Transaction fraud scoring and audit logging
 
 paths:
+  /fraud/score:
+    post:
+      summary: Score a transaction for fraud risk
+      description: Return the transaction's fraud score and persist an audit entry.
+      operationId: scoreTransaction
+      tags:
+        - Fraud Detection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - transaction
+              properties:
+                transaction:
+                  type: object
+                  required:
+                    - id
+                    - amount
+                    - merchant_id
+                    - user_id
+                    - timestamp
+                    - location
+                  properties:
+                    id:
+                      type: string
+                    amount:
+                      type: number
+                    merchant_id:
+                      type: string
+                    user_id:
+                      type: string
+                    timestamp:
+                      type: integer
+                      format: int64
+                    location:
+                      type: string
+      responses:
+        '200':
+          description: Fraud score calculated and audited
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - transaction_id
+                  - score
+                  - is_fraud
+                  - confidence
+                properties:
+                  transaction_id:
+                    type: string
+                  score:
+                    type: number
+                    format: float
+                  is_fraud:
+                    type: boolean
+                  confidence:
+                    type: number
+                    format: float
+        '500':
+          description: Fraud score audit could not be persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /health:
     get:
       summary: Health check

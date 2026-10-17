@@ -97,6 +97,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
+        fraud_detector: ethos_protocol_backend::fraud_detection::FraudDetector::new(),
     }
 }
 
@@ -229,6 +230,56 @@ async fn test_set_and_get_preferences() {
         ethos_protocol_backend::models::Frequency::Once
     );
     drop(app2);
+}
+
+#[tokio::test]
+async fn test_fraud_scoring_persists_audit_entry() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let state = test_state(Arc::clone(&db));
+    let app = crate::build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/fraud/score")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token")
+                .header("x-user-tier", "free")
+                .body(Body::from(
+                    json!({
+                        "transaction": {
+                            "id": "fraud-audit-test",
+                            "amount": 125.0,
+                            "merchant_id": "known-merchant",
+                            "user_id": "user-audit-test",
+                            "timestamp": 14400,
+                            "location": "us"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let score: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(score["transaction_id"], "fraud-audit-test");
+
+    let audit_entries = db
+        .query_audit_logs(&ethos_protocol_backend::models::AuditLogQuery {
+            user_id: Some("user-audit-test".to_string()),
+            action: Some("fraud_score".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(audit_entries.len(), 1);
+    assert_eq!(audit_entries[0].resource, "transaction:fraud-audit-test");
+    assert_eq!(audit_entries[0].result, "clear");
 }
 
 #[tokio::test]
@@ -395,6 +446,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
+        fraud_detector: ethos_protocol_backend::fraud_detection::FraudDetector::new(),
     };
     db.migrate().unwrap();
 
