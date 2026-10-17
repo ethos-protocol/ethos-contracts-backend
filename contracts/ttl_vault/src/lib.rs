@@ -6444,16 +6444,28 @@ impl TtlVaultContract {
         Self::load_token(&env)
     }
 
-    /// Returns all vault IDs where the given address is a beneficiary - Issue #398
+    /// Returns a paginated slice of vault IDs where the given address is a beneficiary.
+    pub fn get_vaults_as_beneficiary_page(
+        env: Env,
+        beneficiary: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<u64> {
+        let all = Self::load_beneficiary_vault_ids(&env, &beneficiary);
+        Self::paginate(&env, all, page, page_size)
+    }
+
+    /// Returns up to 50 vault IDs where the given address is a beneficiary.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `beneficiary` - The beneficiary address
     ///
     /// # Returns
-    /// A vector of vault IDs where the address is a beneficiary
+    /// The first page of vault IDs where the address is a beneficiary
+    #[deprecated(note = "Use get_vaults_as_beneficiary_page to paginate beneficiary vault IDs")]
     pub fn get_vaults_as_beneficiary(env: Env, beneficiary: Address) -> Vec<u64> {
-        Self::load_beneficiary_vault_ids(&env, &beneficiary)
+        Self::get_vaults_as_beneficiary_page(env, beneficiary, 0, 50)
     }
 
     /// Returns passkey usage history for a vault - Issue #395

@@ -3708,6 +3708,7 @@ fn test_non_primary_beneficiary_cannot_veto() {
 // ---- Issue #398: Beneficiary Notification System Tests ----
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3723,6 +3724,7 @@ fn test_get_vaults_as_beneficiary() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary_empty() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3734,6 +3736,27 @@ fn test_get_vaults_as_beneficiary_empty() {
     // Get vaults for non-beneficiary
     let vaults = client.get_vaults_as_beneficiary(&other_beneficiary);
     assert_eq!(vaults.len(), 0);
+}
+
+#[test]
+fn test_get_vaults_as_beneficiary_pagination() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let ids: alloc::vec::Vec<u64> = (0..5)
+        .map(|_| client.create_vault(&owner, &beneficiary, &100u64, &None))
+        .collect();
+
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &0u32, &2u32),
+        vec![&env, ids[0], ids[1]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &1u32, &2u32),
+        vec![&env, ids[2], ids[3]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &2u32, &2u32),
+        vec![&env, ids[4]]
+    );
 }
 
 #[test]
