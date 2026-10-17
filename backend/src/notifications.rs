@@ -946,7 +946,7 @@ impl NotificationService {
         (false, None)
     }
 
-    /// Stub: attempt to deliver via a specific channel.
+    /// Attempt delivery via a specific channel.
     async fn try_channel_delivery(
         &self,
         notif: &ScheduledNotification,
@@ -977,14 +977,12 @@ impl NotificationService {
                 false
             }
             NotificationChannel::Email => {
-                // Stub: in production this would call an email API
-                log::info!("Sending email to owner={}", notif.owner);
-                true
+                log::error!("Email notification delivery is not configured");
+                false
             }
             NotificationChannel::Sms => {
-                // Stub: in production this would call an SMS API
-                log::info!("Sending SMS to owner={}", notif.owner);
-                true
+                log::error!("SMS notification delivery is not configured");
+                false
             }
         }
     }
@@ -1076,6 +1074,50 @@ mod tests {
             create_delivery_store(),
         );
         assert!(service.get_tokens("owner").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_email_and_sms_channels_are_not_marked_delivered() {
+        let service = make_service();
+        let notification = ScheduledNotification {
+            id: "notification-1".to_string(),
+            vault_id: "vault-1".to_string(),
+            owner: "owner-1".to_string(),
+            notification_type: NotificationType::CheckInReminder,
+            scheduled_at: Utc::now(),
+            status: DeliveryStatus::Pending,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            sent_at: None,
+            passkey_hash: None,
+            ttl_hours: None,
+        };
+
+        for channel in [NotificationChannel::Email, NotificationChannel::Sms] {
+            let preferences = NotificationPreferences {
+                owner: notification.owner.clone(),
+                preferred_channel: Some(channel.clone()),
+                fallback_channel: None,
+                ..Default::default()
+            };
+            service
+                .prefs
+                .lock()
+                .unwrap()
+                .insert(notification.owner.clone(), preferences);
+
+            let (primary_ok, fallback_ok) =
+                service.deliver_with_fallback(&notification).await;
+            assert!(!primary_ok);
+            assert_eq!(fallback_ok, None);
+            assert_eq!(
+                service
+                    .get_channel_delivery_log(&notification.id)
+                    .last()
+                    .unwrap()
+                    .status,
+                DeliveryStatus::Failed
+            );
+        }
     }
 
     fn make_vault(ttl: Option<u64>) -> Vault {
