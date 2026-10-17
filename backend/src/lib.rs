@@ -1,28 +1,30 @@
 pub mod acl;
 pub mod alert_rules;
-pub mod automated_rollback;
-pub mod blue_green;
 pub mod analytics;
 pub mod anomaly_detection;
 pub mod anomaly_explanation;
-pub mod audit;
-pub mod lazy_metadata;
-pub mod materialized_views;
-pub mod query_optimizer;
 #[cfg(test)]
-mod property_tests;
+mod api_versioning_tests;
+pub mod audit;
+pub mod automated_rollback;
 pub mod backup_validation;
 pub mod batch_conditional_completion;
 pub mod batching;
-pub mod bulkhead;
+pub mod blue_green;
 pub mod bulk_operations;
+#[cfg(test)]
+mod bulk_operations_tests;
+pub mod bulkhead;
 pub mod cache;
 pub mod cache_partition;
-pub mod captcha;
 pub mod canary;
+pub mod captcha;
 pub mod cdc_lag;
 pub mod chaos;
 pub mod circuit_breaker;
+#[cfg(test)]
+mod circuit_breaker_tests;
+pub mod compliance;
 pub mod consensus;
 pub mod consistency;
 pub mod contract_version_check;
@@ -46,22 +48,16 @@ pub mod health;
 pub mod health_routing;
 pub mod incidents;
 pub mod job_queue;
+pub mod lazy_metadata;
 pub mod load_shedding;
 pub mod log_aggregation;
 pub mod log_analysis;
 pub mod log_search;
+pub mod materialized_views;
 pub mod message_queue;
 pub mod metrics;
 #[cfg(test)]
 mod migration_rollback_tests;
-#[cfg(test)]
-mod response_caching_tests;
-#[cfg(test)]
-mod circuit_breaker_tests;
-#[cfg(test)]
-mod api_versioning_tests;
-#[cfg(test)]
-mod bulk_operations_tests;
 pub mod models;
 pub mod multilevel_cache;
 pub mod notifications;
@@ -69,22 +65,27 @@ pub mod oncall;
 pub mod predictive_scaling;
 pub mod priority;
 pub mod profiler;
+#[cfg(test)]
+mod property_tests;
 pub mod query_cache;
+pub mod query_optimizer;
 pub mod replay;
 pub mod request_queue;
 pub mod request_signing;
+#[cfg(test)]
+mod response_caching_tests;
 pub mod retention;
 pub mod retry_policy;
 pub mod routes;
 pub mod rpc_pool;
 pub mod saga;
 pub mod scheduler;
-pub mod sla;
 pub mod secret_rotation;
+pub mod sla;
 pub mod streaming;
 pub mod structured_logging;
-pub mod structured_logging_middleware;
 pub mod structured_logging_integration;
+pub mod structured_logging_middleware;
 pub mod templates;
 pub mod timeout_adaptation;
 pub mod timeout_policy;

@@ -11,21 +11,22 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
-    aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
     acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
     alert_rules::{
         create_alert_rule, delete_alert_rule, evaluate_alerts, get_alert_rule, list_alert_rules,
         list_fired_alerts, AlertRulesState,
     },
-    sla::{
-        create_sla_policy, delete_sla_policy, get_compliance_summary, get_sla_policy,
-        get_sla_report, list_sla_breaches, list_sla_policies, record_sla_measurement,
-        update_sla_policy, SlaState,
+    aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
+    anomaly_detection::{
+        configure_seasonality, get_baseline, get_investigation_history, get_seasonal_pattern,
+        list_alerts, list_root_causes, list_system_anomalies, observe_metric, record_investigation,
+        set_seasonal_threshold, AnomalyStore,
     },
     automated_rollback::{
         create_rollback_plan, get_rollback_plan, list_rollback_history, list_rollback_plans,
         run_post_deployment_tests, trigger_rollback, RollbackState,
     },
+    batching::{AdaptiveBatcher, BatchConfig},
     blue_green::{
         create_blue_green_deployment, get_blue_green_deployment, list_blue_green_deployments,
         report_health as bg_report_health, rollback_blue_green, switch_traffic, BlueGreenState,
@@ -34,22 +35,12 @@ use ethos_protocol_backend::{
         evaluate_canary, get_canary_deployment, rollback_canary, start_canary_deployment,
         CanaryState,
     },
-    anomaly_detection::{
-        configure_seasonality, get_baseline, get_investigation_history, get_seasonal_pattern,
-        list_alerts, list_root_causes, list_system_anomalies, observe_metric,
-        record_investigation, set_seasonal_threshold, AnomalyStore,
-    },
-    batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     cost_tracking::{
         allocate_cost, get_budget_breaches, get_cost_dashboard, get_cost_report,
         get_gas_cost_report, get_optimization_suggestions, record_cost_entry, record_gas_cost,
         set_budget_threshold, CostState,
-    },
-    dr_automation::{
-        confirm_dr_action, get_dr_test_schedule, get_rto_rpo, list_playbooks, request_dr_action,
-        DrAutomationState,
     },
     // Commented out: custom_metrics unused in current build
     // custom_metrics::{
@@ -64,6 +55,10 @@ use ethos_protocol_backend::{
     degradation::{
         capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
         DegradationState,
+    },
+    dr_automation::{
+        confirm_dr_action, get_dr_test_schedule, get_rto_rpo, list_playbooks, request_dr_action,
+        DrAutomationState,
     },
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
@@ -80,6 +75,11 @@ use ethos_protocol_backend::{
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
     schema_validation::{openapi_validation_middleware, OpenApiSpec},
+    sla::{
+        create_sla_policy, delete_sla_policy, get_compliance_summary, get_sla_policy,
+        get_sla_report, list_sla_breaches, list_sla_policies, record_sla_measurement,
+        update_sla_policy, SlaState,
+    },
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
@@ -92,9 +92,9 @@ use ethos_protocol_backend::{
 };
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod stellar_integration_tests;
+#[cfg(test)]
+mod tests;
 
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
@@ -210,6 +210,10 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/captcha/trusted-users",
             get(ethos_protocol_backend::captcha::get_trusted_users_handler)
                 .post(ethos_protocol_backend::captcha::post_add_trusted_user_handler),
+        )
+        .route(
+            "/admin/compliance-report",
+            get(ethos_protocol_backend::compliance::compliance_report_handler),
         )
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
@@ -449,21 +453,18 @@ async fn main() {
     // budget thresholds / breach alerts, and optimization suggestions.
     let cost_state = Arc::new(CostState::new());
     let cost_router = Router::new()
-        .route(
-            "/admin/cost/entries",
-            post(record_cost_entry),
-        )
+        .route("/admin/cost/entries", post(record_cost_entry))
         .route("/admin/cost/report", get(get_cost_report))
         .route("/admin/cost/allocate", post(allocate_cost))
-        .route(
-            "/admin/cost/budget-thresholds",
-            post(set_budget_threshold),
-        )
+        .route("/admin/cost/budget-thresholds", post(set_budget_threshold))
         .route("/admin/cost/budget-breaches", get(get_budget_breaches))
         .route("/admin/cost/gas", post(record_gas_cost))
         .route("/admin/cost/gas/report", get(get_gas_cost_report))
         .route("/admin/cost/dashboard", get(get_cost_dashboard))
-        .route("/admin/cost/optimizations", get(get_optimization_suggestions))
+        .route(
+            "/admin/cost/optimizations",
+            get(get_optimization_suggestions),
+        )
         .with_state(cost_state);
 
     // ── Disaster recovery automation routes (#595) ─────────────────────────
@@ -472,10 +473,7 @@ async fn main() {
     let dr_state = Arc::new(DrAutomationState::new());
     let dr_router = Router::new()
         .route("/admin/dr/actions", post(request_dr_action))
-        .route(
-            "/admin/dr/actions/:token/confirm",
-            post(confirm_dr_action),
-        )
+        .route("/admin/dr/actions/:token/confirm", post(confirm_dr_action))
         .route("/admin/dr/rto-rpo", get(get_rto_rpo))
         .route("/admin/dr/test-schedule", get(get_dr_test_schedule))
         .route("/admin/dr/playbooks", get(list_playbooks))
@@ -491,7 +489,10 @@ async fn main() {
             "/anomaly/seasonality",
             post(configure_seasonality).get(get_seasonal_pattern),
         )
-        .route("/anomaly/seasonality/threshold", put(set_seasonal_threshold))
+        .route(
+            "/anomaly/seasonality/threshold",
+            put(set_seasonal_threshold),
+        )
         .route("/anomaly/system", get(list_system_anomalies))
         .route("/anomaly/root-causes", get(list_root_causes))
         .route(
@@ -555,22 +556,10 @@ async fn main() {
     // ── Issue #591: Canary Deployment ─────────────────────────────────────────
     let canary_state = Arc::new(CanaryState::new());
     let canary_router = Router::new()
-        .route(
-            "/deployments/canary",
-            post(start_canary_deployment),
-        )
-        .route(
-            "/deployments/canary/:id",
-            get(get_canary_deployment),
-        )
-        .route(
-            "/deployments/canary/:id/evaluate",
-            post(evaluate_canary),
-        )
-        .route(
-            "/deployments/canary/:id/rollback",
-            post(rollback_canary),
-        )
+        .route("/deployments/canary", post(start_canary_deployment))
+        .route("/deployments/canary/:id", get(get_canary_deployment))
+        .route("/deployments/canary/:id/evaluate", post(evaluate_canary))
+        .route("/deployments/canary/:id/rollback", post(rollback_canary))
         .with_state(canary_state);
 
     // ── Issue #592: Blue-Green Deployment ─────────────────────────────────────
@@ -584,18 +573,12 @@ async fn main() {
             "/deployments/blue-green/:id",
             get(get_blue_green_deployment),
         )
-        .route(
-            "/deployments/blue-green/:id/switch",
-            post(switch_traffic),
-        )
+        .route("/deployments/blue-green/:id/switch", post(switch_traffic))
         .route(
             "/deployments/blue-green/:id/rollback",
             post(rollback_blue_green),
         )
-        .route(
-            "/deployments/blue-green/:id/health",
-            post(bg_report_health),
-        )
+        .route("/deployments/blue-green/:id/health", post(bg_report_health))
         .with_state(blue_green_state);
 
     // ── Issue #593: Automated Rollback on Test Failure ────────────────────────
@@ -605,10 +588,7 @@ async fn main() {
             "/deployments/rollback/plan",
             post(create_rollback_plan).get(list_rollback_plans),
         )
-        .route(
-            "/deployments/rollback/plan/:id",
-            get(get_rollback_plan),
-        )
+        .route("/deployments/rollback/plan/:id", get(get_rollback_plan))
         .route(
             "/deployments/rollback/plan/:id/run-tests",
             post(run_post_deployment_tests),
@@ -617,10 +597,7 @@ async fn main() {
             "/deployments/rollback/plan/:id/rollback",
             post(trigger_rollback),
         )
-        .route(
-            "/deployments/rollback/history",
-            get(list_rollback_history),
-        )
+        .route("/deployments/rollback/history", get(list_rollback_history))
         .with_state(rollback_state);
 
     // ── Issue #600: SLA Monitoring and Reporting ───────────────────────────────
