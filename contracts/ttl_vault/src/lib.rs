@@ -531,6 +531,7 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    UpgradeManifestRequired = 140,
 }
 
 #[contract]
@@ -1158,22 +1159,12 @@ impl TtlVaultContract {
         }
     }
 
-    /// Admin-only. Validates and upgrades the contract to a new WASM hash.
-    ///
-    /// This only performs the basic non-zero-hash check. Prefer
-    /// `upgrade_with_manifest` for upgrades where a baseline has been
-    /// recorded via `set_upgrade_manifest`, since it additionally enforces
-    /// interface, storage, and error-code compatibility.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    /// Hash-only upgrades are disabled. Use `upgrade_with_manifest` or
+    /// `upgrade_with_manifest_and_signatures` so the candidate's compatibility
+    /// is checked against the recorded baseline.
+    pub fn upgrade(env: Env, _new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env);
-        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.storage()
-            .instance()
-            .remove(&DataKey::UpgradeFunctionSignaturesHash);
+        panic_with_error!(&env, ContractError::UpgradeManifestRequired);
     }
 
     /// Admin-only. Full upgrade-safety path: validates the hash, validates

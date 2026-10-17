@@ -1,11 +1,10 @@
 # Upgrade Safety
 
-`contracts/ttl_vault/src/lib.rs` exposes `upgrade(env, new_wasm_hash)`,
-which lets the admin replace the deployed WASM with arbitrary new code.
-Historically this only checked that the hash was non-zero — it did not
-verify the new code was interface-compatible, storage-compatible, or
-error-code-compatible with the running contract. This document describes
-the compatibility checks that were added and how to use them.
+The hash-only `upgrade(env, new_wasm_hash)` entry point is disabled and
+returns `UpgradeManifestRequired`. All upgrades must use a manifest-aware
+entry point so the candidate is checked against the recorded interface,
+storage, and error-code baseline. This document describes those checks and
+how to use them.
 
 ## What is checked
 
@@ -85,14 +84,12 @@ been recorded.
    and then records the new values as the baseline for the *next* upgrade
    (incrementing `UpgradeManifest.version`).
 
-The legacy `set_upgrade_manifest`, `validate_upgrade_compatibility`,
-`upgrade_with_manifest`, and `upgrade(new_wasm_hash)` entry points remain
-available for compatibility with existing tooling. The first three do not
-check exact function signatures; new deployments and operational tooling
-should prefer their `*_with_signatures` counterparts. A successful legacy
-upgrade clears any stored signature fingerprint, so a strict upgrade cannot
-reuse a stale baseline; record it again with
-`set_upgrade_manifest_with_signatures`.
+The legacy `set_upgrade_manifest`, `validate_upgrade_compatibility`, and
+`upgrade_with_manifest` entry points remain available for compatibility with
+existing tooling. The manifest-aware legacy path does not check exact function
+signatures; new deployments and operational tooling should prefer its
+`*_with_signatures` counterpart. The hash-only `upgrade(new_wasm_hash)` call
+is rejected even for admins.
 
 ## Automated simulation
 

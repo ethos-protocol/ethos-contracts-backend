@@ -185,3 +185,15 @@ fn upgrade_with_manifest_rejects_invalid_hash() {
     let result = client.try_upgrade_with_manifest(&zero_hash, &10u32, &5u32, &hash);
     assert!(result.is_err());
 }
+
+#[test]
+fn hash_only_upgrade_is_rejected() {
+    let (env, _admin, client) = setup();
+    let hash = schema_hash(&env, 1);
+
+    let result = client.try_upgrade(&hash);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(ContractError::UpgradeManifestRequired as u32)
+    );
+}
