@@ -308,6 +308,9 @@ const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 /// Time-lock delay for admin transfers in seconds (24 hours) — Issue #813.
 const ADMIN_TRANSFER_TIMELOCK: u64 = 86_400;
 
+/// Maximum number of bytes retained in a pause record's reason.
+pub const MAX_PAUSE_REASON_LEN: u32 = 256;
+
 /// Time-lock delay before a proposed protocol config takes effect (24 hours) — Issue #809.
 const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
 
@@ -531,6 +534,7 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    InvalidPauseReason = 140,
 }
 
 #[contract]
@@ -584,6 +588,9 @@ impl TtlVaultContract {
     /// Panics if the caller is not the admin
     pub fn pause(env: Env, reason: Bytes) {
         Self::require_admin(&env);
+        if reason.len() > MAX_PAUSE_REASON_LEN {
+            panic_with_error!(&env, ContractError::InvalidPauseReason);
+        }
         let paused_by = Self::load_admin(&env);
         let record = PauseRecord {
             paused_by: paused_by.clone(),

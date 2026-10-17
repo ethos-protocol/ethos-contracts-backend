@@ -6573,6 +6573,18 @@ fn test_accept_admin_emits_completed_event() {
 // ---- Issue #814: Pause Reason Tracking ----
 
 #[test]
+fn test_pause_rejects_oversized_reason() {
+    let (env, _, _, _, _, client) = setup();
+    let reason = Bytes::from_array(&env, &[0u8; (MAX_PAUSE_REASON_LEN + 1) as usize]);
+
+    let error = client.try_pause(&reason).unwrap_err();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidPauseReason as u32)
+    );
+}
+
+#[test]
 fn test_pause_stores_pause_record() {
     let (env, _, _, admin, _, client) = setup();
     let reason = bytes!(&env, 0xdeadbeef);
