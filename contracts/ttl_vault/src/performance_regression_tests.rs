@@ -65,10 +65,7 @@ const BASELINE_TRIGGER_RELEASE_5: Baseline = Baseline { cpu: 234_567, mem: 8_192
 
 fn assert_no_regression(label: &str, measured: u64, baseline: u64) {
     let threshold = (baseline as f64 * (1.0 + TOLERANCE)) as u64;
-    println!(
-        "[perf] {}: measured={} baseline={} threshold={}",
-        label, measured, baseline, threshold
-    );
+    let _ = (label, measured, baseline, threshold);
     assert!(
         measured <= threshold,
         "Performance regression detected in '{}': measured {} > threshold {} (baseline {} + {}%)",
@@ -271,10 +268,7 @@ fn perf_regression_release_scales_sub_linearly() {
     let (cpu_5, _) = measure_budget(&env2);
 
     let linear_upper_bound = cpu_1.saturating_mul(5);
-    println!(
-        "[perf] release_scaling: 1-beneficiary={} 5-beneficiary={} linear_upper_bound={}",
-        cpu_1, cpu_5, linear_upper_bound
-    );
+    let _ = (cpu_1, cpu_5, linear_upper_bound);
     assert!(
         cpu_5 <= linear_upper_bound,
         "Performance regression: release cost with 5 beneficiaries ({}) exceeds 5× the 1-beneficiary cost ({})",

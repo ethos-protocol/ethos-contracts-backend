@@ -1,8 +1,9 @@
+#![cfg(test)]
+
 /// Issue #559 — Incremental state snapshots tests
 ///
 /// ⚠️ WARNING: These tests are implementation-only and have **not** been run
 /// as part of this change. Do not add integration/end-to-end assertions here.
-#![cfg(test)]
 
 extern crate alloc;
 
@@ -197,8 +198,5 @@ fn test_reconstruct_missing_snapshot_errors() {
         .try_reconstruct_vault_snapshot(&vault_id, &3)
         .unwrap_err()
         .unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::SnapshotNotFound as u32)
-    );
+    assert_eq!(err, ContractError::SnapshotNotFound);
 }

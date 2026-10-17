@@ -1,8 +1,9 @@
+#![cfg(test)]
+
 /// Issue #557 — Vault history archival tests
 ///
 /// ⚠️ WARNING: These tests are implementation-only and have **not** been run
 /// as part of this change. Do not add integration/end-to-end assertions here.
-#![cfg(test)]
 
 extern crate alloc;
 
@@ -120,10 +121,7 @@ fn test_get_archived_history_missing_page_errors() {
         .try_get_archived_history(&vault_id, &0)
         .unwrap_err()
         .unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::ArchivePageNotFound as u32)
-    );
+    assert_eq!(err, ContractError::ArchivePageNotFound);
 }
 
 #[test]
@@ -185,8 +183,5 @@ fn test_archive_rejects_unrelated_caller() {
         .try_archive_vault_history(&vault_id, &stranger)
         .unwrap_err()
         .unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::NotOwner as u32)
-    );
+    assert_eq!(err, ContractError::NotOwner);
 }

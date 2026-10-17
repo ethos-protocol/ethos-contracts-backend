@@ -53,7 +53,10 @@ pub struct Policy {
     /// Amount at or above which operations require KYC (0 = disabled).
     pub kyc_high_value_threshold: i128,
     pub allowlist_enforced: bool,
-    pub reporting_thresholds: Option<ThresholdConfig>,
+    /// Reporting thresholds, or the zero-value config when disabled.
+    pub reporting_thresholds: ThresholdConfig,
+    /// Whether reporting thresholds were active for this policy version.
+    pub thresholds_enabled: bool,
 }
 
 #[contracttype]
@@ -115,6 +118,12 @@ fn append(env: &Env, mut policy: Policy) -> u32 {
 /// Called after every direct change through the compliance setters.
 pub fn record_live_change(env: &Env, actor: &Address, reason: Symbol) -> u32 {
     let now = env.ledger().timestamp();
+    let thresholds = compliance::get_threshold_config(env);
+    let reporting_thresholds = thresholds.unwrap_or(ThresholdConfig {
+        single_tx_threshold: 0,
+        cumulative_threshold: 0,
+        window_seconds: 0,
+    });
     let version = append(
         env,
         Policy {
@@ -125,7 +134,8 @@ pub fn record_live_change(env: &Env, actor: &Address, reason: Symbol) -> u32 {
             reason,
             kyc_high_value_threshold: compliance::get_kyc_high_value_threshold(env),
             allowlist_enforced: compliance::is_allowlist_enforced(env),
-            reporting_thresholds: compliance::get_threshold_config(env),
+            reporting_thresholds,
+            thresholds_enabled: thresholds.is_some(),
         },
     );
     persist(env, &PolicyKey::Applied, &version);
@@ -160,6 +170,12 @@ pub fn publish_policy(
         }
     }
 
+    let thresholds_enabled = reporting_thresholds.is_some();
+    let reporting_thresholds = reporting_thresholds.unwrap_or(ThresholdConfig {
+        single_tx_threshold: 0,
+        cumulative_threshold: 0,
+        window_seconds: 0,
+    });
     let version = append(
         env,
         Policy {
@@ -171,6 +187,7 @@ pub fn publish_policy(
             kyc_high_value_threshold,
             allowlist_enforced,
             reporting_thresholds,
+            thresholds_enabled,
         },
     );
     sync_active_policy(env)?;
@@ -214,9 +231,10 @@ pub fn sync_active_policy(env: &Env) -> Result<Option<u32>, ContractError> {
     if compliance::is_allowlist_enforced(env) != active.allowlist_enforced {
         compliance::set_allowlist_enforced(env, active.allowlist_enforced);
     }
-    match &active.reporting_thresholds {
-        Some(cfg) => compliance::set_threshold_config(env, cfg)?,
-        None => compliance::clear_threshold_config(env),
+    if active.thresholds_enabled {
+        compliance::set_threshold_config(env, &active.reporting_thresholds)?;
+    } else {
+        compliance::clear_threshold_config(env);
     }
 
     persist(env, &PolicyKey::Applied, &active.version);

@@ -721,7 +721,7 @@ pub struct ReleaseEvent {
 /// they receive nothing and those funds are redistributed to other beneficiaries.
 /// Set to 0 to disable the minimum threshold for this beneficiary.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
@@ -891,7 +891,7 @@ pub struct WithdrawalRateLimit {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Vault {
     pub owner: Address,
     /// Primary beneficiary kept for backwards-compatible single-beneficiary reads.
@@ -1221,7 +1221,7 @@ pub enum ProposalStatus {
 
 /// State transition record for vault status changes - Issue #472
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StateTransitionEntry {
     pub from_status: ReleaseStatus,
     pub to_status: ReleaseStatus,

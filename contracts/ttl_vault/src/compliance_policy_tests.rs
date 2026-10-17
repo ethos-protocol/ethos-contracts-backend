@@ -1,8 +1,9 @@
+#![cfg(test)]
+
 /// Issue #556 — Compliance policy versioning tests
 ///
 /// ⚠️ WARNING: These tests are implementation-only and have **not** been run
 /// as part of this change. Do not add integration/end-to-end assertions here.
-#![cfg(test)]
 
 extern crate alloc;
 
@@ -37,10 +38,7 @@ fn test_no_policy_before_first_change() {
     let (_env, _, client) = setup();
     assert_eq!(client.get_policy_version_count(), 0);
     let err = client.try_get_policy_version(&1_000).unwrap_err().unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::PolicyVersionNotFound as u32)
-    );
+    assert_eq!(err, ContractError::PolicyVersionNotFound);
 }
 
 #[test]
@@ -130,10 +128,7 @@ fn test_publish_policy_rejects_past_effective_date() {
         .try_publish_compliance_policy(&0, &false, &None, &999)
         .unwrap_err()
         .unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::InvalidEffectiveDate as u32)
-    );
+    assert_eq!(err, ContractError::InvalidEffectiveDate);
 }
 
 #[test]

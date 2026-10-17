@@ -38,7 +38,15 @@ jobs:
           openapi-spec-validator docs/openapi.yaml
 
       - name: Schema-validation middleware unit tests
-        run: cargo test --package ethos-protocol-backend schema_validation
+        run: |
+          set -euo pipefail
+          tests="$(cargo test --package ethos-protocol-backend schema_validation -- --list)"
+          printf '%s\n' "$tests"
+          if ! grep -q '^schema_validation::tests::' <<< "$tests"; then
+            echo "No schema-validation unit tests were discovered."
+            exit 1
+          fi
+          cargo test --package ethos-protocol-backend schema_validation
 
       - name: Fail if handlers drift from docs/openapi.yaml
         run: node scripts/check_openapi_drift.mjs

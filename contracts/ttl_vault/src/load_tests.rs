@@ -280,9 +280,6 @@ fn load_release_many_vaults() {
 fn print_budget(env: &Env, label: &str) -> (u64, u64) {
     let cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let mem = env.cost_estimate().budget().mem_byte_cost();
-    println!(
-        "[load] {}: cpu={} mem={}",
-        label, cpu, mem
-    );
+    let _ = (label, cpu, mem);
     (cpu, mem)
 }
