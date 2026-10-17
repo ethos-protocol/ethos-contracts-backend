@@ -4577,9 +4577,8 @@ fn test_audit_log_page_size_stays_bounded() {
         client.withdraw(&vault_id, &owner, &1i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
-    // We expect exactly 125 entries (1 create + 124 deposit/withdraw).
-    assert_eq!(all.len(), 125, "expected 125 total audit entries");
+    // The compatibility alias is now bounded to a single page.
+    assert_eq!(client.get_vault_activity_log(&vault_id).len(), 50);
 
     // Verify that each paginated storage key holds at most PAGE_SIZE entries by
     // reading pages 0..2 through the public paged accessor.
@@ -4592,11 +4591,13 @@ fn test_audit_log_page_size_stays_bounded() {
     assert_eq!(page1.len(), 50, "page 1 must contain exactly 50 entries");
     assert_eq!(page2.len(), 25, "page 2 (tail) must contain the remaining 25 entries");
     assert!(page3.is_empty(), "page 3 does not exist and should be empty");
+    assert_eq!(page0.len() + page1.len() + page2.len(), 125);
 }
 
 /// Verify that all historical entries remain retrievable via the paged accessor
 /// after the storage layout change — no entries should be dropped or reordered.
 #[test]
+#[allow(deprecated)]
 fn test_audit_log_historical_entries_readable_via_pagination() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
@@ -4607,7 +4608,7 @@ fn test_audit_log_historical_entries_readable_via_pagination() {
         client.withdraw(&vault_id, &owner, &1_000i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
+    let all = client.get_vault_audit_log(&vault_id);
     assert_eq!(all.len(), 55);
 
     // First entry is create_vault (written before the loop).
@@ -7227,4 +7228,3 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
-

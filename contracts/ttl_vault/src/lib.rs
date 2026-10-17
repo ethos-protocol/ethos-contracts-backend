@@ -8325,9 +8325,9 @@ impl TtlVaultContract {
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
     }
 
-    /// Returns the vault activity log (alias for get_vault_audit_log).
+    /// Returns the first page of the vault activity log.
     pub fn get_vault_activity_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
-        Self::get_vault_audit_log(env, vault_id)
+        Self::get_vault_audit_log_page(env, vault_id, 0, Self::AUDIT_LOG_PAGE_SIZE)
     }
 
     /// Transfers vault ownership immediately (single-step, backwards-compatible).
@@ -9693,6 +9693,7 @@ impl TtlVaultContract {
     ///
     /// # Returns
     /// A vector of audit entries in chronological order (oldest first)
+    #[deprecated(note = "Use get_vault_audit_log_page to read audit entries in bounded pages")]
     pub fn get_vault_audit_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
         let mut result: Vec<AuditEntry> = Vec::new(&env);
 
@@ -9749,20 +9750,51 @@ impl TtlVaultContract {
         page: u32,
         page_size: u32,
     ) -> Vec<AuditEntry> {
-        // Gather all entries (legacy + new) then return the requested slice.
-        // For most vaults only the new layout is active; legacy vaults are handled
-        // in get_vault_audit_log above.
-        let all = Self::get_vault_audit_log(env.clone(), vault_id);
-        let total = all.len() as u32;
         let cap = page_size.min(Self::AUDIT_LOG_PAGE_SIZE);
-        let start = page * cap;
-        if start >= total {
+        if cap == 0 {
             return Vec::new(&env);
         }
-        let end = (start + cap).min(total);
+        let start = page.saturating_mul(cap);
         let mut result: Vec<AuditEntry> = Vec::new(&env);
-        for i in start..end {
-            result.push_back(all.get(i).unwrap());
+
+        let legacy: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultAuditLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let legacy_len = legacy.len();
+        if start < legacy_len {
+            let legacy_end = start.saturating_add(cap).min(legacy_len);
+            for index in start..legacy_end {
+                result.push_back(legacy.get(index).unwrap());
+            }
+        }
+
+        let mut new_index = start.saturating_sub(legacy_len);
+        let total_new: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultAuditLogLen(vault_id))
+            .unwrap_or(0);
+        while result.len() < cap && new_index < total_new {
+            let page_index = new_index / Self::AUDIT_LOG_PAGE_SIZE;
+            let page_offset = new_index % Self::AUDIT_LOG_PAGE_SIZE;
+            let entries: Vec<AuditEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VaultAuditLogPage(vault_id, page_index))
+                .unwrap_or_else(|| Vec::new(&env));
+            let count = entries
+                .len()
+                .saturating_sub(page_offset)
+                .min(cap - result.len());
+            if count == 0 {
+                break;
+            }
+            for offset in 0..count {
+                result.push_back(entries.get(page_offset + offset).unwrap());
+            }
+            new_index += count;
         }
         result
     }
