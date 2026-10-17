@@ -13,13 +13,17 @@
 //! * [`RevocationList::is_revoked`] is the check every authenticated request
 //!   runs; [`validate_ws_token_with_revocation`] wires it onto the existing
 //!   [`crate::websocket::validate_ws_token`] verification.
-//! * `POST /auth/revoke` ([`revoke_token`]) adds a token (or a bare `jti`) to
-//!   the list.
+//! * Admin-only `POST /auth/revoke` ([`revoke_token`]) adds a token (or a bare
+//!   `jti`) to the list.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -144,11 +148,19 @@ fn bad_request(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// `POST /auth/revoke` — add a token to the revocation list.
+/// Admin-only `POST /auth/revoke` — add a token to the revocation list.
 pub async fn revoke_token(
     State(list): State<Arc<RevocationList>>,
+    headers: HeaderMap,
     Json(body): Json<RevokeRequest>,
 ) -> Result<Json<RevokeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = crate::audit::authorize_admin(&headers) {
+        return Err((
+            error.status(),
+            Json(serde_json::json!({ "error": error.message })),
+        ));
+    }
+
     let now = Utc::now().timestamp();
 
     let (jti, token_exp) = match (body.jti.clone(), body.token.as_deref()) {
@@ -269,6 +281,7 @@ mod tests {
         // By bare jti.
         let resp = revoke_token(
             State(list.clone()),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: None,
                 jti: Some("direct-jti".to_string()),
@@ -284,6 +297,7 @@ mod tests {
         let token = mint(b"whatever", "token-jti", exp);
         let resp = revoke_token(
             State(list.clone()),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: Some(token),
                 jti: None,
@@ -302,6 +316,7 @@ mod tests {
         let list = RevocationList::new();
         let err = revoke_token(
             State(list),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: None,
                 jti: None,
