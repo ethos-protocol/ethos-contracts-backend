@@ -139,8 +139,8 @@ pub struct FieldEncryptionEngine {
 impl FieldEncryptionEngine {
     /// Construct from environment variables.
     ///
-    /// Reads `FIELD_ENCRYPTION_KEY_VERSION` (defaults to `1`) and then looks
-    /// for `FIELD_ENCRYPTION_KEY_<N>` for each version it needs to support.
+    /// Reads `FIELD_ENCRYPTION_KEY_VERSION` (defaults to `1`) and then loads
+    /// configured keys for that version and up to 9 previous versions.
     /// If a key env-var is absent the dev-only zero-key is substituted —
     /// **only safe in test/local environments**.
     pub fn from_env() -> Result<Self, EncryptionError> {
@@ -152,6 +152,13 @@ impl FieldEncryptionEngine {
         let mut keys = std::collections::HashMap::new();
         // Load the active version key and up to 9 previous versions.
         for v in active_version.saturating_sub(9)..=active_version {
+            let var_name = format!("FIELD_ENCRYPTION_KEY_{v}");
+            if v != active_version
+                && std::env::var(&var_name).is_err()
+                && crate::security_settings::is_production()
+            {
+                continue;
+            }
             let key = Self::load_key_for_version(v)?;
             keys.insert(v, key);
         }
@@ -280,8 +287,11 @@ impl FieldEncryptionEngine {
                 Ok(key)
             }
             Err(_) => {
+                if crate::security_settings::is_production() {
+                    return Err(EncryptionError::KeyNotFound(version));
+                }
                 // Fall back to dev key if no env var is set.
-                // Warn loudly so this is never silently used in production.
+                // Warn loudly when the development fallback is used.
                 #[cfg(not(test))]
                 tracing::warn!(
                     version,

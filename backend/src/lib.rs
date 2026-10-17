@@ -76,6 +76,7 @@ pub mod retention;
 pub mod retry_policy;
 pub mod routes;
 pub mod rpc_pool;
+pub mod security_settings;
 pub mod saga;
 pub mod scheduler;
 pub mod sla;

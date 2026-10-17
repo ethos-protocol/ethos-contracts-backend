@@ -273,6 +273,11 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    if let Err(error) = ethos_protocol_backend::security_settings::validate_startup() {
+        tracing::error!(%error, "invalid production security configuration");
+        std::process::exit(1);
+    }
+
     // Check contract version before proceeding with server startup
     let min_contract_version =
         parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());

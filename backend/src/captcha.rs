@@ -300,6 +300,9 @@ pub async fn verify_captcha(
     let secret_key = std::env::var("RECAPTCHA_SECRET_KEY").unwrap_or_default();
 
     if secret_key.is_empty() {
+        if crate::security_settings::is_production() {
+            return Err("RECAPTCHA_SECRET_KEY is required in production".to_string());
+        }
         // Development / CI mode — accept any token without contacting Google.
         tracing::debug!("RECAPTCHA_SECRET_KEY not set; returning stub success (dev mode)");
 
