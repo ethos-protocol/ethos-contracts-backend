@@ -197,6 +197,20 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        // ── CAPTCHA challenge / verification (#97) ────────────────────────
+        .route(
+            "/captcha/challenge",
+            post(ethos_protocol_backend::captcha::post_challenge_handler),
+        )
+        .route(
+            "/captcha/verify",
+            post(ethos_protocol_backend::captcha::post_verify_handler),
+        )
+        .route(
+            "/admin/captcha/trusted-users",
+            get(ethos_protocol_backend::captcha::get_trusted_users_handler)
+                .post(ethos_protocol_backend::captcha::post_add_trusted_user_handler),
+        )
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",

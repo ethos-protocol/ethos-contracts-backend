@@ -18,6 +18,7 @@ pub mod bulkhead;
 pub mod bulk_operations;
 pub mod cache;
 pub mod cache_partition;
+pub mod captcha;
 pub mod canary;
 pub mod cdc_lag;
 pub mod chaos;
