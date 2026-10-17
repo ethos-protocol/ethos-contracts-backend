@@ -10,7 +10,14 @@ use crate::models::{
     RegisterTokenRequest, ReminderDeliveryLog, ScheduledNotification, UnsubscribeToken,
     UpdatePreferencesRequest, Vault,
 };
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    routing::get,
+    Json,
+};
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,6 +61,20 @@ pub fn create_channel_delivery_store() -> ChannelDeliveryStore {
 }
 pub fn create_idempotency_store() -> IdempotencyStore {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub fn create_service() -> Arc<NotificationService> {
+    let fcm = Arc::new(FcmClient::new(
+        std::env::var("FCM_SERVER_KEY").unwrap_or_default(),
+        std::env::var("FCM_PROJECT_ID").unwrap_or_default(),
+    ));
+    Arc::new(NotificationService::new(
+        fcm,
+        create_token_store(),
+        create_prefs_store(),
+        create_schedule_store(),
+        create_delivery_store(),
+    ))
 }
 
 /// Exponential backoff delays in seconds: 1 min, 5 min, 15 min, 1 hr, 6 hr.
@@ -292,6 +313,105 @@ pub struct NotificationService {
     pub unsubscribe_tokens: UnsubscribeStore,
     pub channel_delivery_log: ChannelDeliveryStore,
     pub idempotency: IdempotencyStore,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OwnerQuery {
+    pub owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScheduleNotificationRequest {
+    pub vault_id: String,
+    pub owner: String,
+    pub notification_type: NotificationType,
+}
+
+pub async fn schedule_notification(
+    State(service): State<Arc<NotificationService>>,
+    Json(request): Json<ScheduleNotificationRequest>,
+) -> StatusCode {
+    service.schedule_immediate(
+        &request.vault_id,
+        &request.owner,
+        request.notification_type,
+    );
+    StatusCode::ACCEPTED
+}
+
+/// Register a device for push notifications.
+pub async fn register_token(
+    State(service): State<Arc<NotificationService>>,
+    Json(request): Json<RegisterTokenRequest>,
+) -> Result<(StatusCode, Json<DeviceToken>), StatusCode> {
+    let owner = request.owner.clone();
+    let token_value = request.token.clone();
+    service.register_token(request);
+    let token = service
+        .get_tokens(&owner)
+        .into_iter()
+        .find(|token| token.token == token_value)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(token)))
+}
+
+/// Remove a previously registered device token.
+pub async fn unregister_token(
+    State(service): State<Arc<NotificationService>>,
+    Json(request): Json<RegisterTokenRequest>,
+) -> StatusCode {
+    service.unregister_token(&request.owner, &request.token);
+    StatusCode::NO_CONTENT
+}
+
+pub async fn get_preferences(
+    State(service): State<Arc<NotificationService>>,
+    Query(query): Query<OwnerQuery>,
+) -> Json<NotificationPreferences> {
+    Json(service.get_preferences(&query.owner))
+}
+
+pub async fn update_preferences(
+    State(service): State<Arc<NotificationService>>,
+    Json(request): Json<UpdatePreferencesRequest>,
+) -> Json<NotificationPreferences> {
+    let owner = request.owner.clone();
+    service.update_preferences(request);
+    Json(service.get_preferences(&owner))
+}
+
+pub async fn get_delivery_log(
+    State(service): State<Arc<NotificationService>>,
+    Query(query): Query<OwnerQuery>,
+) -> Json<Vec<DeliveryRecord>> {
+    Json(service.get_delivery_log(&query.owner))
+}
+
+pub async fn flush_pending_handler(
+    State(service): State<Arc<NotificationService>>,
+) -> StatusCode {
+    service.flush_pending().await;
+    StatusCode::NO_CONTENT
+}
+
+pub async fn deliver_with_fallback_handler(
+    State(service): State<Arc<NotificationService>>,
+    axum::extract::Path(notification_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let notification = service
+        .schedule
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|notification| notification.id == notification_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let (primary_ok, fallback_ok) = service.deliver_with_fallback(&notification).await;
+    Ok(Json(json!({
+        "notification_id": notification_id,
+        "primary_ok": primary_ok,
+        "fallback_ok": fallback_ok,
+    })))
 }
 
 impl NotificationService {
@@ -907,31 +1027,26 @@ impl NotificationService {
     ) -> (bool, Option<bool>) {
         let prefs = self.get_preferences(&notif.owner);
 
-        let preferred = prefs.preferred_channel.clone();
+        let preferred = prefs
+            .preferred_channel
+            .unwrap_or(NotificationChannel::Push);
         let fallback = prefs.fallback_channel.clone();
 
-        let primary_ok = if let Some(ref ch) = preferred {
-            let ok = self.try_channel_delivery(notif, ch).await;
-            self.log_channel_delivery(
-                &notif.id,
-                ch,
-                if ok {
-                    DeliveryStatus::Sent
-                } else {
-                    DeliveryStatus::Failed
-                },
-                if ok {
-                    None
-                } else {
-                    Some("primary channel failed".into())
-                },
-            );
-            ok
-        } else {
-            // No preferred channel set — use default FCM push delivery
-            let tokens = self.get_tokens(&notif.owner);
-            !tokens.is_empty()
-        };
+        let primary_ok = self.try_channel_delivery(notif, &preferred).await;
+        self.log_channel_delivery(
+            &notif.id,
+            &preferred,
+            if primary_ok {
+                DeliveryStatus::Sent
+            } else {
+                DeliveryStatus::Failed
+            },
+            if primary_ok {
+                None
+            } else {
+                Some("primary channel failed".into())
+            },
+        );
 
         if primary_ok {
             return (true, None);
@@ -1725,4 +1840,3 @@ mod tests {
         assert_eq!(data["vault_id"], "safe-vault-42");
     }
 }
-

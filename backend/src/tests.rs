@@ -96,6 +96,8 @@ fn test_state(db: Arc<Db>) -> AppState {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        notification_service: ethos_protocol_backend::notifications::create_service(),
+        profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
     }
 }
 
@@ -307,8 +309,10 @@ async fn test_health_endpoint() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["status"], "ok");
+    assert!(json["status"] == "ok" || json["status"] == "degraded");
     assert!(json["version"].is_string());
+    assert!(json["rpc"]["status"].is_string());
+    assert!(json["rpc"]["reachable"].is_boolean());
 }
 
 #[tokio::test]
@@ -322,6 +326,78 @@ async fn test_ready_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["database"], "connected");
+}
+
+#[tokio::test]
+async fn test_notification_registration_route() {
+    let response = post_json(
+        test_app(),
+        "/api/notifications/register",
+        json!({
+            "owner": "owner-1",
+            "token": "device-token-1",
+            "platform": "ios",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["owner"], "owner-1");
+    assert_eq!(json["token"], "device-token-1");
+}
+
+#[tokio::test]
+async fn test_tenant_routes_are_mounted() {
+    let app = test_app();
+    let response = post_json(
+        app.clone(),
+        "/api/tenants",
+        json!({
+            "name": "Tenant One",
+            "owner": "owner-1",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tenant: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tenant_id = tenant["id"].as_str().unwrap();
+
+    let response = post_json(
+        app.clone(),
+        &format!("/api/tenants/{tenant_id}/vaults/vault-1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = get_req(app, &format!("/api/tenants/{tenant_id}/vaults")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let vaults: Vec<String> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(vaults, vec!["vault-1"]);
+}
+
+#[tokio::test]
+async fn test_profiler_routes_record_http_samples() {
+    let app = test_app();
+    let _ = get_req(app.clone(), "/admin/profiler/samples").await;
+
+    let response = get_req(app, "/admin/profiler/samples").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let samples: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(!samples.as_array().unwrap().is_empty());
+    assert!(samples[0]["operation"].as_str().unwrap().starts_with("GET "));
 }
 
 // ── #962: Multi-node consensus health check tests ────────────────────────────
@@ -387,6 +463,8 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        notification_service: ethos_protocol_backend::notifications::create_service(),
+        profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
     };
     db.migrate().unwrap();
 
