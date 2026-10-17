@@ -7008,7 +7008,7 @@ fn test_check_in_with_geo_basic() {
 }
 
 #[test]
-fn test_check_in_with_geo_records_location() {
+fn test_check_in_with_geo_does_not_store_location() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
     let passkey_hash = BytesN::<32>::random(&env);
@@ -7024,7 +7024,16 @@ fn test_check_in_with_geo_records_location() {
     ).unwrap();
 
     let geo_log = client.get_geo_checkin_log(&vault_id);
-    assert!(geo_log.len() > 0);
+    assert!(geo_log.is_empty());
+
+    let has_geo_event = env.events().all().iter().any(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val::<soroban_sdk::Symbol>(&env).ok())
+            .is_some_and(|topic| topic == symbol_short!("ci_geo"))
+    });
+    assert!(!has_geo_event);
 }
 
 #[test]
