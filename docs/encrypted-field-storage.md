@@ -134,6 +134,8 @@ let (new_field, result) = engine.rotate_field(&field, 2)?;
 
 ## Development / test mode
 
-If `FIELD_ENCRYPTION_KEY_<N>` is not set in the environment the engine falls
-back to a zero-key for that version.  A `tracing::warn` is emitted.  **Never
-deploy without setting real keys.**
+In development, a missing `FIELD_ENCRYPTION_KEY_<N>` falls back to a zero-key
+and emits a `tracing::warn`. In production (`APP_ENV=production`), startup
+requires the active version's key and the engine will not substitute the
+development key for missing versions. **Never deploy without setting real
+keys.**

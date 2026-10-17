@@ -11,6 +11,10 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    acl::{
+        acl_audit_trail, acl_enforce_middleware, create_acl_rule, delete_acl_rule,
+        list_acl_rules, require_admin_key_middleware, AclStore,
+    },
     aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
     alert_rules::{
         create_alert_rule, delete_alert_rule, evaluate_alerts, get_alert_rule, list_alert_rules,
@@ -25,6 +29,7 @@ use ethos_protocol_backend::{
         create_rollback_plan, get_rollback_plan, list_rollback_history, list_rollback_plans,
         run_post_deployment_tests, trigger_rollback, RollbackState,
     },
+    audit::audit_middleware,
     blue_green::{
         create_blue_green_deployment, get_blue_green_deployment, list_blue_green_deployments,
         report_health as bg_report_health, rollback_blue_green, switch_traffic, BlueGreenState,
@@ -116,6 +121,22 @@ fn build_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers(tower_http::cors::Any)
+}
+
+fn attach_security_middleware(
+    router: Router,
+    audit_db: Arc<Db>,
+    acl_store: Arc<AclStore>,
+) -> Router {
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            acl_store,
+            acl_enforce_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            audit_db,
+            audit_middleware,
+        ))
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
@@ -273,6 +294,11 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    if let Err(error) = ethos_protocol_backend::security_settings::validate_startup() {
+        tracing::error!(%error, "invalid production security configuration");
+        std::process::exit(1);
+    }
+
     // Check contract version before proceeding with server startup
     let min_contract_version =
         parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());
@@ -410,18 +436,8 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
     };
-
-    // ── Dynamic ACL admin routes ─────────────────────────────────────────
-    // NOTE: ACL functionality is pending implementation.
-    // When implemented, uncomment the following and ensure AclStore and handlers
-    // are properly defined:
-    // let acl_store = AclStore::new();
-    // let acl_router = Router::new()
-    //     .route("/admin/acl", post(create_acl_rule).get(list_acl_rules))
-    //     .route("/admin/acl/:id", delete(delete_acl_rule))
-    //     .route("/admin/acl/audit", get(acl_audit_trail))
-    //     .with_state(acl_store);
 
     // ── Custom metrics + Grafana dashboard routes ────────────────────────
     // NOTE: Custom metrics functionality is pending implementation.
@@ -640,8 +656,22 @@ async fn main() {
         .route("/sla/compliance", get(get_compliance_summary))
         .with_state(sla_state);
 
+    let audit_db = Arc::clone(&state.db);
+    let acl_store = AclStore::new();
+    let acl_router = Router::new()
+        .route(
+            "/admin/acl",
+            post(create_acl_rule).get(list_acl_rules),
+        )
+        .route("/admin/acl/:id", delete(delete_acl_rule))
+        .route("/admin/acl/audit", get(acl_audit_trail))
+        .route_layer(axum::middleware::from_fn(
+            require_admin_key_middleware,
+        ))
+        .with_state(Arc::clone(&acl_store));
+
     let app = build_router(state)
-        // .merge(acl_router)
+        .merge(acl_router)
         // .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
@@ -650,6 +680,7 @@ async fn main() {
         .merge(cost_router)
         .merge(dr_router)
         .merge(sla_router);
+    let app = attach_security_middleware(app, audit_db, acl_store);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
