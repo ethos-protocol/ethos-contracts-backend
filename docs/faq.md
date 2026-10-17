@@ -152,10 +152,11 @@ Capped at 30 days per call. Cannot push expiry to the current time.
 
 ### What happens if Soroban archives my vault state?
 
-Vault data is not deleted — it is archived. You or anyone else can restore it:
+Vault data is not deleted — it is archived. The vault owner or contract admin
+can restore it:
 
 ```rust
-restore_vault(vault_id)
+restore_vault(vault_id, caller)
 ```
 
 `trigger_release` will also automatically attempt restoration before transferring funds. See [docs/ttl-logic.md](ttl-logic.md#vault-archival-and-restoration).

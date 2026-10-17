@@ -8204,21 +8204,28 @@ impl TtlVaultContract {
 
     /// Restores an archived vault's persistent storage entry by re-extending its TTL.
     ///
-    /// Soroban archives persistent entries when their TTL expires. This function
-    /// restores the vault entry so it becomes accessible again. Anyone can call this
-    /// to unblock a beneficiary from triggering release on an archived vault.
+    /// Soroban archives persistent entries when their TTL expires. The vault owner
+    /// or contract admin can restore the entry directly; `trigger_release` also
+    /// attempts restoration internally.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault to restore
+    /// * `caller` - Must be the vault owner or contract admin
     ///
     /// # Panics
-    /// Panics if the vault does not exist (was never created or has been permanently deleted)
-    pub fn restore_vault(env: Env, vault_id: u64) {
+    /// Panics if the caller is not the vault owner or admin, or the vault does
+    /// not exist (was never created or has been permanently deleted).
+    pub fn restore_vault(env: Env, vault_id: u64, caller: Address) {
+        caller.require_auth();
+        let admin = Self::load_admin(&env);
         // Extending TTL on an archived entry restores it. If the entry no longer
         // exists at all, load_vault will panic with VaultNotFound. Re-saving also
         // re-materializes a compressed vault (Issue #558) and extends its TTL.
         let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner && caller != admin {
+            panic_with_error!(&env, ContractError::NotOwner);
+        }
         Self::save_vault(&env, vault_id, &vault);
         // Clear any stale archived-info snapshot now that the vault is live again.
         env.storage()

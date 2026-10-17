@@ -59,13 +59,15 @@ Returns `Some(ArchivedVaultInfo)` if a snapshot exists, `None` if the vault is l
 
 ### Restoring an Archived Vault
 
-Anyone can restore an archived vault by calling:
+The vault owner or contract admin can restore an archived vault by calling:
 
 ```rust
-restore_vault(vault_id)
+restore_vault(vault_id, caller)
 ```
 
-This re-extends the persistent entry TTL so the vault becomes accessible again. It also removes any stale archived-info snapshot and emits a `v_restore` event.
+The caller must authorize the call. Restoration re-extends the persistent
+entry TTL so the vault becomes accessible again. It also removes any stale
+archived-info snapshot and emits a `v_restore` event.
 
 ### Automatic Restoration in `trigger_release`
 
