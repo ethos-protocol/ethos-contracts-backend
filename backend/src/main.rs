@@ -78,6 +78,7 @@ use ethos_protocol_backend::{
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
+    saml::{self, AttributeMapping, SamlConfig, SamlState},
     schema_validation::{openapi_validation_middleware, OpenApiSpec},
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
@@ -196,6 +197,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        // ── Enterprise SSO ──────────────────────────────────────────────────
+        .route("/saml/metadata", get(saml::get_metadata))
+        .route("/saml/login", get(saml::initiate_login))
+        .route("/saml/acs", post(saml::assertion_consumer_service))
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",
@@ -386,6 +391,10 @@ async fn main() {
     let webhook_state = Arc::new(WebhookState::new());
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+    let saml_state = SamlConfig::from_env()
+        .expect("invalid SAML configuration")
+        .map(|config| Arc::new(SamlState::new(config, AttributeMapping::default())))
+        .unwrap_or_else(|| Arc::new(SamlState::disabled()));
 
     let state = AppState {
         db: Arc::clone(&db),
@@ -410,6 +419,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        saml_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

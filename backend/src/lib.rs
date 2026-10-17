@@ -79,6 +79,7 @@ pub mod rpc_pool;
 pub mod saga;
 pub mod scheduler;
 pub mod sla;
+pub mod saml;
 pub mod secret_rotation;
 pub mod streaming;
 pub mod structured_logging;

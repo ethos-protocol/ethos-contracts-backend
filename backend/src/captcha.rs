@@ -602,6 +602,7 @@ mod tests {
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
             deadlock_detector: Arc::new(DeadlockDetector::new()),
+            saml_state: Arc::new(crate::saml::SamlState::disabled()),
         }
     }
 

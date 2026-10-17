@@ -96,6 +96,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
     }
 }
 
@@ -312,6 +313,12 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn saml_routes_are_mounted_and_fail_closed_when_unconfigured() {
+    let res = get_req(test_app(), "/saml/metadata").await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn test_ready_endpoint() {
     let app = test_app();
     let res = get_req(app, "/ready").await;
@@ -387,6 +394,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
     };
     db.migrate().unwrap();
 
