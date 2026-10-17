@@ -90,6 +90,10 @@ fn generate_otp_code() -> String {
     format!("{:06}", rng.gen_range(0..1_000_000))
 }
 
+fn mask_contact() -> &'static str {
+    "[REDACTED]"
+}
+
 fn generate_totp_secret() -> String {
     let mut rng = rand::thread_rng();
     let bytes: Vec<u8> = (0..20).map(|_| rng.gen()).collect();
@@ -332,7 +336,11 @@ pub async fn enable_2fa(
             };
             db.upsert_2fa_config(&config)?;
 
-            tracing::info!(vault_id, phone, code, "SMS OTP sent");
+            tracing::info!(
+                vault_id,
+                phone = mask_contact(),
+                "SMS OTP sent"
+            );
 
             Ok(Json(Enable2FAResponse {
                 vault_id,
@@ -374,7 +382,11 @@ pub async fn enable_2fa(
             };
             db.upsert_2fa_config(&config)?;
 
-            tracing::info!(vault_id, email, code, "Email OTP sent");
+            tracing::info!(
+                vault_id,
+                email = mask_contact(),
+                "Email OTP sent"
+            );
 
             Ok(Json(Enable2FAResponse {
                 vault_id,
@@ -496,7 +508,24 @@ pub async fn clear_2fa_session(Path(vault_id): Path<String>) -> Result<StatusCod
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::{
+        io::{self, Write},
+        sync::{Barrier, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn config_with_codes(vault_id: &str, codes: &[&str]) -> TwoFactorConfig {
         TwoFactorConfig {
@@ -522,6 +551,59 @@ mod tests {
             assert_eq!(code.len(), 10);
             assert!(code.chars().all(|c| c.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn sms_and_email_otp_logs_scrub_contacts_and_codes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(async {
+                enable_2fa(
+                    State(Arc::clone(&db)),
+                    Path("sms-vault".to_string()),
+                    Json(Enable2FARequest {
+                        method: TwoFactorMethod::Sms,
+                        phone: Some("+1-202-555-0178".to_string()),
+                        email: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                enable_2fa(
+                    State(db),
+                    Path("email-vault".to_string()),
+                    Json(Enable2FARequest {
+                        method: TwoFactorMethod::Email,
+                        phone: None,
+                        email: Some("person@example.com".to_string()),
+                    }),
+                )
+                .await
+                .unwrap();
+            });
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("SMS OTP sent"));
+        assert!(output.contains("Email OTP sent"));
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("+1-202-555-0178"));
+        assert!(!output.contains("person@example.com"));
+        assert!(
+            !output
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|part| part.len() == 6),
+            "OTP log output must not contain a six-digit code: {output}"
+        );
     }
 
     #[test]

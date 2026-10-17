@@ -91,7 +91,14 @@ pub fn log_state_modification(
 pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     let api_key = std::env::var("ADMIN_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        return Ok(());
+        if !crate::security_settings::is_production() {
+            return Ok(());
+        }
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "valid admin API key required",
+        ));
     }
     let auth_header = headers
         .get("authorization")

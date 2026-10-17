@@ -45,9 +45,12 @@ Client                Backend                   Authenticator
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEBAUTHN_RP_ID` | `localhost` | Relying Party ID — must match the domain serving the frontend |
+| `WEBAUTHN_RP_ID` | `localhost` (development only) | Relying Party ID — must match the domain serving the frontend |
 | `WEBAUTHN_RP_NAME` | `Ethos Protocol` | Human-readable name shown by authenticators |
-| `WEBAUTHN_ORIGIN` | `http://localhost:3000` | Exact origin of your frontend (`scheme://host[:port]`) |
+| `WEBAUTHN_ORIGIN` | `http://localhost:3000` (development only) | Exact origin of your frontend (`scheme://host[:port]`) |
+
+Production startup requires explicit `WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN`
+values; it will not use the localhost defaults.
 
 Set these before starting the backend:
 

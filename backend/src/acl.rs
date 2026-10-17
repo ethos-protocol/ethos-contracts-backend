@@ -183,6 +183,14 @@ pub async fn acl_enforce_middleware(
     next.run(req).await
 }
 
+/// Require the configured admin bearer key on ACL management endpoints.
+pub async fn require_admin_key_middleware(req: Request<Body>, next: Next) -> Response {
+    if let Err(error) = crate::audit::authorize_admin(req.headers()) {
+        return error.into_response();
+    }
+    next.run(req).await
+}
+
 /// `POST /admin/acl` - create a new dynamic ACL rule.
 pub async fn create_acl_rule(
     State(store): State<Arc<AclStore>>,
