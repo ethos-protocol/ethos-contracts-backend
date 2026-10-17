@@ -25,8 +25,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use crate::clock::{Clock, SystemClock};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Standard severity classification for an incident.
@@ -151,12 +153,18 @@ pub fn create_incident_store() -> IncidentStore {
 #[derive(Clone)]
 pub struct IncidentState {
     pub store: IncidentStore,
+    clock: Arc<dyn Clock>,
 }
 
 impl IncidentState {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             store: create_incident_store(),
+            clock,
         }
     }
 }
@@ -167,22 +175,26 @@ impl Default for IncidentState {
     }
 }
 
-fn timeline_entry(actor: impl Into<String>, note: impl Into<String>) -> TimelineEntry {
+fn timeline_entry_at(
+    actor: impl Into<String>,
+    note: impl Into<String>,
+    now: DateTime<Utc>,
+) -> TimelineEntry {
     TimelineEntry {
         id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
+        timestamp: now,
         actor: actor.into(),
         note: note.into(),
     }
 }
 
-fn new_incident(
+fn new_incident_at(
     title: String,
     description: String,
     severity: IncidentSeverity,
     assigned_to: Option<String>,
+    now: DateTime<Utc>,
 ) -> Incident {
-    let now = Utc::now();
     let deadline = now + Duration::minutes(severity.acknowledgment_timeout_minutes());
     Incident {
         id: Uuid::new_v4().to_string(),
@@ -192,7 +204,7 @@ fn new_incident(
         status: IncidentStatus::Open,
         escalation_level: 0,
         assigned_to,
-        timeline: vec![timeline_entry("system", "incident opened")],
+        timeline: vec![timeline_entry_at("system", "incident opened", now)],
         created_at: now,
         updated_at: now,
         acknowledged_at: None,
@@ -211,7 +223,17 @@ pub fn open_incident(
     description: impl Into<String>,
     severity: IncidentSeverity,
 ) -> Incident {
-    let incident = new_incident(title.into(), description.into(), severity, None);
+    open_incident_at(store, title, description, severity, SystemClock.now())
+}
+
+fn open_incident_at(
+    store: &IncidentStore,
+    title: impl Into<String>,
+    description: impl Into<String>,
+    severity: IncidentSeverity,
+    now: DateTime<Utc>,
+) -> Incident {
+    let incident = new_incident_at(title.into(), description.into(), severity, None, now);
 
     tracing::warn!(
         incident_id = %incident.id,
@@ -228,7 +250,13 @@ pub async fn create_incident(
     State(state): State<Arc<IncidentState>>,
     Json(body): Json<CreateIncidentRequest>,
 ) -> (StatusCode, Json<Incident>) {
-    let mut incident = open_incident(&state.store, body.title, body.description, body.severity);
+    let mut incident = open_incident_at(
+        &state.store,
+        body.title,
+        body.description,
+        body.severity,
+        state.clock.now(),
+    );
     incident.assigned_to = body.assigned_to.clone();
     state
         .store
@@ -262,8 +290,9 @@ pub async fn add_timeline_entry(
 ) -> Result<Json<Incident>, StatusCode> {
     let mut store = state.store.lock().unwrap();
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
-    incident.timeline.push(timeline_entry(body.actor, body.note));
-    incident.updated_at = Utc::now();
+    let now = state.clock.now();
+    incident.timeline.push(timeline_entry_at(body.actor, body.note, now));
+    incident.updated_at = now;
     Ok(Json(incident.clone()))
 }
 
@@ -277,13 +306,14 @@ pub async fn acknowledge_incident(
     let mut store = state.store.lock().unwrap();
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    let now = Utc::now();
+    let now = state.clock.now();
     incident.acknowledged_at = Some(now);
     incident.acknowledgment_deadline = None;
     incident.updated_at = now;
-    incident.timeline.push(timeline_entry(
+    incident.timeline.push(timeline_entry_at(
         body.actor,
         format!("acknowledged at escalation tier {}", incident.escalation_level),
+        now,
     ));
 
     Ok(Json(incident.clone()))
@@ -301,8 +331,9 @@ pub async fn update_incident_status(
 
     let note = format!("status changed from {:?} to {:?}", incident.status, body.status);
     incident.status = body.status;
-    incident.updated_at = Utc::now();
-    incident.timeline.push(timeline_entry(body.actor, note));
+    let now = state.clock.now();
+    incident.updated_at = now;
+    incident.timeline.push(timeline_entry_at(body.actor, note, now));
 
     Ok(Json(incident.clone()))
 }
@@ -312,22 +343,26 @@ pub async fn update_incident_status(
 ///
 /// Returns `true` if the incident was escalated, `false` if it was already
 /// acknowledged (and therefore needs no escalation).
-fn escalate_to_next_tier(incident: &mut Incident, reason: &str) -> bool {
+fn escalate_to_next_tier_at(
+    incident: &mut Incident,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> bool {
     if incident.acknowledged_at.is_some() {
         return false;
     }
 
-    let now = Utc::now();
     incident.escalation_level += 1;
     incident.acknowledgment_deadline =
         Some(now + Duration::minutes(incident.severity.acknowledgment_timeout_minutes()));
     incident.updated_at = now;
-    incident.timeline.push(timeline_entry(
+    incident.timeline.push(timeline_entry_at(
         "system",
         format!(
             "escalated to tier {}: {}",
             incident.escalation_level, reason
         ),
+        now,
     ));
 
     true
@@ -342,8 +377,11 @@ pub async fn escalate_incident(
     let mut store = state.store.lock().unwrap();
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    escalate_to_next_tier(incident, &body.reason);
-    incident.timeline.push(timeline_entry(body.actor, "requested escalation"));
+    let now = state.clock.now();
+    escalate_to_next_tier_at(incident, &body.reason, now);
+    incident
+        .timeline
+        .push(timeline_entry_at(body.actor, "requested escalation", now));
 
     Ok(Json(incident.clone()))
 }
@@ -357,7 +395,13 @@ pub async fn escalate_incident(
 ///
 /// Returns the incidents that were escalated.
 pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Vec<Incident> {
-    let now = Utc::now();
+    enforce_acknowledgment_timeouts_at(store, SystemClock.now())
+}
+
+pub fn enforce_acknowledgment_timeouts_at(
+    store: &IncidentStore,
+    now: DateTime<Utc>,
+) -> Vec<Incident> {
     let mut escalated = Vec::new();
     let mut store = store.lock().unwrap();
 
@@ -372,7 +416,7 @@ pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Vec<Incident> {
             .acknowledgment_deadline
             .map(|deadline| deadline <= now)
             .unwrap_or(false);
-        if overdue && escalate_to_next_tier(incident, "acknowledgment timeout") {
+        if overdue && escalate_to_next_tier_at(incident, "acknowledgment timeout", now) {
             escalated.push(incident.clone());
         }
     }
@@ -383,21 +427,57 @@ pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Vec<Incident> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
+
+    fn test_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_incident_uses_injected_clock() {
+        let now = test_now();
+        let state = Arc::new(IncidentState::with_clock(Arc::new(ManualClock::new(now))));
+        let (_, Json(incident)) = create_incident(
+            State(state),
+            Json(CreateIncidentRequest {
+                title: "clock test".into(),
+                description: "deterministic timestamp".into(),
+                severity: IncidentSeverity::Sev1,
+                assigned_to: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(incident.created_at, now);
+        assert_eq!(incident.updated_at, now);
+        assert_eq!(incident.timeline[0].timestamp, now);
+        assert_eq!(
+            incident.acknowledgment_deadline,
+            Some(now + Duration::minutes(5))
+        );
+    }
 
     #[test]
     fn on_time_acknowledgment_prevents_escalation() {
         let store = create_incident_store();
-        let incident = open_incident(&store, "db down", "primary db unreachable", IncidentSeverity::Sev1);
+        let now = test_now();
+        let incident = open_incident_at(
+            &store,
+            "db down",
+            "primary db unreachable",
+            IncidentSeverity::Sev1,
+            now,
+        );
 
         // Acknowledge before the deadline elapses.
         {
             let mut guard = store.lock().unwrap();
             let stored = guard.get_mut(&incident.id).unwrap();
-            stored.acknowledged_at = Some(Utc::now());
+            stored.acknowledged_at = Some(now);
             stored.acknowledgment_deadline = None;
         }
 
-        let escalated = enforce_acknowledgment_timeouts(&store);
+        let escalated = enforce_acknowledgment_timeouts_at(&store, now);
         assert!(escalated.is_empty(), "acknowledged incident must not escalate");
 
         let guard = store.lock().unwrap();
@@ -408,22 +488,30 @@ mod tests {
     #[test]
     fn timeout_escalates_to_next_tier() {
         let store = create_incident_store();
-        let incident = open_incident(&store, "api latency", "p99 above threshold", IncidentSeverity::Sev2);
+        let now = test_now();
+        let incident = open_incident_at(
+            &store,
+            "api latency",
+            "p99 above threshold",
+            IncidentSeverity::Sev2,
+            now,
+        );
 
         // Force the deadline into the past to simulate an unacknowledged timeout.
         {
             let mut guard = store.lock().unwrap();
             let stored = guard.get_mut(&incident.id).unwrap();
-            stored.acknowledgment_deadline = Some(Utc::now() - Duration::minutes(1));
+            stored.acknowledgment_deadline = Some(now - Duration::minutes(1));
         }
 
-        let escalated = enforce_acknowledgment_timeouts(&store);
+        let enforce_at = now;
+        let escalated = enforce_acknowledgment_timeouts_at(&store, enforce_at);
         assert_eq!(escalated.len(), 1);
         assert_eq!(escalated[0].escalation_level, 1);
 
         let guard = store.lock().unwrap();
         let stored = guard.get(&incident.id).unwrap();
         assert_eq!(stored.escalation_level, 1);
-        assert!(stored.acknowledgment_deadline.unwrap() > Utc::now());
+        assert!(stored.acknowledgment_deadline.unwrap() > enforce_at);
     }
 }

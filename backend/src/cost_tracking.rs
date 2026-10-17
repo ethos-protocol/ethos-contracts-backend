@@ -26,12 +26,12 @@
 //! - `GET /admin/cost/optimizations` — optimization suggestions
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::clock::{Clock, SystemClock};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// A single recorded cost entry, e.g. "this DB query cost $0.0003".
@@ -271,14 +271,20 @@ pub struct CostState {
     thresholds: Mutex<Vec<BudgetThreshold>>,
     /// Gas (on-chain fee) entries recorded via `POST /admin/cost/gas`.
     gas_entries: Mutex<Vec<GasCostEntry>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl CostState {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
             thresholds: Mutex::new(Vec::new()),
             gas_entries: Mutex::new(Vec::new()),
+            clock,
         }
     }
 
@@ -391,7 +397,7 @@ impl CostState {
             breached_thresholds: breaches.len(),
             top_fiat_operations: fiat_ops,
             top_gas_operations: gas_ops,
-            generated_at: Utc::now(),
+            generated_at: self.clock.now(),
         }
     }
 
@@ -675,7 +681,7 @@ pub async fn record_cost_entry(
         tags: body.tags,
         amount: body.amount,
         currency: body.currency,
-        recorded_at: Utc::now(),
+        recorded_at: state.clock.now(),
     };
     state.record(entry.clone());
 
@@ -772,7 +778,7 @@ pub async fn record_gas_cost(
         fee_stroops: body.fee_stroops,
         ledger_sequence: body.ledger_sequence,
         tags: body.tags,
-        recorded_at: Utc::now(),
+        recorded_at: state.clock.now(),
     };
     state.record_gas(entry.clone());
 
@@ -803,6 +809,11 @@ pub async fn get_optimization_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
+
+    fn test_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
 
     fn entry(operation: &str, team: &str, amount: f64) -> CostEntry {
         let mut tags = HashMap::new();
@@ -813,7 +824,7 @@ mod tests {
             tags,
             amount,
             currency: "USD".to_string(),
-            recorded_at: Utc::now(),
+            recorded_at: test_now(),
         }
     }
 
@@ -863,7 +874,7 @@ mod tests {
             fee_stroops,
             ledger_sequence: ledger,
             tags: HashMap::new(),
-            recorded_at: Utc::now(),
+            recorded_at: test_now(),
         }
     }
 
@@ -944,6 +955,14 @@ mod tests {
         assert_eq!(dash.breached_thresholds, 0);
         assert!(dash.top_fiat_operations.is_empty());
         assert!(dash.top_gas_operations.is_empty());
+    }
+
+    #[test]
+    fn dashboard_uses_injected_clock() {
+        let now = test_now();
+        let state = CostState::with_clock(Arc::new(ManualClock::new(now)));
+
+        assert_eq!(state.dashboard().generated_at, now);
     }
 
     #[test]
