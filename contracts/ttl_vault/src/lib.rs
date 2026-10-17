@@ -531,6 +531,7 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    InvalidToken = 140,
 }
 
 #[contract]
@@ -562,6 +563,12 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidAdmin);
         }
         admin.require_auth();
+        if token::Client::new(&env, &xlm_token)
+            .try_balance(&env.current_contract_address())
+            .is_err()
+        {
+            panic_with_error!(&env, ContractError::InvalidToken);
+        }
         env.storage()
             .instance()
             .set(&DataKey::TokenAddress, &xlm_token);

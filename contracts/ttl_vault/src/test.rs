@@ -89,6 +89,21 @@ fn test_initialize_guard_against_double_init() {
 }
 
 #[test]
+fn test_initialize_rejects_address_without_token_interface() {
+    let (env, _, _, admin, _, client) = setup();
+    let not_a_token = Address::generate(&env);
+
+    let err = client
+        .try_initialize(&not_a_token, &admin)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidToken as u32)
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #20)")]
 fn test_initialize_rejects_same_xlm_token_and_admin() {
     let env = Env::default();
@@ -7227,4 +7242,3 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
-
