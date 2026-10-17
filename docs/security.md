@@ -38,6 +38,10 @@ threshold or multi-party approval for these operations.
 - Use a multisig or governance-controlled address for the admin role and
   document who controls it operationally. The contract itself does not enforce
   this recommendation.
+- At initialization, the token address is checked for the standard token
+  interface. This is a compatibility check, not proof that it is the
+  canonical XLM contract; deployment operators must verify the network-specific
+  address from a trusted source.
 - Admin actions are published on-chain.
 
 ### 4. Re-initialization Attack

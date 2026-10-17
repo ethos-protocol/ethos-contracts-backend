@@ -8593,19 +8593,17 @@ impl TtlVaultContract {
 
     // ── Issue: Geographic Check-in Tracking ───────────────────────────────────
 
-    /// Records a check-in with geographic location metadata for security and anomaly detection.
+    /// Legacy API for check-ins that previously accepted geographic metadata.
     ///
-    /// Legacy API that delegates to `check_in` for vault validation. Geographic
-    /// arguments are deliberately ignored because on-chain storage and events
-    /// are public.
+    /// Delegates to `check_in` for vault validation. Geographic arguments are
+    /// retained for compatibility but ignored because on-chain storage and
+    /// events are public.
     ///
     /// # Arguments
     /// * `vault_id`        - The vault to check in
     /// * `caller`          - Must be the vault owner
     /// * `passkey_hash`    - Passkey used for this check-in
-    /// * `latitude_micro`  - Latitude in microdegrees (e.g. 37_422_000 = 37.422°)
-    /// * `longitude_micro` - Longitude in microdegrees
-    /// * `country_code`    - ISO 3166-1 alpha-2 country code (e.g. "US")
+    /// * Geographic arguments are ignored and are not stored or emitted.
     ///
     /// # Errors
     /// Same as `check_in`.
