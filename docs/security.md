@@ -22,13 +22,23 @@
 
 ### 3. Admin Abuse
 
-**Risk**: Admin pauses contract or changes configuration maliciously
+**Risk**: The contract stores one admin address, and that address alone
+authorizes pausing, token whitelisting, and contract upgrades. A compromised or
+malicious admin can disrupt service, change accepted tokens, or replace the
+contract logic and its security guarantees. The contract does not require
+threshold or multi-party approval for these operations.
 
 **Mitigations**:
-- Admin cannot access vault funds
-- Admin cannot change vault owners or beneficiaries
-- Two-step admin transfer with `propose_admin` and `accept_admin`
-- Transparent on-chain actions
+- The admin cannot directly call owner-only vault operations or transfer vault
+  funds under the current implementation; however, its upgrade authority can
+  replace those protections.
+- `propose_admin` and `accept_admin` provide a two-step, time-locked admin
+  transfer. This does not delay or require additional approval for actions by
+  the current admin.
+- Use a multisig or governance-controlled address for the admin role and
+  document who controls it operationally. The contract itself does not enforce
+  this recommendation.
+- Admin actions are published on-chain.
 
 ### 4. Re-initialization Attack
 
