@@ -90,6 +90,8 @@ pub struct AppState {
     /// consensus reconciliation job (#373), so a conflict opens the same
     /// kind of record a manually-filed incident would.
     pub incident_state: Arc<crate::incidents::IncidentState>,
+    /// In-memory deny-list shared by token revocation and authentication.
+    pub token_revocations: Arc<crate::token_revocation::RevocationList>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -107,6 +109,12 @@ impl axum::extract::FromRef<AppState> for Arc<AppState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
     fn from_ref(state: &AppState) -> Arc<crate::webhook::WebhookState> {
         Arc::clone(&state.webhook_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::token_revocation::RevocationList> {
+    fn from_ref(state: &AppState) -> Arc<crate::token_revocation::RevocationList> {
+        Arc::clone(&state.token_revocations)
     }
 }
 

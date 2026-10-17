@@ -96,6 +96,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
     }
 }
 
@@ -387,6 +388,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
     };
     db.migrate().unwrap();
 
