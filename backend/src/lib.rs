@@ -19,6 +19,7 @@ pub mod bulk_operations;
 pub mod cache;
 pub mod cache_partition;
 pub mod canary;
+pub mod cdc;
 pub mod cdc_lag;
 pub mod chaos;
 pub mod circuit_breaker;
