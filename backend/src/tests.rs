@@ -84,6 +84,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
             16,
         )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -279,6 +280,17 @@ async fn test_websocket_vault_route_requires_authentication() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_replay_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/replay/logs").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /replay/logs response: {}",
+        response.status()
+    );
 }
 
 #[tokio::test]

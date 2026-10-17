@@ -271,6 +271,23 @@ pub fn build_router(state: AppState) -> Router {
             "/ws/vaults/:vault_id/heartbeat",
             get(ethos_protocol_backend::websocket::heartbeat_vault_websocket_handler),
         )
+        // ── Request replay operator routes (#73) ────────────────────────────
+        .route(
+            "/replay",
+            post(ethos_protocol_backend::replay::replay_handler),
+        )
+        .route(
+            "/replay/batch",
+            post(ethos_protocol_backend::replay::batch_replay_handler),
+        )
+        .route(
+            "/replay/logs",
+            get(ethos_protocol_backend::replay::list_logs_handler),
+        )
+        .route(
+            "/replay/logs/:log_id",
+            get(ethos_protocol_backend::replay::get_log_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -438,6 +455,7 @@ async fn main() {
         vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
             1024,
         )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -452,6 +470,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

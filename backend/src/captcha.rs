@@ -581,6 +581,7 @@ mod tests {
             consensus: NodeCache::from_env(),
             webhook_state: Arc::new(WebhookState::new()),
             vault_broadcaster: Arc::new(crate::websocket::VaultBroadcaster::new(16)),
+            request_log_store: crate::replay::create_request_log_store(),
             graphql_schema,
             metrics: Metrics::new(),
             priority_enforcer: Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
@@ -603,6 +604,7 @@ mod tests {
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
             deadlock_detector: Arc::new(DeadlockDetector::new()),
+            incident_state: Arc::new(crate::incidents::IncidentState::new()),
         }
     }
 
