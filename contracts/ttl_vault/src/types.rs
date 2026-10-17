@@ -811,11 +811,19 @@ pub struct PasskeyEscrowRecord {
     pub escrowed_at: u64,
 }
 
-/// Backup code entry - Issue #393
+/// Legacy plaintext backup-code entry, retained for storage migration.
 #[contracttype]
 #[derive(Clone)]
 pub struct BackupCode {
     pub code: String,
+    pub used: bool,
+}
+
+/// Hash-only backup code entry for newly generated recovery codes.
+#[contracttype]
+#[derive(Clone)]
+pub struct HashedBackupCode {
+    pub code_hash: BytesN<32>,
     pub used: bool,
 }
 
