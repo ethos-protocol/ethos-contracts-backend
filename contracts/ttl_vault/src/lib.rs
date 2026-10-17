@@ -3612,8 +3612,8 @@ impl TtlVaultContract {
 
     /// Applies TTL decay to a vault if no check-in for 30 days.
     ///
-    /// Anyone can call this function. If the vault hasn't been checked in for 30 days,
-    /// the TTL is reduced by the configured decay rate. This encourages regular engagement.
+    /// Only the vault owner can call this function. If the vault hasn't been checked in
+    /// for 30 days, the TTL is reduced by the configured decay rate.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -3631,6 +3631,7 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
+        vault.owner.require_auth();
 
         let decay_rate = Self::get_ttl_decay_rate(env.clone());
         if decay_rate == 0 {

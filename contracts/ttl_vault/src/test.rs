@@ -189,6 +189,18 @@ fn test_legacy_backup_codes_migrate_to_hashes_when_used() {
 }
 
 #[test]
+fn test_apply_ttl_decay_requires_vault_owner_auth() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    assert!(client.try_apply_ttl_decay(&vault_id).is_err());
+
+    env.mock_all_auths();
+    client.apply_ttl_decay(&vault_id).unwrap();
+}
+
+#[test]
 fn test_initialize_guard_against_double_init() {
     let (env, _, _, admin, token_address, client) = setup();
 
