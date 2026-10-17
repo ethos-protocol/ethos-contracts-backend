@@ -7251,3 +7251,23 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
+
+#[test]
+fn test_get_vault_batch_status_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..20 {
+        vault_ids.push_back(vault_id);
+    }
+
+    assert!(client.get_vault_batch_status(&vault_ids).is_empty());
+    vault_ids.push_back(20);
+    let err = client
+        .try_get_vault_batch_status(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
+}

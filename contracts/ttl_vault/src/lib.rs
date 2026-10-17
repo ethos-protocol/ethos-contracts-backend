@@ -531,6 +531,7 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    BatchSizeExceeded = 140,
 }
 
 #[contract]
@@ -12427,11 +12428,14 @@ impl TtlVaultContract {
     /// to poll many vaults efficiently.
     ///
     /// # Arguments
-    /// * `vault_ids` - List of vault IDs to query (max 20 to stay within gas limits)
+    /// * `vault_ids` - List of up to 20 vault IDs to query
     ///
     /// # Returns
     /// A vector of `VaultStatusSummary` for each found vault.
     pub fn get_vault_batch_status(env: Env, vault_ids: Vec<u64>) -> Vec<VaultStatusSummary> {
+        if vault_ids.len() > 20 {
+            panic_with_error!(&env, ContractError::BatchSizeExceeded);
+        }
         let mut results = Vec::new(&env);
         let now = env.ledger().timestamp();
         for vault_id in vault_ids.iter() {
