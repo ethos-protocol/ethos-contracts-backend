@@ -13,6 +13,7 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
+    acl::{AclEffect, AclStore, CreateAclRuleRequest},
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
@@ -27,6 +28,7 @@ use ethos_protocol_backend::{
     load_shedding::{LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
+    models::AuditLogQuery,
     predictive_scaling::{ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig},
     priority::{PriorityConfig, PriorityEnforcer},
     routes,
@@ -127,6 +129,43 @@ fn test_app_with_db(db: Arc<Db>) -> Router {
         )
         .route("/notifications/unsubscribe", get(routes::unsubscribe))
         .with_state(state)
+}
+
+#[tokio::test]
+async fn acl_middleware_denial_is_recorded_by_audit_middleware() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+    let acl_store = AclStore::new();
+    acl_store.add_rule(CreateAclRuleRequest {
+        subject: "alice".to_string(),
+        resource: "/api/protected".to_string(),
+        action: "GET".to_string(),
+        effect: AclEffect::Deny,
+        actor: Some("admin".to_string()),
+    });
+
+    let router = Router::new().route("/api/protected", get(|| async { "ok" }));
+    let app = crate::attach_security_middleware(router, Arc::clone(&db), acl_store);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/protected")
+                .header("x-user-id", "alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let audit_logs = db
+        .query_audit_logs(&AuditLogQuery {
+            resource: Some("/api/protected".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(audit_logs.len(), 1);
+    assert_eq!(audit_logs[0].result, "failure");
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
