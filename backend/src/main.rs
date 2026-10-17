@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
     aml::{check_address, flag_address, list_flags as list_aml_flags, unflag_address, AmlScreener},
+    acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
     alert_rules::{
         create_alert_rule, delete_alert_rule, evaluate_alerts, get_alert_rule, list_alert_rules,
         list_fired_alerts, AlertRulesState,
@@ -412,17 +413,6 @@ async fn main() {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     };
 
-    // ── Dynamic ACL admin routes ─────────────────────────────────────────
-    // NOTE: ACL functionality is pending implementation.
-    // When implemented, uncomment the following and ensure AclStore and handlers
-    // are properly defined:
-    // let acl_store = AclStore::new();
-    // let acl_router = Router::new()
-    //     .route("/admin/acl", post(create_acl_rule).get(list_acl_rules))
-    //     .route("/admin/acl/:id", delete(delete_acl_rule))
-    //     .route("/admin/acl/audit", get(acl_audit_trail))
-    //     .with_state(acl_store);
-
     // ── Custom metrics + Grafana dashboard routes ────────────────────────
     // NOTE: Custom metrics functionality is pending implementation.
     // let custom_metrics_store = CustomMetricsStore::new();
@@ -640,8 +630,15 @@ async fn main() {
         .route("/sla/compliance", get(get_compliance_summary))
         .with_state(sla_state);
 
+    let acl_store = AclStore::new();
+    let acl_router = Router::new()
+        .route("/admin/acl", post(create_acl_rule).get(list_acl_rules))
+        .route("/admin/acl/:id", delete(delete_acl_rule))
+        .route("/admin/acl/audit", get(acl_audit_trail))
+        .with_state(acl_store);
+
     let app = build_router(state)
-        // .merge(acl_router)
+        .merge(acl_router)
         // .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
