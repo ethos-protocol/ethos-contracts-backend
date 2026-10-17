@@ -258,6 +258,19 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Authenticated WebSocket vault streams ────────────────────────────
+        .route(
+            "/ws/vaults",
+            get(ethos_protocol_backend::websocket::authenticated_vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id",
+            get(ethos_protocol_backend::websocket::vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id/heartbeat",
+            get(ethos_protocol_backend::websocket::heartbeat_vault_websocket_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -422,6 +435,9 @@ async fn main() {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state,
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            1024,
+        )),
         graphql_schema,
         metrics,
         priority_enforcer,

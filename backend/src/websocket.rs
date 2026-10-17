@@ -1,14 +1,18 @@
 use crate::models::{AuthClaims, VaultEvent, WebSocketMessage};
+use axum::{
+    extract::{
+        ws::{CloseCode, CloseFrame, Message, WebSocket},
+        Path, State, WebSocketUpgrade,
+    },
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::time::{interval, Duration, Instant};
-use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,7 +43,7 @@ impl MessageRateLimiter {
     }
 }
 
-pub type WsStream = WebSocketStream<TcpStream>;
+pub type WsStream = WebSocket;
 pub type WsSink = SplitSink<WsStream, Message>;
 pub type WsSource = SplitStream<WsStream>;
 
@@ -78,55 +82,98 @@ pub fn extract_token_from_header(header_value: &str) -> Option<&str> {
     header_value.strip_prefix("Bearer ")
 }
 
+fn authenticated_vault_ids(headers: &HeaderMap) -> Result<Vec<String>, StatusCode> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_token_from_header)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let secret = std::env::var("JWT_SECRET").map_err(|_| StatusCode::UNAUTHORIZED)?;
+    validate_ws_token(token, secret.as_bytes())
+        .map(|claims| claims.vault_ids)
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+/// Upgrade an authenticated WebSocket subscription for one authorized vault.
+pub async fn vault_websocket_handler(
+    State(broadcaster): State<Arc<VaultBroadcaster>>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode> {
+    let authorized_vault_ids = authenticated_vault_ids(&headers)?;
+    if !authorized_vault_ids.contains(&vault_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(ws.on_upgrade(move |socket| async move {
+        let (sink, source) = socket.split();
+        handle_vault_stream(vault_id, broadcaster.subscribe(), sink, source).await;
+    }))
+}
+
+/// Upgrade an authenticated WebSocket subscription for all token-authorized vaults.
+pub async fn authenticated_vault_websocket_handler(
+    State(broadcaster): State<Arc<VaultBroadcaster>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode> {
+    let authorized_vault_ids = authenticated_vault_ids(&headers)?;
+
+    Ok(ws.on_upgrade(move |socket| async move {
+        let (sink, source) = socket.split();
+        handle_authenticated_vault_stream(
+            authorized_vault_ids,
+            broadcaster.subscribe(),
+            sink,
+            source,
+        )
+        .await;
+    }))
+}
+
+/// Upgrade a heartbeat-enabled subscription for one authorized vault.
+pub async fn heartbeat_vault_websocket_handler(
+    State(broadcaster): State<Arc<VaultBroadcaster>>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode> {
+    let authorized_vault_ids = authenticated_vault_ids(&headers)?;
+    if !authorized_vault_ids.contains(&vault_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(ws.on_upgrade(move |socket| async move {
+        let (sink, source) = socket.split();
+        handle_vault_stream_with_heartbeat(
+            vec![vault_id],
+            broadcaster.subscribe(),
+            sink,
+            source,
+        )
+        .await;
+    }))
+}
+
 // ── Heartbeat-aware vault stream ────────────────────────────────────────────
 
 pub async fn handle_vault_stream(
     vault_id: String,
     rx: broadcast::Receiver<VaultEvent>,
     ws_sink: WsSink,
+    ws_source: WsSource,
 ) {
-    handle_authenticated_vault_stream(vec![vault_id], rx, ws_sink).await;
+    handle_authenticated_vault_stream(vec![vault_id], rx, ws_sink, ws_source).await;
 }
 
 pub async fn handle_authenticated_vault_stream(
     authorized_vault_ids: Vec<String>,
-    mut rx: broadcast::Receiver<VaultEvent>,
-    mut ws_sink: WsSink,
+    rx: broadcast::Receiver<VaultEvent>,
+    ws_sink: WsSink,
+    ws_source: WsSource,
 ) {
-    let mut heartbeat = interval(HEARTBEAT_INTERVAL);
-    let last_pong = Instant::now();
-    let mut awaiting_pong = false;
-
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(event) if authorized_vault_ids.contains(&event.vault_id) => {
-                        let msg = WebSocketMessage {
-                            message_type: format!("{:?}", event.event_type),
-                            data: event.data,
-                        };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if ws_sink.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(_) => {} // event for a vault not authorized — skip
-                    Err(_) => break,
-                }
-            }
-            _ = heartbeat.tick() => {
-                if awaiting_pong && last_pong.elapsed() > HEARTBEAT_INTERVAL + PONG_TIMEOUT {
-                    break;
-                }
-                if ws_sink.send(Message::Ping(vec![])).await.is_err() {
-                    break;
-                }
-                awaiting_pong = true;
-            }
-        }
-    }
+    handle_vault_stream_with_heartbeat(authorized_vault_ids, rx, ws_sink, ws_source).await;
 }
 
 pub async fn read_client_frames(
@@ -172,7 +219,7 @@ pub async fn handle_vault_stream_with_heartbeat(
                             data: event.data,
                         };
                         if let Ok(json) = serde_json::to_string(&msg) {
-                            if ws_sink.send(Message::Text(json)).await.is_err() {
+                            if ws_sink.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -204,7 +251,7 @@ pub async fn handle_vault_stream_with_heartbeat(
                     let _ = ws_sink.send(Message::Close(None)).await;
                     break;
                 }
-                if ws_sink.send(Message::Ping(vec![])).await.is_err() {
+                if ws_sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
                 awaiting_pong = true;

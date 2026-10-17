@@ -81,6 +81,9 @@ fn test_state(db: Arc<Db>) -> AppState {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            16,
+        )),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -257,6 +260,25 @@ async fn test_retention_deletion_log_route_is_mounted_and_authorized() {
         "unexpected retention deletion-log response: {}",
         response.status()
     );
+}
+
+#[tokio::test]
+async fn test_websocket_vault_route_requires_authentication() {
+    let app = test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ws/vaults")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

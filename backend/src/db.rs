@@ -60,6 +60,8 @@ pub struct AppState {
     pub consensus: Arc<crate::consensus::NodeCache>,
     /// Webhook registry and HTTP delivery client (#65).
     pub webhook_state: Arc<crate::webhook::WebhookState>,
+    /// Live vault-event broadcaster used by authenticated WebSocket streams.
+    pub vault_broadcaster: Arc<crate::websocket::VaultBroadcaster>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
     /// Prometheus-style counters exposed at `/metrics`.
@@ -113,6 +115,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
     fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
         Arc::clone(&state.webhook_state.dlq_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::websocket::VaultBroadcaster> {
+    fn from_ref(state: &AppState) -> Arc<crate::websocket::VaultBroadcaster> {
+        Arc::clone(&state.vault_broadcaster)
     }
 }
 
