@@ -55,11 +55,12 @@ use types::{
     PasskeyHash, PasskeyUsageEntry, PauseRecord, PendingBeneficiaryUpdate, ProofOfLifeEntry,
     ProposalStatus, ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry,
     StateTransitionEntry, TokenCollateral, TokenConversion, TokenHedge, TokenLending,
-    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, UpgradeManifest, Vault,
-    VaultStatusSummary, VestingBonusConfig, VestingCatchUpConfig, VestingPenaltyConfig,
-    VestingPendingClaim, VestingSchedule, WhitelistEntry, WithdrawalAuditEntry, WithdrawalLimit,
-    WithdrawalReversal, WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig,
-    YieldDistributionMode, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
+    TokenRebalanceConfig, TokenStaking, TokenWeight, TtlBorrowRecord, UpgradeManifest,
+    UpgradeProposal, Vault, VaultStatusSummary, VestingBonusConfig, VestingCatchUpConfig,
+    VestingPenaltyConfig, VestingPendingClaim, VestingSchedule, WhitelistEntry,
+    WithdrawalAuditEntry, WithdrawalLimit, WithdrawalReversal, WithdrawalScheduleEntry,
+    WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
+    ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
     ADMIN_TRANSFER_COMPLETED_TOPIC, ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
     BACKUP_CODE_USED_TOPIC, BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC,
     BENEFICIARY_CAP_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC,
@@ -311,6 +312,9 @@ const ADMIN_TRANSFER_TIMELOCK: u64 = 86_400;
 /// Time-lock delay before a proposed protocol config takes effect (24 hours) — Issue #809.
 const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
 
+/// Time-lock delay before a proposed contract upgrade can be executed.
+const UPGRADE_TIMELOCK: u64 = 86_400;
+
 /// Maximum number of beneficiaries allowed per vault — Issue #872.
 /// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
 /// Soroban instruction limit; 50 approaches it. Capped at 20 for headroom.
@@ -532,6 +536,9 @@ pub enum ContractError {
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
     UpgradeManifestRequired = 140,
+    UpgradeFunctionSignaturesRequired = 141,
+    NoPendingUpgrade = 142,
+    UpgradeTimeLocked = 143,
 }
 
 #[contract]
@@ -1167,12 +1174,7 @@ impl TtlVaultContract {
         panic_with_error!(&env, ContractError::UpgradeManifestRequired);
     }
 
-    /// Admin-only. Full upgrade-safety path: validates the hash, validates
-    /// interface/storage/error-code compatibility against the recorded
-    /// manifest, performs the upgrade, and then bumps the manifest version
-    /// so the new contract becomes the baseline for the *next* upgrade.
-    ///
-    /// See `docs/upgrade-safety.md` for the recommended admin workflow.
+    /// Admin-only. Validates and stages a manifest-compatible upgrade.
     pub fn upgrade_with_manifest(
         env: Env,
         new_wasm_hash: BytesN<32>,
@@ -1180,33 +1182,35 @@ impl TtlVaultContract {
         new_error_code_count: u32,
         new_storage_schema_hash: BytesN<32>,
     ) {
-        Self::require_admin(&env);
-        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
-        Self::validate_upgrade_compatibility(
+        Self::propose_upgrade_internal(
             env.clone(),
-            new_exported_fn_count,
-            new_error_code_count,
-            new_storage_schema_hash.clone(),
-        );
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.storage()
-            .instance()
-            .remove(&DataKey::UpgradeFunctionSignaturesHash);
-
-        Self::set_upgrade_manifest(
-            env,
+            new_wasm_hash,
             new_exported_fn_count,
             new_error_code_count,
             new_storage_schema_hash,
+            None,
         );
     }
 
-    /// Admin-only. Performs an upgrade after validating the full manifest,
-    /// including an exact public function-signature fingerprint.
+    /// Admin-only. Explicitly stages a manifest-compatible upgrade.
+    pub fn propose_upgrade_with_manifest(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+    ) {
+        Self::propose_upgrade_internal(
+            env,
+            new_wasm_hash,
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+            None,
+        );
+    }
+
+    /// Admin-only. Validates and stages a signature-aware upgrade.
     pub fn upgrade_with_manifest_and_signatures(
         env: Env,
         new_wasm_hash: BytesN<32>,
@@ -1215,28 +1219,148 @@ impl TtlVaultContract {
         new_storage_schema_hash: BytesN<32>,
         new_function_signatures_hash: BytesN<32>,
     ) {
-        Self::require_admin(&env);
-        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
-        Self::validate_upgrade_compatibility_with_signatures(
-            env.clone(),
-            new_exported_fn_count,
-            new_error_code_count,
-            new_storage_schema_hash.clone(),
-            new_function_signatures_hash.clone(),
-        );
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-
-        Self::set_upgrade_manifest_with_signatures(
+        Self::propose_upgrade_internal(
             env,
+            new_wasm_hash,
             new_exported_fn_count,
             new_error_code_count,
             new_storage_schema_hash,
-            new_function_signatures_hash,
+            Some(new_function_signatures_hash),
         );
+    }
+
+    /// Admin-only. Stages a signature-aware upgrade for delayed execution.
+    pub fn propose_upgrade_with_manifest_and_signatures(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+        new_function_signatures_hash: BytesN<32>,
+    ) {
+        Self::propose_upgrade_internal(
+            env,
+            new_wasm_hash,
+            new_exported_fn_count,
+            new_error_code_count,
+            new_storage_schema_hash,
+            Some(new_function_signatures_hash),
+        );
+    }
+
+    /// Admin-only. Executes the pending manifest-validated upgrade after the
+    /// 24-hour timelock has elapsed.
+    pub fn execute_upgrade(env: Env) {
+        Self::require_admin(&env);
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingUpgrade));
+        if env.ledger().timestamp() < proposal.proposed_at.saturating_add(UPGRADE_TIMELOCK) {
+            panic_with_error!(&env, ContractError::UpgradeTimeLocked);
+        }
+
+        Self::validate_upgrade(env.clone(), proposal.wasm_hash.clone());
+        match proposal.function_signatures_hash.clone() {
+            Some(signatures_hash) => Self::validate_upgrade_compatibility_with_signatures(
+                env.clone(),
+                proposal.exported_fn_count,
+                proposal.error_code_count,
+                proposal.storage_schema_hash.clone(),
+                signatures_hash,
+            ),
+            None => Self::validate_upgrade_compatibility(
+                env.clone(),
+                proposal.exported_fn_count,
+                proposal.error_code_count,
+                proposal.storage_schema_hash.clone(),
+            ),
+        }
+
+        let version = env
+            .storage()
+            .instance()
+            .get::<DataKey, UpgradeManifest>(&DataKey::UpgradeManifest)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UpgradeManifestNotSet))
+            .version
+            .saturating_add(1);
+        env.deployer()
+            .update_current_contract_wasm(proposal.wasm_hash);
+        let manifest = UpgradeManifest {
+            exported_fn_count: proposal.exported_fn_count,
+            error_code_count: proposal.error_code_count,
+            storage_schema_hash: proposal.storage_schema_hash,
+            version,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeManifest, &manifest);
+        match proposal.function_signatures_hash {
+            Some(signatures_hash) => env
+                .storage()
+                .instance()
+                .set(&DataKey::UpgradeFunctionSignaturesHash, &signatures_hash),
+            None => env
+                .storage()
+                .instance()
+                .remove(&DataKey::UpgradeFunctionSignaturesHash),
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
+    fn propose_upgrade_internal(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_exported_fn_count: u32,
+        new_error_code_count: u32,
+        new_storage_schema_hash: BytesN<32>,
+        new_function_signatures_hash: Option<BytesN<32>>,
+    ) {
+        Self::require_admin(&env);
+        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
+
+        match new_function_signatures_hash.clone() {
+            Some(signatures_hash) => Self::validate_upgrade_compatibility_with_signatures(
+                env.clone(),
+                new_exported_fn_count,
+                new_error_code_count,
+                new_storage_schema_hash.clone(),
+                signatures_hash,
+            ),
+            None => {
+                if env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::UpgradeFunctionSignaturesHash)
+                {
+                    panic_with_error!(&env, ContractError::UpgradeFunctionSignaturesRequired);
+                }
+                Self::validate_upgrade_compatibility(
+                    env.clone(),
+                    new_exported_fn_count,
+                    new_error_code_count,
+                    new_storage_schema_hash.clone(),
+                );
+            }
+        }
+
+        let proposal = UpgradeProposal {
+            wasm_hash: new_wasm_hash,
+            exported_fn_count: new_exported_fn_count,
+            error_code_count: new_error_code_count,
+            storage_schema_hash: new_storage_schema_hash,
+            function_signatures_hash: new_function_signatures_hash,
+            proposed_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &proposal);
     }
 
     // --- Issue #581: Token Conversion ---

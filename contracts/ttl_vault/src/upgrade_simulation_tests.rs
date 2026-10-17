@@ -32,13 +32,17 @@ fn successful_wasm_upgrade_preserves_initialized_state() {
     let candidate_hash = env.deployer().upload_contract_wasm(wasm.as_slice());
     client.set_upgrade_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
 
-    client.upgrade_with_manifest_and_signatures(
+    client.propose_upgrade_with_manifest_and_signatures(
         &candidate_hash,
         &10u32,
         &5u32,
         &storage_hash,
         &signature_hash,
     );
+    assert!(client.try_execute_upgrade().is_err());
+    env.ledger()
+        .with_mut(|ledger| ledger.timestamp += UPGRADE_TIMELOCK);
+    client.execute_upgrade();
 
     let manifest = client.get_upgrade_manifest().unwrap();
     assert_eq!(manifest.version, 2);
