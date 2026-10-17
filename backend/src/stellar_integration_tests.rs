@@ -62,11 +62,7 @@ impl StellarRpcClient {
     /// Send a JSON-RPC 2.0 request and return the parsed response body.
     ///
     /// Uses the `reqwest` blocking client so tests remain synchronous.
-    fn call(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -102,8 +98,7 @@ impl StellarRpcClient {
             ));
         }
 
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("JSON parse error: {e}"))
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("JSON parse error: {e}"))
     }
 
     /// Call `getHealth` — returns the node health status string.
@@ -159,7 +154,9 @@ fn test_rpc_health() {
     }
 
     let client = StellarRpcClient::new(&rpc_url());
-    let status = client.get_health().expect("getHealth RPC call must succeed");
+    let status = client
+        .get_health()
+        .expect("getHealth RPC call must succeed");
     assert_eq!(status, "healthy", "testnet RPC must report healthy status");
 }
 
@@ -213,7 +210,7 @@ fn test_vault_contract_data_accessible() {
     );
 
     match result {
-        Ok(_) => {} // contract instance found — success
+        Ok(_) => {}                                 // contract instance found — success
         Err(e) if e.contains("entryNotFound") => {} // no entries yet — acceptable
         Err(e) => panic!("unexpected RPC error for contract data lookup: {e}"),
     }
@@ -240,10 +237,7 @@ fn test_invalid_contract_returns_entry_not_found() {
     );
 
     // Must be an error; it must not panic or return an Ok with data.
-    assert!(
-        result.is_err(),
-        "invalid contract must return an RPC error"
-    );
+    assert!(result.is_err(), "invalid contract must return an RPC error");
     let err = result.unwrap_err();
     assert!(
         err.contains("entryNotFound") || err.contains("error"),
@@ -304,7 +298,10 @@ fn test_rpc_latest_ledger_response_shape() {
 
     let result = &resp["result"];
     assert!(result["sequence"].is_number(), "sequence must be numeric");
-    assert!(result["id"].is_string(), "id (ledger hash) must be a string");
+    assert!(
+        result["id"].is_string(),
+        "id (ledger hash) must be a string"
+    );
     assert!(
         result["protocolVersion"].is_number(),
         "protocolVersion must be numeric"

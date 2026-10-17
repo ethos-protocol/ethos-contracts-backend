@@ -5,12 +5,12 @@
 //! - [`run_compliance_checks`]: evaluates GDPR, SOC2, and ISO 27001 controls
 //!   against the current runtime environment and returns a list of
 //!   [`ComplianceCheck`] results.
-//! - [`generate_pdf_stub`]: returns a placeholder [`serde_json::Value`]
-//!   representing where a real PDF export would appear.
+//! - [`generate_pdf_report`]: returns a Base64-encoded PDF audit report.
 //! - [`compliance_report_handler`]: axum handler for
 //!   `GET /admin/compliance-report`.
 
 use axum::{extract::State, http::HeaderMap, Json};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -19,7 +19,8 @@ use crate::{
     db::AppState,
     error::AppError,
     models::{
-        ComplianceAuditReport, ComplianceCheck, ComplianceReportResponse, ComplianceStatus,
+        ComplianceAuditReport, ComplianceCheck, CompliancePdf, ComplianceReportResponse,
+        ComplianceStatus,
     },
 };
 
@@ -140,30 +141,28 @@ fn gdpr_checks() -> Vec<ComplianceCheck> {
         ),
         // Article 32 — Security of processing
         {
-            let (status, remediation) = if admin_key_set && reminder_email_key_set && reminder_sms_key_set {
-                (
-                    ComplianceStatus::Pass,
-                    "".to_string(),
-                )
-            } else {
-                let missing: Vec<&str> = [
-                    (!admin_key_set).then_some("ADMIN_API_KEY"),
-                    (!reminder_email_key_set).then_some("REMINDER_EMAIL_API_KEY"),
-                    (!reminder_sms_key_set).then_some("REMINDER_SMS_API_KEY"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                (
-                    ComplianceStatus::Fail,
-                    format!(
-                        "Set the following required environment variables before deploying to \
+            let (status, remediation) =
+                if admin_key_set && reminder_email_key_set && reminder_sms_key_set {
+                    (ComplianceStatus::Pass, "".to_string())
+                } else {
+                    let missing: Vec<&str> = [
+                        (!admin_key_set).then_some("ADMIN_API_KEY"),
+                        (!reminder_email_key_set).then_some("REMINDER_EMAIL_API_KEY"),
+                        (!reminder_sms_key_set).then_some("REMINDER_SMS_API_KEY"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    (
+                        ComplianceStatus::Fail,
+                        format!(
+                            "Set the following required environment variables before deploying to \
                          production: {}. Unset keys leave admin and notification endpoints \
                          unauthenticated.",
-                        missing.join(", ")
-                    ),
-                )
-            };
+                            missing.join(", ")
+                        ),
+                    )
+                };
             check(
                 "gdpr.security_of_processing",
                 "Security of Processing",
@@ -191,14 +190,20 @@ fn soc2_checks() -> Vec<ComplianceCheck> {
             "soc2.cc6_1_access_controls",
             "Logical Access Controls (CC6.1)",
             "SOC2",
-            if std::env::var("ADMIN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            if std::env::var("ADMIN_API_KEY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
                 ComplianceStatus::Pass
             } else {
                 ComplianceStatus::Fail
             },
             "The ADMIN_API_KEY environment variable gates all /admin/* endpoints. \
              When set, bearer-token authentication is enforced by authorize_admin().",
-            if std::env::var("ADMIN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            if std::env::var("ADMIN_API_KEY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
                 ""
             } else {
                 "Set ADMIN_API_KEY in the deployment environment to enforce admin access controls."
@@ -410,21 +415,155 @@ pub fn run_compliance_checks() -> Vec<ComplianceCheck> {
     checks
 }
 
-/// Return a [`serde_json::Value`] placeholder where a real PDF report would be
-/// embedded.
+/// Generate a self-contained PDF report and return its Base64-encoded bytes.
 ///
-/// Generating a true PDF requires a rendering engine (e.g. `printpdf` or
-/// `wkhtmltopdf`) that is deliberately excluded to avoid adding heavyweight
-/// optional dependencies. Consumers may use the JSON report to render their own
-/// PDF via any suitable client-side or server-side tool.
-pub fn generate_pdf_stub() -> serde_json::Value {
-    serde_json::json!({
-        "format": "pdf",
-        "version": "1.0",
-        "note": "PDF generation requires an external renderer. \
-                 Use the JSON report fields to produce a PDF via your preferred tooling.",
-        "placeholder_base64": "",
-    })
+/// This writes the small PDF structure directly, avoiding a heavyweight
+/// rendering dependency while including every check and its remediation.
+pub fn generate_pdf_report(
+    generated_at: &chrono::DateTime<Utc>,
+    checks: &[ComplianceCheck],
+) -> String {
+    let counts = checks.iter().fold([0usize; 4], |mut counts, check| {
+        let index = match check.status {
+            ComplianceStatus::Pass => 0,
+            ComplianceStatus::Fail => 1,
+            ComplianceStatus::Warning => 2,
+            ComplianceStatus::NotApplicable => 3,
+        };
+        counts[index] += 1;
+        counts
+    });
+
+    let mut lines = vec![
+        "Compliance Audit Report".to_string(),
+        format!("Generated: {}", generated_at.to_rfc3339()),
+        format!(
+            "Summary: {} checks; {} passed, {} failed, {} warnings, {} not applicable",
+            checks.len(),
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3]
+        ),
+        String::new(),
+    ];
+    for check in checks {
+        lines.push(format!(
+            "[{}] {} / {}: {}",
+            check.status, check.framework, check.id, check.name
+        ));
+        lines.extend(wrap_pdf_text(
+            &format!("Description: {}", check.description),
+            95,
+        ));
+        if !check.remediation.is_empty() {
+            lines.extend(wrap_pdf_text(
+                &format!("Remediation: {}", check.remediation),
+                95,
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    STANDARD.encode(generate_pdf_bytes(&lines))
+}
+
+fn wrap_pdf_text(text: &str, width: usize) -> Vec<String> {
+    let ascii_text: String = text
+        .chars()
+        .map(|character| if character.is_ascii() { character } else { '?' })
+        .collect();
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    for word in ascii_text.split_whitespace() {
+        if !line.is_empty() && line.len() + word.len() + 1 > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+
+    lines
+}
+
+fn generate_pdf_bytes(lines: &[String]) -> Vec<u8> {
+    const LINES_PER_PAGE: usize = 55;
+    let pages: Vec<&[String]> = if lines.is_empty() {
+        vec![&[]]
+    } else {
+        lines.chunks(LINES_PER_PAGE).collect()
+    };
+
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        String::new(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let page_ids: Vec<usize> = (0..pages.len()).map(|index| 4 + index * 2).collect();
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        page_ids
+            .iter()
+            .map(|id| format!("{id} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        pages.len()
+    );
+
+    for (index, page_lines) in pages.iter().enumerate() {
+        let page_id = page_ids[index];
+        let content_id = page_id + 1;
+        let content = page_lines
+            .iter()
+            .map(|line| {
+                let escaped = line
+                    .replace('\\', "\\\\")
+                    .replace('(', "\\(")
+                    .replace(')', "\\)");
+                format!("({escaped}) Tj\nT*\n")
+            })
+            .collect::<String>();
+        let stream = format!("BT\n/F1 9 Tf\n50 750 Td\n12 TL\n{content}ET");
+
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+        ));
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        ));
+    }
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len() + 1);
+    offsets.push(0usize);
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+
+    pdf
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -445,9 +584,8 @@ pub async fn compliance_report_handler(
     State(_state): State<Arc<AppState>>,
 ) -> Result<Json<ComplianceReportResponse>, AppError> {
     // Admin-only: validate the bearer token before serving the report.
-    authorize_admin(&headers).map_err(|_api_err| {
-        AppError::InvalidInput("valid admin API key required".to_string())
-    })?;
+    authorize_admin(&headers)
+        .map_err(|_api_err| AppError::InvalidInput("valid admin API key required".to_string()))?;
 
     let checks = run_compliance_checks();
 
@@ -469,15 +607,21 @@ pub async fn compliance_report_handler(
         .count();
     let total_checks = checks.len();
 
+    let generated_at = Utc::now();
+    let pdf_base64 = generate_pdf_report(&generated_at, &checks);
     let report = ComplianceAuditReport {
-        generated_at: Utc::now(),
+        generated_at,
         total_checks,
         passed,
         failed,
         warnings,
         not_applicable,
         checks,
-        pdf_stub: generate_pdf_stub(),
+        pdf: CompliancePdf {
+            format: "pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            base64: pdf_base64,
+        },
     };
 
     Ok(Json(ComplianceReportResponse { report }))
@@ -501,7 +645,10 @@ mod tests {
             assert!(!c.id.is_empty(), "check id must not be empty");
             assert!(!c.name.is_empty(), "check name must not be empty");
             assert!(!c.framework.is_empty(), "check framework must not be empty");
-            assert!(!c.description.is_empty(), "check description must not be empty");
+            assert!(
+                !c.description.is_empty(),
+                "check description must not be empty"
+            );
         }
     }
 
@@ -532,10 +679,12 @@ mod tests {
     }
 
     #[test]
-    fn pdf_stub_has_expected_shape() {
-        let stub = generate_pdf_stub();
-        assert_eq!(stub["format"], "pdf");
-        assert!(stub["note"].as_str().is_some());
+    fn pdf_report_is_nonempty_and_contains_valid_pdf_bytes() {
+        let generated_at = Utc::now();
+        let encoded = generate_pdf_report(&generated_at, &run_compliance_checks());
+        let decoded = STANDARD.decode(encoded).unwrap();
+        assert!(decoded.starts_with(b"%PDF-1.4"));
+        assert!(decoded.ends_with(b"%%EOF\n"));
     }
 
     #[test]
@@ -543,7 +692,10 @@ mod tests {
         assert_eq!(ComplianceStatus::Pass.to_string(), "pass");
         assert_eq!(ComplianceStatus::Fail.to_string(), "fail");
         assert_eq!(ComplianceStatus::Warning.to_string(), "warning");
-        assert_eq!(ComplianceStatus::NotApplicable.to_string(), "not_applicable");
+        assert_eq!(
+            ComplianceStatus::NotApplicable.to_string(),
+            "not_applicable"
+        );
     }
 
     #[test]

@@ -13,8 +13,7 @@
 // The suspicious-activity threshold is controlled by the
 // `CAPTCHA_SUSPICIOUS_THRESHOLD` env var (default: 10 events per window).
 //
-// These handlers are not yet registered in main.rs::build_router — see task
-// instructions.  They follow the same axum pattern used throughout this crate:
+// These handlers follow the same axum pattern used throughout this crate:
 //   `async fn foo(State(state): State<Arc<AppState>>, headers: HeaderMap, ...) -> Result<Json<T>, AppError>`
 #![allow(clippy::unused_async)]
 

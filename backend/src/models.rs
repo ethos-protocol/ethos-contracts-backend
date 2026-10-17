@@ -372,6 +372,60 @@ pub struct ComplianceReport {
     pub current_balance: i128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStatus {
+    Pass,
+    Fail,
+    Warning,
+    NotApplicable,
+}
+
+impl std::fmt::Display for ComplianceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Warning => "warning",
+            Self::NotApplicable => "not_applicable",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceCheck {
+    pub id: String,
+    pub name: String,
+    pub framework: String,
+    pub status: ComplianceStatus,
+    pub description: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompliancePdf {
+    pub format: String,
+    pub content_type: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceAuditReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_checks: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warnings: usize,
+    pub not_applicable: usize,
+    pub checks: Vec<ComplianceCheck>,
+    pub pdf: CompliancePdf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceReportResponse {
+    pub report: ComplianceAuditReport,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FundMovement {
     pub timestamp: DateTime<Utc>,
