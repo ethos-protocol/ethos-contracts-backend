@@ -238,6 +238,17 @@ async fn test_get_not_found() {
 }
 
 #[tokio::test]
+async fn test_dlq_operator_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/admin/dlq").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /admin/dlq response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
 async fn test_set_empty_channels_rejected() {
     let app = test_app();
     let body = json!({

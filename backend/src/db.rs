@@ -110,6 +110,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
     }
 }
 
+impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
+    fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
+        Arc::clone(&state.webhook_state.dlq_state)
+    }
+}
+
 impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     fn from_ref(state: &AppState) -> crate::graphql::EthosSchema {
         state.graphql_schema.clone()

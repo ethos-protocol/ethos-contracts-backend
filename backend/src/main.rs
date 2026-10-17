@@ -226,6 +226,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
         .route("/webhooks/verify", post(verify_webhook))
+        // ── Dead-letter queue operator routes ────────────────────────────────
+        .route(
+            "/admin/dlq",
+            get(ethos_protocol_backend::dlq::list_dlq_entries),
+        )
+        .route(
+            "/admin/dlq/replay",
+            post(ethos_protocol_backend::dlq::replay_dlq_entries),
+        )
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
