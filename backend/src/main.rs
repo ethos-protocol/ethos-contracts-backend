@@ -226,12 +226,68 @@ pub fn build_router(state: AppState) -> Router {
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
         .route("/webhooks/verify", post(verify_webhook))
+        // ── Dead-letter queue operator routes ────────────────────────────────
+        .route(
+            "/admin/dlq",
+            get(ethos_protocol_backend::dlq::list_dlq_entries),
+        )
+        .route(
+            "/admin/dlq/replay",
+            post(ethos_protocol_backend::dlq::replay_dlq_entries),
+        )
+        // ── Data retention operator routes (#100) ────────────────────────────
+        .route(
+            "/api/retention/policies/:data_type",
+            put(ethos_protocol_backend::retention::upsert_policy),
+        )
+        .route(
+            "/api/retention/purge/:data_type",
+            post(ethos_protocol_backend::retention::trigger_purge),
+        )
+        .route(
+            "/api/retention/exceptions/:data_type",
+            post(ethos_protocol_backend::retention::add_exception),
+        )
+        .route(
+            "/api/retention/deletion-log",
+            get(ethos_protocol_backend::retention::get_deletion_log),
+        )
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Authenticated WebSocket vault streams ────────────────────────────
+        .route(
+            "/ws/vaults",
+            get(ethos_protocol_backend::websocket::authenticated_vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id",
+            get(ethos_protocol_backend::websocket::vault_websocket_handler),
+        )
+        .route(
+            "/ws/vaults/:vault_id/heartbeat",
+            get(ethos_protocol_backend::websocket::heartbeat_vault_websocket_handler),
+        )
+        // ── Request replay operator routes (#73) ────────────────────────────
+        .route(
+            "/replay",
+            post(ethos_protocol_backend::replay::replay_handler),
+        )
+        .route(
+            "/replay/batch",
+            post(ethos_protocol_backend::replay::batch_replay_handler),
+        )
+        .route(
+            "/replay/logs",
+            get(ethos_protocol_backend::replay::list_logs_handler),
+        )
+        .route(
+            "/replay/logs/:log_id",
+            get(ethos_protocol_backend::replay::get_log_handler),
+        )
         // ── Request prioritization / load shedding (#128, #129) ──────────────
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -396,6 +452,10 @@ async fn main() {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state,
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            1024,
+        )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -410,6 +470,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

@@ -81,6 +81,10 @@ fn test_state(db: Arc<Db>) -> AppState {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            16,
+        )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -235,6 +239,58 @@ async fn test_get_not_found() {
     let app = test_app();
     let res = get_req(app, "/api/vaults/999/reminder-preferences").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_dlq_operator_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/admin/dlq").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /admin/dlq response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_retention_deletion_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/api/retention/deletion-log").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected retention deletion-log response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_websocket_vault_route_requires_authentication() {
+    let app = test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ws/vaults")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_replay_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/replay/logs").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /replay/logs response: {}",
+        response.status()
+    );
 }
 
 #[tokio::test]
