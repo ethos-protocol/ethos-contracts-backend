@@ -13,7 +13,7 @@ use crate::models::{
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use uuid::Uuid;
 
 // ── Shared store types ───────────────────────────────────────────────────────
@@ -30,6 +30,13 @@ pub type UnsubscribeStore = Arc<Mutex<HashMap<String, UnsubscribeToken>>>;
 pub type ChannelDeliveryStore = Arc<Mutex<Vec<ChannelDeliveryLog>>>;
 /// Idempotency key store (#825). Key → cached record.
 pub type IdempotencyStore = Arc<Mutex<HashMap<String, IdempotencyRecord>>>;
+
+fn lock_store<T>(store: &Mutex<T>) -> MutexGuard<'_, T> {
+    store.lock().unwrap_or_else(|poisoned| {
+        log::error!("recovering poisoned notification store lock");
+        poisoned.into_inner()
+    })
+}
 
 pub fn create_token_store() -> TokenStore {
     Arc::new(Mutex::new(HashMap::new()))
@@ -318,7 +325,7 @@ impl NotificationService {
     // ── Token management ─────────────────────────────────────────────────────
 
     pub fn register_token(&self, req: RegisterTokenRequest) {
-        let mut store = self.tokens.lock().unwrap();
+        let mut store = lock_store(&self.tokens);
         let entry = store.entry(req.owner.clone()).or_default();
         // Deduplicate by token value
         if !entry.iter().any(|t| t.token == req.token) {
@@ -332,16 +339,14 @@ impl NotificationService {
     }
 
     pub fn unregister_token(&self, owner: &str, token: &str) {
-        let mut store = self.tokens.lock().unwrap();
+        let mut store = lock_store(&self.tokens);
         if let Some(tokens) = store.get_mut(owner) {
             tokens.retain(|t| t.token != token);
         }
     }
 
     pub fn get_tokens(&self, owner: &str) -> Vec<DeviceToken> {
-        self.tokens
-            .lock()
-            .unwrap()
+        lock_store(&self.tokens)
             .get(owner)
             .cloned()
             .unwrap_or_default()
@@ -351,9 +356,7 @@ impl NotificationService {
 
     // Preferences are stored per-owner.
     pub fn get_preferences(&self, owner: &str) -> NotificationPreferences {
-        self.prefs
-            .lock()
-            .unwrap()
+        lock_store(&self.prefs)
             .get(owner)
             .cloned()
             .unwrap_or_else(|| NotificationPreferences {
@@ -363,7 +366,7 @@ impl NotificationService {
     }
 
     pub fn update_preferences(&self, req: UpdatePreferencesRequest) {
-        let mut store = self.prefs.lock().unwrap();
+        let mut store = lock_store(&self.prefs);
         let owner = req.owner.clone();
         let prefs = store
             .entry(owner.clone())
@@ -410,7 +413,7 @@ impl NotificationService {
         let fire_at = Utc::now() + chrono::Duration::seconds((ttl - warning_secs).cast_signed());
 
         // Avoid duplicate schedules for the same vault + type
-        let mut store = self.schedule.lock().unwrap();
+        let mut store = lock_store(&self.schedule);
         let already = store.iter().any(|s| {
             s.vault_id == vault.id
                 && s.notification_type == NotificationType::ExpiryWarning
@@ -458,7 +461,7 @@ impl NotificationService {
             return;
         }
 
-        self.schedule.lock().unwrap().push(ScheduledNotification {
+        lock_store(&self.schedule).push(ScheduledNotification {
             id: Uuid::new_v4().to_string(),
             vault_id: vault_id.to_string(),
             owner: owner.to_string(),
@@ -488,7 +491,7 @@ impl NotificationService {
         if remaining_secs <= 0 {
             // Already expired — schedule PasskeyExpired regardless of the
             // expiry-warning preference (AC 8).
-            let mut store = self.schedule.lock().unwrap();
+            let mut store = lock_store(&self.schedule);
             let already = store.iter().any(|s| {
                 s.vault_id == vault_id
                     && s.notification_type == NotificationType::PasskeyExpired
@@ -526,7 +529,7 @@ impl NotificationService {
         }
 
         // AC 5/10: don't schedule a duplicate PasskeyExpiringSoon while one is pending.
-        let mut store = self.schedule.lock().unwrap();
+        let mut store = lock_store(&self.schedule);
         let already = store.iter().any(|s| {
             s.vault_id == vault_id
                 && s.notification_type == NotificationType::PasskeyExpiringSoon
@@ -563,9 +566,7 @@ impl NotificationService {
 
     pub fn get_pending_notifications(&self) -> Vec<ScheduledNotification> {
         let now = Utc::now();
-        self.schedule
-            .lock()
-            .unwrap()
+        lock_store(&self.schedule)
             .iter()
             .filter(|n| n.status == DeliveryStatus::Pending && n.scheduled_at <= now)
             .cloned()
@@ -578,7 +579,7 @@ impl NotificationService {
     /// was already sent within `DEDUP_WINDOW_SECONDS`.
     pub fn is_duplicate(&self, notif: &ScheduledNotification) -> bool {
         let cutoff = Utc::now() - chrono::Duration::seconds(DEDUP_WINDOW_SECONDS);
-        let store = self.schedule.lock().unwrap();
+        let store = lock_store(&self.schedule);
         store.iter().any(|n| {
             n.id != notif.id
                 && n.vault_id == notif.vault_id
@@ -612,10 +613,7 @@ impl NotificationService {
     /// Retry any Retrying notifications whose next_retry_at has passed.
     pub async fn flush_retries(&self) {
         let now = Utc::now();
-        let due: Vec<ReminderDeliveryLog> = self
-            .retry_log
-            .lock()
-            .unwrap()
+        let due: Vec<ReminderDeliveryLog> = lock_store(&self.retry_log)
             .values()
             .filter(|l| {
                 l.status == DeliveryStatus::Retrying && l.next_retry_at.is_some_and(|t| t <= now)
@@ -626,7 +624,7 @@ impl NotificationService {
         for log in due {
             // Reconstruct a minimal ScheduledNotification for delivery
             let notif = {
-                let sched = self.schedule.lock().unwrap();
+                let sched = lock_store(&self.schedule);
                 sched.iter().find(|n| n.id == log.notification_id).cloned()
             };
             if let Some(notif) = notif {
@@ -731,7 +729,7 @@ impl NotificationService {
         error: &str,
         next_retry_at: Option<chrono::DateTime<Utc>>,
     ) {
-        let mut store = self.retry_log.lock().unwrap();
+        let mut store = lock_store(&self.retry_log);
         let entry = store
             .entry(notif.id.clone())
             .or_insert_with(|| ReminderDeliveryLog {
@@ -753,9 +751,7 @@ impl NotificationService {
 
     /// Returns the current delivery status for a vault's most recent reminder.
     pub fn get_reminder_delivery_status(&self, vault_id: &str) -> Option<ReminderDeliveryLog> {
-        self.retry_log
-            .lock()
-            .unwrap()
+        lock_store(&self.retry_log)
             .values()
             .filter(|l| l.vault_id == vault_id)
             .max_by_key(|l| l.attempts.last().map(|a| a.attempted_at))
@@ -763,7 +759,7 @@ impl NotificationService {
     }
 
     fn record(&self, notif: &ScheduledNotification, status: DeliveryStatus, response: &str) {
-        self.delivery.lock().unwrap().push(DeliveryRecord {
+        lock_store(&self.delivery).push(DeliveryRecord {
             notification_id: notif.id.clone(),
             vault_id: notif.vault_id.clone(),
             owner: notif.owner.clone(),
@@ -775,7 +771,7 @@ impl NotificationService {
     }
 
     fn mark_sent(&self, id: &str, status: DeliveryStatus) {
-        let mut store = self.schedule.lock().unwrap();
+        let mut store = lock_store(&self.schedule);
         if let Some(n) = store.iter_mut().find(|n| n.id == id) {
             if status == DeliveryStatus::Sent {
                 n.sent_at = Some(Utc::now());
@@ -785,9 +781,7 @@ impl NotificationService {
     }
 
     pub fn get_delivery_log(&self, owner: &str) -> Vec<DeliveryRecord> {
-        self.delivery
-            .lock()
-            .unwrap()
+        lock_store(&self.delivery)
             .iter()
             .filter(|r| r.owner == owner)
             .cloned()
@@ -799,7 +793,7 @@ impl NotificationService {
     /// Generate a signed unsubscribe token for the given owner.
     pub fn generate_unsubscribe_token(&self, owner: &str) -> String {
         let token = Uuid::new_v4().to_string();
-        self.unsubscribe_tokens.lock().unwrap().insert(
+        lock_store(&self.unsubscribe_tokens).insert(
             token.clone(),
             UnsubscribeToken {
                 token: token.clone(),
@@ -813,15 +807,12 @@ impl NotificationService {
     /// Validate an unsubscribe token and mark the owner as unsubscribed.
     /// Returns the owner string on success.
     pub fn process_unsubscribe(&self, token: &str) -> Result<String, String> {
-        let unsub = self
-            .unsubscribe_tokens
-            .lock()
-            .unwrap()
+        let unsub = lock_store(&self.unsubscribe_tokens)
             .get(token)
             .cloned()
             .ok_or_else(|| "invalid or expired unsubscribe token".to_string())?;
 
-        let mut prefs_store = self.prefs.lock().unwrap();
+        let mut prefs_store = lock_store(&self.prefs);
         let prefs =
             prefs_store
                 .entry(unsub.owner.clone())
@@ -836,9 +827,7 @@ impl NotificationService {
 
     /// Check if an owner has unsubscribed.
     pub fn is_unsubscribed(&self, owner: &str) -> bool {
-        self.prefs
-            .lock()
-            .unwrap()
+        lock_store(&self.prefs)
             .get(owner)
             .is_some_and(|p| p.unsubscribed)
     }
@@ -876,9 +865,7 @@ impl NotificationService {
         status: DeliveryStatus,
         error: Option<String>,
     ) {
-        self.channel_delivery_log
-            .lock()
-            .unwrap()
+        lock_store(&self.channel_delivery_log)
             .push(ChannelDeliveryLog {
                 notification_id: notification_id.to_string(),
                 channel: channel.clone(),
@@ -890,9 +877,7 @@ impl NotificationService {
 
     /// Get the channel delivery log for a notification.
     pub fn get_channel_delivery_log(&self, notification_id: &str) -> Vec<ChannelDeliveryLog> {
-        self.channel_delivery_log
-            .lock()
-            .unwrap()
+        lock_store(&self.channel_delivery_log)
             .iter()
             .filter(|l| l.notification_id == notification_id)
             .cloned()
@@ -1008,7 +993,7 @@ impl NotificationService {
 
     /// Check if an idempotency key has been seen. Returns the cached record if so.
     pub fn check_idempotency(&self, key: &str) -> Option<IdempotencyRecord> {
-        let store = self.idempotency.lock().unwrap();
+        let store = lock_store(&self.idempotency);
         let record = store.get(key)?;
         let age = Utc::now()
             .signed_duration_since(record.created_at)
@@ -1021,7 +1006,7 @@ impl NotificationService {
 
     /// Store an idempotency key with the associated response.
     pub fn store_idempotency(&self, key: String, status_code: u16, response_body: String) {
-        self.idempotency.lock().unwrap().insert(
+        lock_store(&self.idempotency).insert(
             key.clone(),
             IdempotencyRecord {
                 key,
@@ -1035,9 +1020,7 @@ impl NotificationService {
     /// Purge expired idempotency keys (older than 24h).
     pub fn purge_expired_idempotency_keys(&self) {
         let cutoff = Utc::now() - chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS);
-        self.idempotency
-            .lock()
-            .unwrap()
+        lock_store(&self.idempotency)
             .retain(|_, v| v.created_at > cutoff);
     }
 }
@@ -1074,6 +1057,25 @@ mod tests {
             create_schedule_store(),
             create_delivery_store(),
         )
+    }
+
+    #[test]
+    fn poisoned_store_lock_is_recovered() {
+        let tokens = create_token_store();
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tokens.lock().unwrap();
+            panic!("poison notification token store");
+        }));
+        assert!(poison_result.is_err());
+
+        let service = NotificationService::new(
+            Arc::new(FcmClient::new("test-key".into(), "test-project".into())),
+            tokens,
+            create_prefs_store(),
+            create_schedule_store(),
+            create_delivery_store(),
+        );
+        assert!(service.get_tokens("owner").is_empty());
     }
 
     fn make_vault(ttl: Option<u64>) -> Vault {
@@ -1725,4 +1727,3 @@ mod tests {
         assert_eq!(data["vault_id"], "safe-vault-42");
     }
 }
-
