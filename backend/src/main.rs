@@ -82,6 +82,9 @@ use ethos_protocol_backend::{
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
+    two_factor::{
+        challenge_2fa, clear_2fa_session, disable_2fa, enable_2fa, get_2fa_status, verify_2fa,
+    },
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
@@ -185,8 +188,35 @@ pub fn build_router(state: AppState) -> Router {
     // let retry_state = RetryPolicyState::new();
     // let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
     let _timeout_state = TimeoutState::new();
+    let two_factor_router = Router::new()
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(clear_2fa_session),
+        )
+        .with_state(Arc::clone(&state.db));
 
     Router::new()
+        .merge(two_factor_router)
         // ── Feature flags (#274) ─────────────────────────────────────────────
         .route("/admin/flags", post(upsert_flag).get(list_flags))
         .route("/admin/flags/:key", get(get_flag))
