@@ -398,7 +398,7 @@ All tutorials follow a consistent format:
 **Outline**:
 
 1. Scenario: contract state archived unexpectedly
-2. Calling `restore_vault(vault_id)` manually
+2. Calling `restore_vault(vault_id, caller)` as the vault owner or admin
 3. Re-deploying a contract if the WASM is unavailable
 4. Database recovery from PostgreSQL backup
 5. Key rotation after a suspected compromise

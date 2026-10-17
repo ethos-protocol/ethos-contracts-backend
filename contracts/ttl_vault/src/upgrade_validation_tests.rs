@@ -185,3 +185,30 @@ fn upgrade_with_manifest_rejects_invalid_hash() {
     let result = client.try_upgrade_with_manifest(&zero_hash, &10u32, &5u32, &hash);
     assert!(result.is_err());
 }
+
+#[test]
+fn hash_only_upgrade_is_rejected() {
+    let (env, _admin, client) = setup();
+    let hash = schema_hash(&env, 1);
+
+    let result = client.try_upgrade(&hash);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(ContractError::UpgradeManifestRequired as u32)
+    );
+}
+
+#[test]
+fn manifest_upgrade_requires_timelock_before_execution() {
+    let (env, _admin, client) = setup();
+    let storage_hash = schema_hash(&env, 1);
+    let wasm_hash = schema_hash(&env, 2);
+    client.set_upgrade_manifest(&10u32, &5u32, &storage_hash);
+
+    client.propose_upgrade_with_manifest(&wasm_hash, &10u32, &5u32, &storage_hash);
+    let err = client.try_execute_upgrade().unwrap_err().unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::UpgradeTimeLocked as u32)
+    );
+}

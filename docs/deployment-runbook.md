@@ -270,8 +270,10 @@ stellar contract invoke \
 
 ### Step 4.5 — Upgrading an existing mainnet contract (instead of redeploying)
 
-For code changes to an already-deployed contract, prefer an in-place upgrade,
-which keeps the contract id and all storage:
+For code changes to an already-deployed contract, use the manifest-aware,
+time-locked in-place upgrade flow. The hash-only `upgrade` entry point is
+disabled. Compute the candidate manifest as described in
+[upgrade-safety.md](upgrade-safety.md), then stage the upgrade:
 
 ```bash
 NEW_WASM_HASH=$(stellar contract upload \
@@ -285,13 +287,26 @@ stellar contract invoke \
   --source "$ADMIN_IDENTITY" \
   --network mainnet \
   --rpc-url "$STELLAR_MAINNET_RPC_URL" \
-  -- upgrade \
-  --new_wasm_hash "$NEW_WASM_HASH"
+  -- propose_upgrade_with_manifest_and_signatures \
+  --new_wasm_hash "$NEW_WASM_HASH" \
+  --new_exported_fn_count "$NEW_EXPORTED_FN_COUNT" \
+  --new_error_code_count "$NEW_ERROR_CODE_COUNT" \
+  --new_storage_schema_hash "$NEW_STORAGE_SCHEMA_HASH" \
+  --new_function_signatures_hash "$NEW_FUNCTION_SIGNATURES_HASH"
 ```
 
-Use `upgrade_with_manifest` when a manifest baseline exists — see
-[upgrade-safety.md](upgrade-safety.md). Record both the old and new WASM
-hashes in the deployment record.
+Wait 24 hours, then execute the pending proposal:
+
+```bash
+stellar contract invoke \
+  --id "$CONTRACT_ID" \
+  --source "$ADMIN_IDENTITY" \
+  --network mainnet \
+  --rpc-url "$STELLAR_MAINNET_RPC_URL" \
+  -- execute_upgrade
+```
+
+Record both the old and new WASM hashes in the deployment record.
 
 ---
 
@@ -358,19 +373,12 @@ stellar contract invoke \
 `--reason` is hex-encoded bytes (`696e636964656e74` = `incident`).
 **Verify:** `is_paused` returns `true`. Unpause with `-- unpause` once resolved.
 
-### 6.2 Upgrade back to the previous WASM (minutes)
+### 6.2 Upgrade back to the previous WASM
 
 The previous WASM is still installed on-chain; re-point the contract to it
-using the hash recorded in the deployment record:
-
-```bash
-stellar contract invoke \
-  --id "$CONTRACT_ID" \
-  --source "$ADMIN_IDENTITY" \
-  --network "$NETWORK" \
-  -- upgrade \
-  --new_wasm_hash "$PREVIOUS_WASM_HASH"
-```
+using the hash recorded in the deployment record. A rollback is still an
+upgrade: validate its manifest, stage it through the manifest-aware path, and
+wait the full 24-hour timelock before calling `execute_upgrade()`.
 
 **Verify:** run §7. If the failed version wrote storage in a new layout, the
 old code may not read it — consult [upgrade-safety.md](upgrade-safety.md)

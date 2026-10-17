@@ -82,6 +82,7 @@ STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
 | `CONTRACT_TTL_VAULT` | `string` | — | Deployed `ttl_vault` contract ID (Strkey format) |
 | `CONTRACT_SBT` | `string` | — | Deployed `sbt` contract ID |
 | `CONTRACT_ZK_VERIFIER` | `string` | — | Deployed `zk_verifier` contract ID |
+| `RESTORE_VAULT_CALLER` | `string` | — | Owner/admin address used by disaster-recovery automation; must match `DEPLOYER_IDENTITY` |
 
 **Impact**: If these are missing or incorrect, all vault operations will fail.
 

@@ -4794,6 +4794,30 @@ fn test_manual_archive_vault() {
 }
 
 #[test]
+fn restore_vault_requires_owner_or_admin() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    client.trigger_release(&vault_id);
+    assert!(client.get_archived_vault_info(&vault_id).is_some());
+
+    let outsider = Address::generate(&env);
+    let err = client
+        .try_restore_vault(&vault_id, &outsider)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::NotOwner as u32)
+    );
+    assert!(client.get_archived_vault_info(&vault_id).is_some());
+
+    client.restore_vault(&vault_id, &owner);
+    assert!(client.get_archived_vault_info(&vault_id).is_none());
+}
+
+#[test]
 fn test_archive_locked_vault_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
@@ -7227,4 +7251,3 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
-

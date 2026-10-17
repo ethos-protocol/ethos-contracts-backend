@@ -68,6 +68,7 @@ use ethos_protocol_backend::{
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    log_analysis::log_analysis_router,
     message_queue::MessageQueueState,
     metrics::Metrics,
     predictive_scaling::{
@@ -505,12 +506,7 @@ async fn main() {
         .with_state(aml_screener);
 
     // ── Structured log parsing / search routes ───────────────────────────
-    // NOTE: Log parsing/search is pending implementation.
-    // let log_store = LogStore::new();
-    // let log_router = Router::new()
-    //     .route("/logs/ingest", post(ingest_logs))
-    //     .route("/logs/search", get(search_logs))
-    //     .with_state(log_store);
+    let log_router = log_analysis_router();
 
     // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
     let webauthn_state = Arc::new(WebAuthnState::from_env());
@@ -645,7 +641,7 @@ async fn main() {
         // .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
-        // .merge(log_router)
+        .merge(log_router)
         .merge(webauthn_router)
         .merge(cost_router)
         .merge(dr_router)

@@ -210,7 +210,9 @@ pub async fn confirm_dr_action(
 /// commands documented in `docs/disaster-recovery-runbook.md`. Contract id,
 /// network, and signing identity are read from the same environment
 /// variables the runbook's manual commands reference
-/// (`CONTRACT_TTL_VAULT`, `STELLAR_NETWORK`, `DEPLOYER_IDENTITY`).
+/// (`CONTRACT_TTL_VAULT`, `STELLAR_NETWORK`, `DEPLOYER_IDENTITY`). Restoring a
+/// vault additionally requires `RESTORE_VAULT_CALLER` to be set to the address
+/// represented by the signing identity.
 fn execute_step(step: DrStep, vault_id: Option<u64>) -> DrActionResult {
     let executed_at = Utc::now();
 
@@ -219,11 +221,27 @@ fn execute_step(step: DrStep, vault_id: Option<u64>) -> DrActionResult {
     let args: Vec<String> = match step {
         DrStep::PauseContract => vec!["pause".to_string()],
         DrStep::UnpauseContract => vec!["unpause".to_string()],
-        DrStep::RestoreVault => vec![
-            "restore_vault".to_string(),
-            "--vault_id".to_string(),
-            vault_id.unwrap_or_default().to_string(),
-        ],
+        DrStep::RestoreVault => {
+            let caller = match std::env::var("RESTORE_VAULT_CALLER") {
+                Ok(caller) if !caller.trim().is_empty() => caller,
+                _ => {
+                    return DrActionResult {
+                        step,
+                        success: false,
+                        output: "RESTORE_VAULT_CALLER must be set to the owner or admin address"
+                            .to_string(),
+                        executed_at,
+                    };
+                }
+            };
+            vec![
+                "restore_vault".to_string(),
+                "--vault_id".to_string(),
+                vault_id.unwrap_or_default().to_string(),
+                "--caller".to_string(),
+                caller,
+            ]
+        }
     };
 
     let contract_id = std::env::var("CONTRACT_TTL_VAULT").unwrap_or_default();

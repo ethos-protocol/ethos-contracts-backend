@@ -556,6 +556,7 @@ pub enum DataKey {
     // currently running contract, checked by validate_upgrade.
     UpgradeManifest,
     UpgradeFunctionSignaturesHash,
+    PendingUpgrade,
 
     // ── Issue #563: Cursor-based pagination ────────────────────────────────────
     // (No extra storage keys needed; pagination is computed from existing keys.)
@@ -1617,6 +1618,18 @@ pub struct UpgradeManifest {
     /// Monotonically increasing manifest version, bumped every time the
     /// admin records a new baseline (i.e. after each successful upgrade).
     pub version: u32,
+}
+
+/// Candidate upgrade staged for execution after the upgrade timelock.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    pub wasm_hash: BytesN<32>,
+    pub exported_fn_count: u32,
+    pub error_code_count: u32,
+    pub storage_schema_hash: BytesN<32>,
+    pub function_signatures_hash: Option<BytesN<32>>,
+    pub proposed_at: u64,
 }
 
 /// Stored when an owner commits to an anonymous beneficiary.

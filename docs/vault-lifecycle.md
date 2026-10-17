@@ -200,7 +200,7 @@ The vault remains in the Active state from the perspective of `ReleaseStatus`; h
 
 2. Soroban archives the persistent storage entry after it expires on-chain
 
-3. Beneficiary calls restore_vault(vault_id) to re-extend TTL
+3. Vault owner or admin calls restore_vault(vault_id, caller) to re-extend TTL
    → Vault becomes accessible again
 
 4. Beneficiary calls trigger_release(vault_id)
