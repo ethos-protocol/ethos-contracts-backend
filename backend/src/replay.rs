@@ -103,13 +103,13 @@ pub fn create_request_log_store() -> RequestLogStore {
 /// Append a new log entry and return its ID.
 pub fn record_request(store: &RequestLogStore, log: RequestLog) -> String {
     let id = log.id.clone();
-    store.lock().unwrap().push(log);
+    store.lock().unwrap_or_else(|p| p.into_inner()).push(log);
     id
 }
 
 /// Retrieve a log entry by ID.
 pub fn get_log(store: &RequestLogStore, id: &str) -> Option<RequestLog> {
-    store.lock().unwrap().iter().find(|l| l.id == id).cloned()
+    store.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|l| l.id == id).cloned()
 }
 
 /// List all logs, newest first, with optional path prefix filter.
@@ -118,7 +118,7 @@ pub fn list_logs(
     path_prefix: Option<&str>,
     limit: usize,
 ) -> Vec<RequestLog> {
-    let store = store.lock().unwrap();
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut logs: Vec<RequestLog> = store
         .iter()
         .filter(|l| path_prefix.map_or(true, |p| l.path.starts_with(p)))

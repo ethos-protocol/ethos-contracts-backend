@@ -120,7 +120,7 @@ impl AdaptiveTimeoutManager {
 
     /// Record one observed latency sample for `endpoint`.
     pub fn record_latency(&self, endpoint: &str, latency: Duration) {
-        let mut windows = self.windows.lock().unwrap();
+        let mut windows = self.windows.lock().unwrap_or_else(|p| p.into_inner());
         let window = windows
             .entry(endpoint.to_string())
             .or_insert_with(|| LatencyWindow::new(self.config.window_size));
@@ -138,7 +138,7 @@ impl AdaptiveTimeoutManager {
     /// Falls back to `default_timeout` until `min_samples` observations have
     /// been recorded, then dynamically tracks the configured percentile.
     pub fn current_timeout(&self, endpoint: &str) -> Duration {
-        let windows = self.windows.lock().unwrap();
+        let windows = self.windows.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = windows.get(endpoint) else {
             return self.config.default_timeout;
         };
@@ -157,7 +157,7 @@ impl AdaptiveTimeoutManager {
     /// recent trend in the tracked percentile via an exponential moving
     /// average with a small look-ahead bias.
     pub fn predict_timeout(&self, endpoint: &str) -> Option<Duration> {
-        let windows = self.windows.lock().unwrap();
+        let windows = self.windows.lock().unwrap_or_else(|p| p.into_inner());
         let window = windows.get(endpoint)?;
         if window.percentile_history.len() < 2 {
             return None;
@@ -181,7 +181,7 @@ impl AdaptiveTimeoutManager {
     }
 
     pub fn snapshot(&self, endpoint: &str) -> TimeoutSnapshot {
-        let windows = self.windows.lock().unwrap();
+        let windows = self.windows.lock().unwrap_or_else(|p| p.into_inner());
         let sample_count = windows.get(endpoint).map_or(0, LatencyWindow::len);
         let observed_percentile_ms = windows
             .get(endpoint)
@@ -199,7 +199,7 @@ impl AdaptiveTimeoutManager {
     }
 
     pub fn tracked_endpoints(&self) -> Vec<String> {
-        self.windows.lock().unwrap().keys().cloned().collect()
+        self.windows.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect()
     }
 
     fn clamp(&self, timeout: Duration) -> Duration {

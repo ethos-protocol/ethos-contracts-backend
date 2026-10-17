@@ -83,7 +83,7 @@ impl ConsumerLagTracker {
     /// Record that the CDC source has produced up to `offset` (monotonic; a
     /// lower value is ignored so out-of-order updates cannot rewind the head).
     pub fn record_source_offset(&self, offset: u64) {
-        let mut head = self.source_offset.write().unwrap();
+        let mut head = self.source_offset.write().unwrap_or_else(|p| p.into_inner());
         if offset > *head {
             *head = offset;
         }
@@ -93,7 +93,7 @@ impl ConsumerLagTracker {
     pub fn record_progress(&self, consumer: &str, offset: u64, at: DateTime<Utc>) {
         self.consumers
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(consumer.to_string(), Progress { offset, at });
     }
 
@@ -109,8 +109,8 @@ impl ConsumerLagTracker {
 
     /// [`lag`](Self::lag) evaluated against an explicit `now` (for tests).
     pub fn lag_at(&self, consumer: &str, now: DateTime<Utc>) -> Option<LagSnapshot> {
-        let progress = *self.consumers.read().unwrap().get(consumer)?;
-        let head = *self.source_offset.read().unwrap();
+        let progress = *self.consumers.read().unwrap_or_else(|p| p.into_inner()).get(consumer)?;
+        let head = *self.source_offset.read().unwrap_or_else(|p| p.into_inner());
         Some(LagSnapshot {
             offset_lag: head.saturating_sub(progress.offset),
             time_lag_seconds: (now - progress.at).num_seconds().max(0),
@@ -122,7 +122,7 @@ impl ConsumerLagTracker {
         let now = Utc::now();
         self.consumers
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .keys()
             .filter_map(|c| self.lag_at(c, now).map(|l| (c.clone(), l)))
             .collect()
@@ -135,7 +135,7 @@ impl ConsumerLagTracker {
         let mut out: Vec<LagAlert> = self
             .consumers
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .keys()
             .filter_map(|consumer| {
                 let lag = self.lag_at(consumer, now)?;
@@ -199,7 +199,7 @@ mod tests {
     struct CapturingSink(Mutex<Vec<LagAlert>>);
     impl AlertSink for CapturingSink {
         fn raise(&self, alert: &LagAlert) {
-            self.0.lock().unwrap().push(alert.clone());
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).push(alert.clone());
         }
     }
 
@@ -271,7 +271,7 @@ mod tests {
         let raised = t.evaluate(500, &sink);
 
         assert_eq!(raised.len(), 2);
-        let captured = sink.0.lock().unwrap();
+        let captured = sink.0.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].consumer, "a");
         assert_eq!(captured[1].consumer, "b");

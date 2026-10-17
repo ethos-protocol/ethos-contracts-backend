@@ -85,7 +85,7 @@ impl MetadataCache {
 
     /// Retrieve a cached entry.  Returns `None` if absent or expired.
     pub fn get(&self, vault_id: &str) -> Option<VaultMetadata> {
-        let mut guard = self.entries.lock().unwrap();
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = guard.get_mut(vault_id) {
             if entry.inserted_at.elapsed() < self.config.ttl {
                 entry.last_accessed = Instant::now();
@@ -103,7 +103,7 @@ impl MetadataCache {
 
     /// Insert or update an entry, evicting the LRU entry if the cache is full.
     pub fn insert(&self, metadata: VaultMetadata) {
-        let mut guard = self.entries.lock().unwrap();
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
 
         // Evict the least-recently-used entry when at capacity.
         if guard.len() >= self.config.max_entries && !guard.contains_key(&metadata.vault_id) {
@@ -128,12 +128,12 @@ impl MetadataCache {
 
     /// Explicitly invalidate a single entry (e.g. after a write).
     pub fn invalidate(&self, vault_id: &str) {
-        self.entries.lock().unwrap().remove(vault_id);
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).remove(vault_id);
     }
 
     /// Invalidate all entries.
     pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Return (hits, misses) counters.
@@ -146,7 +146,7 @@ impl MetadataCache {
 
     /// Number of entries currently in the cache (including potentially stale ones).
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// `true` when the cache has no entries.
@@ -224,7 +224,7 @@ impl LazyMetadataLoader {
 impl Db {
     /// Upsert a vault metadata row into `vault_metadata`.
     pub fn upsert_vault_metadata(&self, m: &VaultMetadata) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO vault_metadata (vault_id, fields, updated_at)
               VALUES (?1, ?2, ?3)
               ON CONFLICT(vault_id) DO UPDATE SET
@@ -241,7 +241,7 @@ impl Db {
 
     /// Retrieve a vault metadata row, or `None` if no row exists.
     pub fn get_vault_metadata(&self, vault_id: &str) -> Option<VaultMetadata> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = binding
             .prepare(
                 r"SELECT vault_id, fields, updated_at
@@ -269,7 +269,7 @@ impl Db {
 
     /// Delete the metadata row for `vault_id`.
     pub fn delete_vault_metadata(&self, vault_id: &str) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM vault_metadata WHERE vault_id = ?1",
             rusqlite::params![vault_id],
         )?;

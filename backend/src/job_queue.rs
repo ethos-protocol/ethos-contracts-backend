@@ -80,7 +80,7 @@ impl JobQueue {
 
         self.inner
             .write()
-            .expect("job queue lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .jobs
             .insert(job_id.clone(), job);
 
@@ -91,7 +91,7 @@ impl JobQueue {
     pub fn get_job(&self, job_id: &str) -> Option<Job> {
         self.inner
             .read()
-            .expect("job queue lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .jobs
             .get(job_id)
             .cloned()
@@ -99,7 +99,7 @@ impl JobQueue {
 
     /// Mark a job as running.
     pub fn start_job(&self, job_id: &str) -> bool {
-        let mut inner = self.inner.write().expect("job queue lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = inner.jobs.get_mut(job_id) {
             if job.status == JobStatus::Pending {
                 job.status = JobStatus::Running;
@@ -112,7 +112,7 @@ impl JobQueue {
 
     /// Complete a job with a result.
     pub fn complete_job(&self, job_id: &str, result: String) -> bool {
-        let mut inner = self.inner.write().expect("job queue lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = inner.jobs.get_mut(job_id) {
             if job.status == JobStatus::Running {
                 job.status = JobStatus::Completed;
@@ -126,7 +126,7 @@ impl JobQueue {
 
     /// Fail a job with an error message.
     pub fn fail_job(&self, job_id: &str, error: String) -> bool {
-        let mut inner = self.inner.write().expect("job queue lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = inner.jobs.get_mut(job_id) {
             if job.status == JobStatus::Running || job.status == JobStatus::Pending {
                 job.status = JobStatus::Failed;
@@ -141,7 +141,7 @@ impl JobQueue {
     pub fn list_jobs(&self) -> Vec<Job> {
         self.inner
             .read()
-            .expect("job queue lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .jobs
             .values()
             .cloned()

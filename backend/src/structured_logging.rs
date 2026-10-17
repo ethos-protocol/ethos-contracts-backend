@@ -450,7 +450,7 @@ mod tests {
     fn test_memory_sink_captures_logs() {
         let sink = Arc::new(MemorySink::new());
         let logger = StructuredLogger::new();
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         let entry = StructuredLogEntry::new(LogLevel::Info, "test", "Test message");
@@ -474,7 +474,7 @@ mod tests {
         };
 
         let logger = StructuredLogger::with_config(config);
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         // Add two entries (should trigger flush)
@@ -496,7 +496,7 @@ mod tests {
         };
 
         let logger = StructuredLogger::with_config(config);
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         logger.debug("test", "Debug message");
@@ -520,7 +520,7 @@ mod tests {
         };
 
         let logger = StructuredLogger::with_config(config);
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         logger.info("vault_manager", "Vault message");
@@ -543,7 +543,7 @@ mod tests {
         };
 
         let logger = StructuredLogger::with_config(config);
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         logger.info("important_module", "Important message");
@@ -560,7 +560,7 @@ mod tests {
         let sink1 = Arc::new(MemorySink::new());
         let sink2 = Arc::new(MemorySink::new());
         let logger = StructuredLogger::new();
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink1.clone());
         logger.add_sink(sink2.clone());
 
@@ -575,7 +575,7 @@ mod tests {
     fn test_convenience_methods() {
         let sink = Arc::new(MemorySink::new());
         let logger = StructuredLogger::new();
-        logger.sinks.lock().unwrap().clear();
+        logger.sinks.lock().unwrap_or_else(|p| p.into_inner()).clear();
         logger.add_sink(sink.clone());
 
         logger.trace("test", "Trace message");

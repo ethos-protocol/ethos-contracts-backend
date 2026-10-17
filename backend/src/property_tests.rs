@@ -440,7 +440,7 @@ mod tests {
             let vault_store = create_vault_store();
             for i in 0..n_vaults {
                 let v = make_vault(&format!("v{i}"), "owner", 100, VaultStatus::Active);
-                vault_store.lock().unwrap().insert(v.id.clone(), v);
+                vault_store.lock().unwrap_or_else(|p| p.into_inner()).insert(v.id.clone(), v);
             }
 
             // Collect all pages.

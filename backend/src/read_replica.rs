@@ -317,7 +317,7 @@ impl ReadReplicaRouter {
     pub fn record_lag(&self, replica_id: &str, lag_ms: u64) {
         for r in &self.replicas {
             if r.id == replica_id {
-                let mut m = r.metrics.lock().unwrap();
+                let mut m = r.metrics.lock().unwrap_or_else(|p| p.into_inner());
                 m.lag_ms = lag_ms;
                 m.last_checked_at = Some(Instant::now());
                 if m.health != ReplicaHealth::Unreachable {
@@ -336,15 +336,15 @@ impl ReadReplicaRouter {
         self.replicas
             .iter()
             .find(|r| r.id == replica_id)
-            .map(|r| r.metrics.lock().unwrap().lag_ms)
+            .map(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).lag_ms)
     }
 
     /// Find the freshest healthy replica (the one with the lowest replication lag).
     pub fn freshest_replica(&self) -> Option<Arc<ReplicaConn>> {
         self.replicas
             .iter()
-            .filter(|r| r.metrics.lock().unwrap().health == ReplicaHealth::Healthy)
-            .min_by_key(|r| r.metrics.lock().unwrap().lag_ms)
+            .filter(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).health == ReplicaHealth::Healthy)
+            .min_by_key(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).lag_ms)
             .cloned()
     }
 
@@ -357,7 +357,7 @@ impl ReadReplicaRouter {
     pub fn primary_metrics(&self) -> Option<ReplicaMetrics> {
         self.primary
             .as_ref()
-            .map(|p| p.metrics.lock().unwrap().clone())
+            .map(|p| p.metrics.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     // ── Routing ───────────────────────────────────────────────────────────────
@@ -365,7 +365,7 @@ impl ReadReplicaRouter {
     /// Returns `true` if at least one replica is [`ReplicaHealth::Healthy`].
     pub fn has_healthy_replicas(&self) -> bool {
         self.replicas.iter().any(|r| {
-            r.metrics.lock().unwrap().health == ReplicaHealth::Healthy
+            r.metrics.lock().unwrap_or_else(|p| p.into_inner()).health == ReplicaHealth::Healthy
         })
     }
 
@@ -402,7 +402,7 @@ impl ReadReplicaRouter {
 
             // If no primary is configured in the router, route to the freshest replica.
             if let Some(freshest) = self.freshest_replica() {
-                if freshest.metrics.lock().unwrap().lag_ms <= max_lag {
+                if freshest.metrics.lock().unwrap_or_else(|p| p.into_inner()).lag_ms <= max_lag {
                     return Ok(freshest);
                 }
             }
@@ -415,7 +415,7 @@ impl ReadReplicaRouter {
             .replicas
             .iter()
             .filter(|r| {
-                let m = r.metrics.lock().unwrap();
+                let m = r.metrics.lock().unwrap_or_else(|p| p.into_inner());
                 m.health == ReplicaHealth::Healthy && m.lag_ms <= max_lag
             })
             .cloned()
@@ -424,7 +424,7 @@ impl ReadReplicaRouter {
         if !eligible.is_empty() {
             match self.strategy {
                 ReplicaRoutingStrategy::RoundRobin => {
-                    let mut cursor = self.rr_cursor.lock().unwrap();
+                    let mut cursor = self.rr_cursor.lock().unwrap_or_else(|p| p.into_inner());
                     let idx = *cursor % eligible.len();
                     *cursor = cursor.wrapping_add(1);
                     return Ok(Arc::clone(&eligible[idx]));
@@ -432,7 +432,7 @@ impl ReadReplicaRouter {
                 ReplicaRoutingStrategy::LeastLag => {
                     let best = eligible
                         .into_iter()
-                        .min_by_key(|r| r.metrics.lock().unwrap().lag_ms)
+                        .min_by_key(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).lag_ms)
                         .unwrap();
                     return Ok(best);
                 }
@@ -469,10 +469,10 @@ impl ReadReplicaRouter {
             Err(e) => return Err(e),
         };
 
-        let conn = target.conn.lock().unwrap();
+        let conn = target.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute_batch("SELECT 1")
             .map_err(|e| ReplicaError::Query(e.to_string()))?;
-        target.metrics.lock().unwrap().total_reads += 1;
+        target.metrics.lock().unwrap_or_else(|p| p.into_inner()).total_reads += 1;
         Ok(true)
     }
 
@@ -517,7 +517,7 @@ impl ReadReplicaRouter {
     {
         let target = self.select_target_for_read(options)?;
 
-        let conn = target.conn.lock().unwrap();
+        let conn = target.conn.lock().unwrap_or_else(|p| p.into_inner());
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -530,7 +530,7 @@ impl ReadReplicaRouter {
             .optional()
             .map_err(|e| ReplicaError::Query(e.to_string()))?;
 
-        target.metrics.lock().unwrap().total_reads += 1;
+        target.metrics.lock().unwrap_or_else(|p| p.into_inner()).total_reads += 1;
         Ok(result)
     }
 
@@ -550,11 +550,11 @@ impl ReadReplicaRouter {
 
     fn check_replica(&self, replica: Arc<ReplicaConn>) {
         let start = Instant::now();
-        let conn = replica.conn.lock().unwrap();
+        let conn = replica.conn.lock().unwrap_or_else(|p| p.into_inner());
 
         // Basic connectivity check.
         if conn.execute_batch("SELECT 1").is_err() {
-            let mut m = replica.metrics.lock().unwrap();
+            let mut m = replica.metrics.lock().unwrap_or_else(|p| p.into_inner());
             m.health = ReplicaHealth::Unreachable;
             m.last_checked_at = Some(Instant::now());
             return;
@@ -572,7 +572,7 @@ impl ReadReplicaRouter {
             .map(|v| v as u64)
             .unwrap_or(rtt_ms); // fall back to RTT as lag proxy
 
-        let mut m = replica.metrics.lock().unwrap();
+        let mut m = replica.metrics.lock().unwrap_or_else(|p| p.into_inner());
         m.lag_ms = lag_ms;
         m.last_checked_at = Some(Instant::now());
         m.health = if lag_ms > self.lag_threshold_ms {
@@ -586,7 +586,7 @@ impl ReadReplicaRouter {
     pub fn mark_healthy(&self, replica_id: &str) {
         for r in &self.replicas {
             if r.id == replica_id {
-                let mut m = r.metrics.lock().unwrap();
+                let mut m = r.metrics.lock().unwrap_or_else(|p| p.into_inner());
                 m.health = ReplicaHealth::Healthy;
                 m.lag_ms = 0;
             }
@@ -597,7 +597,7 @@ impl ReadReplicaRouter {
     pub fn mark_unreachable(&self, replica_id: &str) {
         for r in &self.replicas {
             if r.id == replica_id {
-                r.metrics.lock().unwrap().health = ReplicaHealth::Unreachable;
+                r.metrics.lock().unwrap_or_else(|p| p.into_inner()).health = ReplicaHealth::Unreachable;
             }
         }
     }
@@ -608,10 +608,10 @@ impl ReadReplicaRouter {
     pub fn all_metrics(&self) -> Vec<ReplicaMetrics> {
         let mut list: Vec<ReplicaMetrics> = Vec::new();
         if let Some(ref p) = self.primary {
-            list.push(p.metrics.lock().unwrap().clone());
+            list.push(p.metrics.lock().unwrap_or_else(|p| p.into_inner()).clone());
         }
         for r in &self.replicas {
-            list.push(r.metrics.lock().unwrap().clone());
+            list.push(r.metrics.lock().unwrap_or_else(|p| p.into_inner()).clone());
         }
         list
     }
@@ -625,7 +625,7 @@ impl ReadReplicaRouter {
     pub fn healthy_count(&self) -> usize {
         self.replicas
             .iter()
-            .filter(|r| r.metrics.lock().unwrap().health == ReplicaHealth::Healthy)
+            .filter(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).health == ReplicaHealth::Healthy)
             .count()
     }
 
@@ -633,7 +633,7 @@ impl ReadReplicaRouter {
     pub fn staleness_exceeded_count(&self) -> usize {
         self.replicas
             .iter()
-            .filter(|r| r.metrics.lock().unwrap().health == ReplicaHealth::LagExceeded)
+            .filter(|r| r.metrics.lock().unwrap_or_else(|p| p.into_inner()).health == ReplicaHealth::LagExceeded)
             .count()
     }
 }

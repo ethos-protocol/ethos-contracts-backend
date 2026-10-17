@@ -447,7 +447,7 @@ pub async fn create_sla_policy(
         updated_at: now,
     };
 
-    let mut inner = state.store.lock().expect("sla store poisoned");
+    let mut inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     inner.policies.insert(policy.id.clone(), policy.clone());
     Ok((StatusCode::CREATED, Json(policy)))
 }
@@ -456,7 +456,7 @@ pub async fn create_sla_policy(
 pub async fn list_sla_policies(
     State(state): State<Arc<SlaState>>,
 ) -> Json<Vec<SlaPolicy>> {
-    let inner = state.store.lock().expect("sla store poisoned");
+    let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut policies: Vec<SlaPolicy> = inner.policies.values().cloned().collect();
     policies.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Json(policies)
@@ -467,7 +467,7 @@ pub async fn get_sla_policy(
     State(state): State<Arc<SlaState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SlaPolicy>, (StatusCode, Json<serde_json::Value>)> {
-    let inner = state.store.lock().expect("sla store poisoned");
+    let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     inner
         .policies
         .get(&id)
@@ -487,7 +487,7 @@ pub async fn update_sla_policy(
     Path(id): Path<String>,
     Json(body): Json<UpdateSlaPolicyRequest>,
 ) -> Result<Json<SlaPolicy>, (StatusCode, Json<serde_json::Value>)> {
-    let mut inner = state.store.lock().expect("sla store poisoned");
+    let mut inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let policy = inner.policies.get_mut(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -535,7 +535,7 @@ pub async fn delete_sla_policy(
     State(state): State<Arc<SlaState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let mut inner = state.store.lock().expect("sla store poisoned");
+    let mut inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     if inner.policies.remove(&id).is_some() {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -551,7 +551,7 @@ pub async fn record_sla_measurement(
     State(state): State<Arc<SlaState>>,
     Json(body): Json<RecordMeasurementRequest>,
 ) -> Result<(StatusCode, Json<SlaMeasurement>), (StatusCode, Json<serde_json::Value>)> {
-    let mut inner = state.store.lock().expect("sla store poisoned");
+    let mut inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
 
     // Validate that the referenced policy exists and is enabled.
     let policy = inner
@@ -612,7 +612,7 @@ pub async fn get_sla_report(
     State(state): State<Arc<SlaState>>,
     Query(query): Query<SlaReportQuery>,
 ) -> Json<SlaReport> {
-    let inner = state.store.lock().expect("sla store poisoned");
+    let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let now = Utc::now();
 
     let policies: Vec<&SlaPolicy> = inner
@@ -677,7 +677,7 @@ pub async fn list_sla_breaches(
     State(state): State<Arc<SlaState>>,
     Query(query): Query<SlaBreachQuery>,
 ) -> Json<Vec<SlaBreach>> {
-    let inner = state.store.lock().expect("sla store poisoned");
+    let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let limit = query.limit.unwrap_or(50);
 
     let mut breaches: Vec<SlaBreach> = inner
@@ -704,7 +704,7 @@ pub async fn get_compliance_summary(
     State(state): State<Arc<SlaState>>,
     Query(query): Query<SlaReportQuery>,
 ) -> Json<Vec<SlaComplianceSummary>> {
-    let inner = state.store.lock().expect("sla store poisoned");
+    let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let now = Utc::now();
 
     let mut summaries: Vec<SlaComplianceSummary> = inner
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn test_seed_default_policies() {
         let state = SlaState::new();
-        let inner = state.store.lock().unwrap();
+        let inner = state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
             inner.policies.len() >= 4,
             "expected at least 4 default policies, got {}",

@@ -123,7 +123,7 @@ impl CustomMetricsStore {
     }
 
     pub fn record(&self, name: &str, value: f64, tags: HashMap<String, String>) {
-        let mut inner = self.inner.write().expect("metrics lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.series.entry(name.to_string()).or_default().push(MetricPoint {
             timestamp: Utc::now(),
             value,
@@ -132,7 +132,7 @@ impl CustomMetricsStore {
     }
 
     pub fn aggregate(&self, name: &str, agg: Aggregation) -> Option<AggregateResponse> {
-        let inner = self.inner.read().expect("metrics lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let points = inner.series.get(name)?;
         Some(AggregateResponse {
             name: name.to_string(),
@@ -145,7 +145,7 @@ impl CustomMetricsStore {
     pub fn list_metric_names(&self) -> Vec<String> {
         self.inner
             .read()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .series
             .keys()
             .cloned()
@@ -161,7 +161,7 @@ impl CustomMetricsStore {
         };
         self.inner
             .write()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .shares
             .insert(share.token.clone(), share.clone());
         share
@@ -170,7 +170,7 @@ impl CustomMetricsStore {
     pub fn resolve_share(&self, token: &str) -> Option<DashboardShare> {
         self.inner
             .read()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .shares
             .get(token)
             .cloned()

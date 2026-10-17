@@ -180,17 +180,17 @@ impl RetryPolicyStore {
     }
 
     pub fn upsert(&self, policy: RetryPolicy) -> RetryPolicy {
-        let mut guard = self.policies.lock().unwrap();
+        let mut guard = self.policies.lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(policy.id.clone(), policy.clone());
         policy
     }
 
     pub fn get(&self, id: &str) -> Option<RetryPolicy> {
-        self.policies.lock().unwrap().get(id).cloned()
+        self.policies.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
     }
 
     pub fn list(&self) -> Vec<RetryPolicy> {
-        self.policies.lock().unwrap().values().cloned().collect()
+        self.policies.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
     }
 
     /// Finds the first policy whose `endpoint_pattern` is a prefix of
@@ -198,7 +198,7 @@ impl RetryPolicyStore {
     pub fn find_for_path(&self, path: &str) -> Option<RetryPolicy> {
         self.policies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .filter(|p| {
                 let pattern = p.endpoint_pattern.trim_end_matches('*');

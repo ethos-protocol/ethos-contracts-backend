@@ -158,7 +158,7 @@ impl DeadlockDetector {
     /// - If `holder` already holds `resource`, `Ok(())` is returned
     ///   (re-entrant acquisition).
     pub fn acquire_lock(&self, resource: &str, holder: &str) -> Result<(), DeadlockError> {
-        let mut locks = self.active_locks.lock().unwrap();
+        let mut locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
 
         // Re-entrant: same holder already owns the lock.
         if locks.get(resource).is_some_and(|e| e.holder == holder) {
@@ -196,7 +196,7 @@ impl DeadlockDetector {
     ///
     /// If `holder` is not the current holder the call is silently ignored.
     pub fn release_lock(&self, resource: &str, holder: &str) {
-        let mut locks = self.active_locks.lock().unwrap();
+        let mut locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = locks.get(resource) {
             if entry.holder == holder {
                 locks.remove(resource);
@@ -211,7 +211,7 @@ impl DeadlockDetector {
     /// holds some other resource that the current holder of `resource` is
     /// waiting on (directly or transitively), a cycle exists.
     pub fn detect_cycle(&self, resource: &str, holder: &str) -> bool {
-        let locks = self.active_locks.lock().unwrap();
+        let locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         Self::check_cycle_inner(&locks, resource, holder)
     }
 
@@ -309,7 +309,7 @@ impl DeadlockDetector {
 
     /// Return a point-in-time snapshot of detector statistics.
     pub fn stats(&self) -> DeadlockStats {
-        let locks = self.active_locks.lock().unwrap();
+        let locks = self.active_locks.lock().unwrap_or_else(|p| p.into_inner());
         DeadlockStats {
             deadlocks_detected: self.deadlock_count.load(Ordering::Relaxed),
             retries_performed: self.retry_count.load(Ordering::Relaxed),

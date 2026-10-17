@@ -499,7 +499,7 @@ impl AnomalyStore {
         let service = service_label(service);
         let key = metric_key(&service, metric);
 
-        let mut guard = self.inner.write().expect("anomaly lock poisoned");
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let inner = &mut *guard;
 
         let baseline = inner.baselines.entry(key.clone()).or_default();
@@ -574,7 +574,7 @@ impl AnomalyStore {
     pub fn alerts(&self) -> Vec<Alert> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .alerts
             .clone()
     }
@@ -582,14 +582,14 @@ impl AnomalyStore {
     pub fn baseline(&self, metric: &str) -> Option<Baseline> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .baselines
             .get(metric)
             .cloned()
     }
 
     pub fn suppress_anomaly(&self, pattern: &str, expires_at: Option<DateTime<Utc>>) -> u64 {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.suppression_counter += 1;
         let id = inner.suppression_counter;
 
@@ -605,12 +605,12 @@ impl AnomalyStore {
     }
 
     pub fn get_suppressions(&self) -> Vec<Suppression> {
-        let inner = self.inner.read().expect("anomaly lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let now = Utc::now();
         inner
             .suppressions
             .values()
-            .filter(|s| s.expires_at.is_none() || s.expires_at.unwrap() > now)
+            .filter(|s| s.expires_at.is_none_or(|expires_at| expires_at > now))
             .cloned()
             .collect()
     }
@@ -618,7 +618,7 @@ impl AnomalyStore {
     pub fn remove_suppression(&self, id: u64) -> bool {
         self.inner
             .write()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .suppressions
             .remove(&id)
             .is_some()
@@ -627,7 +627,7 @@ impl AnomalyStore {
     pub fn get_correlated_anomalies(&self, anomaly_id: &str) -> Vec<String> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .correlations
             .get(anomaly_id)
             .map(|c| c.correlated_ids.clone())
@@ -635,7 +635,7 @@ impl AnomalyStore {
     }
 
     pub fn add_correlation(&self, anomaly_id: &str, correlated_id: &str, strength: f64) {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let correlation = inner
             .correlations
             .entry(anomaly_id.to_string())
@@ -653,7 +653,7 @@ impl AnomalyStore {
 
     pub fn process_stream_event(&self, metric: &str, value: f64) -> (Option<Alert>, StreamEvent) {
         let event_id = {
-            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
             inner.stream_events.len() as u64 + 1
         };
 
@@ -665,7 +665,7 @@ impl AnomalyStore {
         };
 
         {
-            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
             inner.stream_events.push(event.clone());
         }
 
@@ -676,13 +676,13 @@ impl AnomalyStore {
     pub fn get_stream_events(&self) -> Vec<StreamEvent> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .stream_events
             .clone()
     }
 
     pub fn submit_feedback(&self, anomaly_id: &str, is_true_positive: bool) -> String {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let feedback_id = Uuid::new_v4().to_string();
 
         let feedback = Feedback {
@@ -699,7 +699,7 @@ impl AnomalyStore {
     pub fn get_feedback(&self) -> Vec<Feedback> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .feedback_entries
             .clone()
     }
@@ -707,7 +707,7 @@ impl AnomalyStore {
     pub fn get_feedback_for_anomaly(&self, anomaly_id: &str) -> Vec<Feedback> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .feedback_entries
             .iter()
             .filter(|f| f.anomaly_id == anomaly_id)
@@ -882,6 +882,17 @@ pub async fn get_investigation_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anomaly_store_recovers_poisoned_lock() {
+        let store = AnomalyStore::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.write().unwrap_or_else(|p| p.into_inner());
+            panic!("poison anomaly store lock");
+        }));
+
+        assert!(store.alerts().is_empty());
+    }
 
     #[test]
     fn no_alert_while_learning_baseline() {

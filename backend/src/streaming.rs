@@ -145,7 +145,7 @@ pub async fn stream_vaults(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
 
-    let vaults_guard = state.vault_store.lock().unwrap();
+    let vaults_guard = state.vault_store.lock().unwrap_or_else(|p| p.into_inner());
     let filtered: Vec<Vault> = vaults_guard
         .values()
         .filter(|v| {
@@ -190,7 +190,7 @@ pub async fn stream_events(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
 
-    let events_guard = state.event_store.lock().unwrap();
+    let events_guard = state.event_store.lock().unwrap_or_else(|p| p.into_inner());
     let filtered: Vec<VaultEvent> = events_guard
         .iter()
         .filter(|e| {

@@ -71,7 +71,7 @@ fn hash_backup_code(code: &str) -> String {
 /// the call that actually consumed the code; under concurrent attempts with
 /// the same code, exactly one caller sees `true`.
 fn verify_and_consume_backup_code(db: &Db, vault_id: &str, code: &str) -> Result<bool, AppError> {
-    let _guard = BACKUP_CODE_CONSUME_LOCK.lock().unwrap();
+    let _guard = BACKUP_CODE_CONSUME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let Some(mut config) = db.get_2fa_config(vault_id)? else {
         return Ok(false);
@@ -135,7 +135,7 @@ fn verify_totp_code(secret: &str, code: &str) -> bool {
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     let time_step = now / 30;
 
@@ -197,10 +197,10 @@ fn base32_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn verify_pending_otp(vault_id: &str, code: &str) -> bool {
-    let mut store = PENDING_OTPS.lock().unwrap();
+    let mut store = PENDING_OTPS.lock().unwrap_or_else(|p| p.into_inner());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
 
     if let Some(codes) = store.get_mut(vault_id) {
@@ -223,7 +223,7 @@ pub async fn get_2fa_status(
     let config = db.get_2fa_config(&vault_id)?;
     let session_verified = SESSION_VERIFIED
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&vault_id)
         .copied()
         .unwrap_or(false);
@@ -305,13 +305,13 @@ pub async fn enable_2fa(
             let code = generate_otp_code();
             let expires_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
                 + 300;
 
             PENDING_OTPS
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .entry(vault_id.clone())
                 .or_default()
                 .push(PendingOtp {
@@ -347,13 +347,13 @@ pub async fn enable_2fa(
             let code = generate_otp_code();
             let expires_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
                 + 300;
 
             PENDING_OTPS
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .entry(vault_id.clone())
                 .or_default()
                 .push(PendingOtp {
@@ -433,7 +433,7 @@ pub async fn verify_2fa(
     };
     db.upsert_2fa_config(&updated)?;
 
-    SESSION_VERIFIED.lock().unwrap().insert(vault_id, true);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).insert(vault_id, true);
 
     Ok(StatusCode::OK)
 }
@@ -444,8 +444,8 @@ pub async fn disable_2fa(
     Path(vault_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     db.delete_2fa_config(&vault_id)?;
-    SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
-    PENDING_OTPS.lock().unwrap().remove(&vault_id);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
+    PENDING_OTPS.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -457,7 +457,7 @@ pub async fn challenge_2fa(
     let config = db.get_2fa_config(&vault_id)?;
     let session_verified = SESSION_VERIFIED
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&vault_id)
         .copied()
         .unwrap_or(false);
@@ -487,7 +487,7 @@ pub async fn challenge_2fa(
 
 /// POST /api/vaults/{vault_id}/2fa/session/clear
 pub async fn clear_2fa_session(Path(vault_id): Path<String>) -> Result<StatusCode, AppError> {
-    SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
     Ok(StatusCode::OK)
 }
 

@@ -143,7 +143,7 @@ pub async fn register_fallback_chain(
         active: true,
     };
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(chain.id.clone(), chain.clone());
 
     Ok((StatusCode::CREATED, Json(chain)))
@@ -153,7 +153,7 @@ pub async fn register_fallback_chain(
 pub async fn list_fallback_chains(
     State(state): State<Arc<FallbackState>>,
 ) -> Json<Vec<FallbackChain>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     Json(store.values().cloned().collect())
 }
 
@@ -162,7 +162,7 @@ pub async fn get_fallback_chain(
     State(state): State<Arc<FallbackState>>,
     Path(id): Path<String>,
 ) -> Result<Json<FallbackChain>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store
         .get(&id)
         .cloned()
@@ -179,7 +179,7 @@ pub async fn test_fallback_chain(
     Json(body): Json<TestFallbackChainRequest>,
 ) -> Result<Json<FallbackExecutionResult>, StatusCode> {
     let chain = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         store.get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?
     };
 
@@ -250,7 +250,7 @@ where
 
 /// Find the active chain protecting `resource`, if any.
 pub fn find_chain_for_resource(state: &FallbackState, resource: &str) -> Option<FallbackChain> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store
         .values()
         .find(|c| c.active && c.resource == resource)

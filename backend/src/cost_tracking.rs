@@ -283,28 +283,28 @@ impl CostState {
     }
 
     pub fn record(&self, entry: CostEntry) {
-        self.entries.lock().unwrap().push(entry);
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
     }
 
     pub fn snapshot(&self) -> Vec<CostEntry> {
-        self.entries.lock().unwrap().clone()
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     // ── Gas entry recording ────────────────────────────────────────────────
 
     /// Record a single on-chain gas fee entry.
     pub fn record_gas(&self, entry: GasCostEntry) {
-        self.gas_entries.lock().unwrap().push(entry);
+        self.gas_entries.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
     }
 
     /// Return all recorded gas entries.
     pub fn gas_snapshot(&self) -> Vec<GasCostEntry> {
-        self.gas_entries.lock().unwrap().clone()
+        self.gas_entries.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Aggregate gas entries into a `GasCostReport`.
     pub fn gas_report(&self) -> GasCostReport {
-        let entries = self.gas_entries.lock().unwrap();
+        let entries = self.gas_entries.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut total_fee_stroops: u64 = 0;
         let mut by_op: HashMap<String, Vec<u64>> = HashMap::new();
@@ -352,7 +352,7 @@ impl CostState {
         let fiat = self.report();
         let gas = self.gas_report();
         let breaches = self.check_budget_breaches();
-        let threshold_count = self.thresholds.lock().unwrap().len();
+        let threshold_count = self.thresholds.lock().unwrap_or_else(|p| p.into_inner()).len();
 
         // Top-5 fiat operations by total cost (descending)
         let mut fiat_ops: Vec<OperationCostItem> = fiat
@@ -512,13 +512,13 @@ impl CostState {
 
     /// Configure (or replace, by `category`) a budget threshold.
     pub fn set_budget_threshold(&self, threshold: BudgetThreshold) {
-        let mut thresholds = self.thresholds.lock().unwrap();
+        let mut thresholds = self.thresholds.lock().unwrap_or_else(|p| p.into_inner());
         thresholds.retain(|t| t.category != threshold.category);
         thresholds.push(threshold);
     }
 
     pub fn budget_thresholds(&self) -> Vec<BudgetThreshold> {
-        self.thresholds.lock().unwrap().clone()
+        self.thresholds.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Evaluate every configured budget threshold against currently
@@ -526,8 +526,8 @@ impl CostState {
     /// exceeded, so callers can raise an alert before costs run further
     /// away.
     pub fn check_budget_breaches(&self) -> Vec<BudgetBreach> {
-        let entries = self.entries.lock().unwrap();
-        let thresholds = self.thresholds.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let thresholds = self.thresholds.lock().unwrap_or_else(|p| p.into_inner());
 
         thresholds
             .iter()
@@ -554,7 +554,7 @@ impl CostState {
 
     /// Build an aggregate report across all recorded cost entries.
     pub fn report(&self) -> CostReport {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut total_amount = 0.0;
         let mut by_operation: HashMap<String, f64> = HashMap::new();
@@ -587,7 +587,7 @@ impl CostState {
     /// to each value's historical share of recorded cost. Falls back to an
     /// even split if no historical entries carry `tag_key`.
     pub fn allocate(&self, total_amount: f64, tag_key: &str) -> CostAllocation {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut by_value: HashMap<String, f64> = HashMap::new();
         for entry in entries.iter() {

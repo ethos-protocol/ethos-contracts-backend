@@ -143,7 +143,7 @@ pub fn route_to_dlq(
         last_attempt_at: now,
     };
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(entry.id.clone(), entry.clone());
     tracing::warn!(dlq_id = %entry.id, source = %entry.source, "delivery routed to dead-letter queue");
 
@@ -157,7 +157,7 @@ pub async fn list_dlq_entries(
     State(state): State<Arc<DlqState>>,
     Query(query): Query<ListDlqQuery>,
 ) -> Json<Vec<DlqEntry>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut entries: Vec<DlqEntry> = store
         .values()
         .filter(|e| {
@@ -196,7 +196,7 @@ pub async fn replay_dlq_entries(
     Json(body): Json<ReplayDlqRequest>,
 ) -> Result<Json<ReplayResponse>, (StatusCode, Json<serde_json::Value>)> {
     let targets: Vec<DlqEntry> = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         if body.replay_all {
             store
                 .values()
@@ -291,7 +291,7 @@ async fn replay_one(state: &DlqState, entry: &DlqEntry) -> ReplayResult {
 }
 
 fn mark_status(state: &DlqState, id: &str, status: DlqStatus) {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(entry) = store.get_mut(id) {
         entry.status = status;
         entry.last_attempt_at = Utc::now();

@@ -143,7 +143,7 @@ impl CoordinatorLog {
             .join(",");
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(
                 "INSERT INTO coordinator_tx_log (tx_id, state, participants, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -156,7 +156,7 @@ impl CoordinatorLog {
 
     /// Load the current state of a transaction, if the log knows about it.
     pub fn get(&self, tx_id: &str) -> Result<Option<TxLogRecord>, DistributedTxError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
             "SELECT tx_id, state, participants FROM coordinator_tx_log WHERE tx_id = ?1",
             params![tx_id],
@@ -175,7 +175,7 @@ impl CoordinatorLog {
 
     /// Every transaction that has not reached a terminal state.
     pub fn load_in_flight(&self) -> Result<Vec<TxLogRecord>, DistributedTxError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT tx_id, state, participants FROM coordinator_tx_log
@@ -297,7 +297,7 @@ impl ShardNode {
     pub fn bootstrap(&self) -> Result<(), DistributedTxError> {
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute_batch(
                 r"
                 CREATE TABLE IF NOT EXISTS prepared_transactions (
@@ -334,7 +334,7 @@ impl ShardNode {
         let ops_json = serde_json::to_string(operations)
             .map_err(|e| DistributedTxError::Serialization(e.to_string()))?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
 
         // Check for duplicate tx_id (idempotency guard): refuse a transaction
         // that is already prepared on this shard, or that has already been
@@ -366,7 +366,7 @@ impl ShardNode {
 
     /// Apply the prepared operations and record the commit.
     pub fn commit(&self, tx_id: &str) -> Result<(), DistributedTxError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
 
         // Retrieve prepared operations.
         let ops_json: String = conn
@@ -413,7 +413,7 @@ impl ShardNode {
     pub fn rollback(&self, tx_id: &str) -> Result<(), DistributedTxError> {
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(
                 "DELETE FROM prepared_transactions WHERE tx_id = ?1",
                 params![tx_id],
@@ -426,7 +426,7 @@ impl ShardNode {
 
     /// Read a value from the shard's kv_data store.
     pub fn read(&self, key: &str) -> Result<Option<String>, DistributedTxError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let result = conn
             .query_row(
                 "SELECT value FROM kv_data WHERE shard_key = ?1",
@@ -762,7 +762,7 @@ impl DistributedTxCoordinator {
 
         // Collect keys to migrate.
         let rows: Vec<(String, String)> = {
-            let conn = source.conn.lock().unwrap();
+            let conn = source.conn.lock().unwrap_or_else(|p| p.into_inner());
             let mut stmt = conn
                 .prepare("SELECT shard_key, value FROM kv_data")
                 .map_err(|e| DistributedTxError::ShardUnavailable(source_shard, e.to_string()))?;

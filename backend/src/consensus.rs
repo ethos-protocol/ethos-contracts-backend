@@ -58,19 +58,19 @@ impl InMemoryBackend {
 
 impl CacheBackend for InMemoryBackend {
     fn get_entry(&self, key: &str) -> Result<Option<CacheEntry>, String> {
-        Ok(self.entries.lock().unwrap().get(key).cloned())
+        Ok(self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned())
     }
 
     fn set_entry(&self, entry: &CacheEntry) -> Result<(), String> {
         self.entries
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(entry.key.clone(), entry.clone());
         Ok(())
     }
 
     fn all_entries(&self) -> Result<Vec<CacheEntry>, String> {
-        Ok(self.entries.lock().unwrap().values().cloned().collect())
+        Ok(self.entries.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect())
     }
 }
 
@@ -194,7 +194,7 @@ impl NodeCache {
         self.backend.set_entry(&entry)?;
         self.local
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(key.to_string(), entry.clone());
         Ok(entry)
     }
@@ -205,7 +205,7 @@ impl NodeCache {
 
     pub fn sync_local_from_remote(&self) -> Result<(), String> {
         let entries = self.backend.all_entries()?;
-        let mut local = self.local.lock().unwrap();
+        let mut local = self.local.lock().unwrap_or_else(|p| p.into_inner());
         local.clear();
         for entry in entries {
             local.insert(entry.key.clone(), entry);
@@ -222,7 +222,7 @@ impl NodeCache {
             .map(|entry| (entry.key.clone(), entry))
             .collect();
 
-        let local_snapshot = self.local.lock().unwrap().clone();
+        let local_snapshot = self.local.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let all_keys: HashSet<String> = local_snapshot
             .keys()
             .chain(remote_entries.keys())
@@ -250,7 +250,7 @@ impl NodeCache {
 
             if let Some(resolved) = winner {
                 self.backend.set_entry(&resolved)?;
-                self.local.lock().unwrap().insert(key.clone(), resolved);
+                self.local.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone(), resolved);
                 conflicts_resolved += 1;
             }
         }
@@ -279,7 +279,7 @@ impl NodeCache {
 
     /// Test helper: directly seed a local cache entry, bypassing the backend.
     pub fn set_local_entry(&self, entry: CacheEntry) {
-        self.local.lock().unwrap().insert(entry.key.clone(), entry);
+        self.local.lock().unwrap_or_else(|p| p.into_inner()).insert(entry.key.clone(), entry);
     }
 }
 

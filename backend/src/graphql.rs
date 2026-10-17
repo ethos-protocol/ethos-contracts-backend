@@ -128,7 +128,7 @@ impl QueryRoot {
     /// Fetch a single vault by ID.
     async fn vault(&self, ctx: &Context<'_>, id: String) -> Option<GqlVault> {
         let store = ctx.data_unchecked::<VaultStore>();
-        let vaults = store.lock().unwrap();
+        let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
         vaults.get(&id).cloned().map(GqlVault::from)
     }
 
@@ -146,7 +146,7 @@ impl QueryRoot {
         let limit = limit.unwrap_or(10).clamp(1, 100) as usize;
         let offset = (page - 1) * limit;
 
-        let vaults_guard = store.lock().unwrap();
+        let vaults_guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let filtered: Vec<GqlVault> = vaults_guard
             .values()
             .filter(|v| {
@@ -181,7 +181,7 @@ impl QueryRoot {
     /// List all events for a vault.
     async fn vault_events(&self, ctx: &Context<'_>, vault_id: String) -> Vec<GqlVaultEvent> {
         let store = ctx.data_unchecked::<EventStore>();
-        let events = store.lock().unwrap();
+        let events = store.lock().unwrap_or_else(|p| p.into_inner());
         events
             .iter()
             .filter(|e| e.vault_id == vault_id)
@@ -222,7 +222,7 @@ impl MutationRoot {
         };
 
         let store = ctx.data_unchecked::<VaultStore>();
-        let mut vaults = store.lock().unwrap();
+        let mut vaults = store.lock().unwrap_or_else(|p| p.into_inner());
         vaults.insert(vault.id.clone(), vault.clone());
 
         Ok(GqlVault::from(vault))
@@ -235,7 +235,7 @@ impl MutationRoot {
         vault_id: String,
     ) -> async_graphql::Result<GqlVault> {
         let store = ctx.data_unchecked::<VaultStore>();
-        let mut vaults = store.lock().unwrap();
+        let mut vaults = store.lock().unwrap_or_else(|p| p.into_inner());
 
         let vault = vaults.get_mut(&vault_id).ok_or("vault not found")?;
 
@@ -349,7 +349,7 @@ mod tests {
             ttl_remaining: Some(86400),
         };
 
-        vault_store.lock().unwrap().insert(vault.id.clone(), vault.clone());
+        vault_store.lock().unwrap_or_else(|p| p.into_inner()).insert(vault.id.clone(), vault.clone());
 
         let schema_with_data = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
             .limit_depth(MAX_QUERY_DEPTH)
@@ -383,7 +383,7 @@ mod tests {
                 status: VaultStatus::Active,
                 ttl_remaining: Some(86400),
             };
-            vault_store.lock().unwrap().insert(vault.id.clone(), vault);
+            vault_store.lock().unwrap_or_else(|p| p.into_inner()).insert(vault.id.clone(), vault);
         }
 
         let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
@@ -435,7 +435,7 @@ mod tests {
             .await;
 
         assert!(resp.errors.is_empty());
-        let stored = vault_store.lock().unwrap();
+        let stored = vault_store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(stored.len(), 1);
     }
 
@@ -455,7 +455,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(1000),
         };
-        vault_store.lock().unwrap().insert(vault.id.clone(), vault);
+        vault_store.lock().unwrap_or_else(|p| p.into_inner()).insert(vault.id.clone(), vault);
 
         let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
             .limit_depth(MAX_QUERY_DEPTH)
@@ -469,7 +469,7 @@ mod tests {
             .await;
 
         assert!(resp.errors.is_empty());
-        let stored = vault_store.lock().unwrap();
+        let stored = vault_store.lock().unwrap_or_else(|p| p.into_inner());
         let vault_after = stored.get("vault-1").unwrap();
         assert_eq!(vault_after.ttl_remaining, Some(86400));
     }
@@ -485,7 +485,7 @@ mod tests {
             timestamp: Utc::now(),
             data: serde_json::json!({}),
         };
-        event_store.lock().unwrap().push(event);
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(event);
 
         let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
             .limit_depth(MAX_QUERY_DEPTH)

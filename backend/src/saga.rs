@@ -71,7 +71,7 @@ impl CompensationRegistry {
     /// `true` if `step_name`'s compensation has already run to a successful
     /// completion on this registry.
     pub fn already_compensated(&self, step_name: &str) -> bool {
-        self.executed.lock().unwrap().contains(step_name)
+        self.executed.lock().unwrap_or_else(|p| p.into_inner()).contains(step_name)
     }
 
     fn run(&self, step_name: &str, output: &StepOutput) -> CompensationOutcome {
@@ -84,7 +84,7 @@ impl CompensationRegistry {
             Some(f) => {
                 let result = f(output);
                 if result.is_ok() {
-                    self.executed.lock().unwrap().insert(step_name.to_string());
+                    self.executed.lock().unwrap_or_else(|p| p.into_inner()).insert(step_name.to_string());
                 }
                 CompensationOutcome::Ran(result)
             }

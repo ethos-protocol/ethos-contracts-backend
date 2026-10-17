@@ -128,7 +128,7 @@ impl RpsTracker {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
 
         let elapsed = {
-            let start = self.window_start.lock().unwrap();
+            let start = self.window_start.lock().unwrap_or_else(|p| p.into_inner());
             now.duration_since(*start)
         };
 
@@ -137,17 +137,17 @@ impl RpsTracker {
             let rate = count as f64 / elapsed.as_secs_f64();
 
             // Exponential moving average (alpha = 0.3).
-            let mut smoothed = self.smoothed_rps.lock().unwrap();
+            let mut smoothed = self.smoothed_rps.lock().unwrap_or_else(|p| p.into_inner());
             *smoothed = 0.3 * rate + 0.7 * (*smoothed);
 
             // Reset bucket.
             self.count.store(0, Ordering::Relaxed);
-            let mut start = self.window_start.lock().unwrap();
+            let mut start = self.window_start.lock().unwrap_or_else(|p| p.into_inner());
             *start = now;
 
             *smoothed
         } else {
-            *self.smoothed_rps.lock().unwrap()
+            *self.smoothed_rps.lock().unwrap_or_else(|p| p.into_inner())
         }
     }
 }
@@ -191,7 +191,7 @@ impl TraceSampler {
         let mut rate = self.config.sample_rate;
 
         if self.config.adaptive {
-            let current_rps = *self.rps.smoothed_rps.lock().unwrap();
+            let current_rps = *self.rps.smoothed_rps.lock().unwrap_or_else(|p| p.into_inner());
             if current_rps >= self.config.adaptive_high_rps {
                 // Halve the rate under high load to reduce overhead.
                 rate *= 0.5;
@@ -446,7 +446,7 @@ mod tests {
 
         // Manually set smoothed RPS above threshold.
         {
-            let mut rps = sampler.rps.smoothed_rps.lock().unwrap();
+            let mut rps = sampler.rps.smoothed_rps.lock().unwrap_or_else(|p| p.into_inner());
             *rps = 1000.0;
         }
 

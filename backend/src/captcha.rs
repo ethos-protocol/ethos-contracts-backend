@@ -617,7 +617,7 @@ mod tests {
 
         // Directly insert into the static store.
         {
-            let mut store = TRUSTED_STORE.lock().unwrap();
+            let mut store = TRUSTED_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.push(TrustedUser {
                 user_id: "test-user-trusted".to_string(),
                 ip: "10.0.0.1".to_string(),
@@ -631,7 +631,7 @@ mod tests {
         // Clean up.
         TRUSTED_STORE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .retain(|u| u.user_id != "test-user-trusted");
     }
 
@@ -746,13 +746,13 @@ mod tests {
             record_captcha_failure(ip);
         }
         let blocked_until_first = {
-            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.get(ip).and_then(|r| r.blocked_until).unwrap()
         };
 
         record_captcha_failure(ip);
         let blocked_until_second = {
-            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.get(ip).and_then(|r| r.blocked_until).unwrap()
         };
 
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn repeated_failures_flag_ip_in_reputation_store() {
         let ip = "203.0.113.14";
-        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
 
         for _ in 0..REPUTATION_FLAG_THRESHOLD {
             record_captcha_failure(ip);
@@ -771,7 +771,7 @@ mod tests {
 
         let score = crate::ip_reputation::IP_REPUTATION_STORE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .get(ip)
             .cloned()
             .expect("ip should have been flagged in the reputation store");
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(score.source, "local-penalty");
 
         record_captcha_success(ip);
-        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
     }
 
     #[tokio::test]

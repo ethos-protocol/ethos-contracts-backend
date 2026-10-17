@@ -401,7 +401,7 @@ impl VaultCache {
 
     /// Snapshot of current hit/miss and other metrics.
     pub fn metrics(&self) -> CacheMetrics {
-        self.inner.lock().unwrap().metrics.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).metrics.clone()
     }
 
     // ── #88 Auto-tune ─────────────────────────────────────────────────────────
@@ -414,7 +414,7 @@ impl VaultCache {
     ///
     /// Returns the new TTL after tuning.
     pub fn auto_tune(&self) -> Duration {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ratio = inner.metrics.hit_ratio();
         let current_secs = inner.config.ttl.as_secs();
 
@@ -432,7 +432,7 @@ impl VaultCache {
 
     /// Read-only view of the current configuration.
     pub fn config(&self) -> CacheConfig {
-        self.inner.lock().unwrap().config.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).config.clone()
     }
 
     // ── get_vault / set_vault ─────────────────────────────────────────────────
@@ -442,7 +442,7 @@ impl VaultCache {
     /// Returns `None` if the entry is absent, expired, or bypassed due to
     /// staleness (#90).
     pub fn get_vault(&self, vault_id: &str) -> Option<Vault> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -470,7 +470,7 @@ impl VaultCache {
 
     /// Insert or update the cached `Vault` for `vault_id`.
     pub fn set_vault(&self, vault_id: &str, vault: Vault) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -492,7 +492,7 @@ impl VaultCache {
     /// `Some(None)` = cached "no TTL" result, `Some(Some(n))` = cached value.
     #[allow(clippy::option_option)]
     pub fn get_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -520,7 +520,7 @@ impl VaultCache {
 
     /// Insert or update the cached TTL-remaining value for `vault_id`.
     pub fn set_ttl_remaining(&self, vault_id: &str, ttl_remaining: Option<u64>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -538,7 +538,7 @@ impl VaultCache {
     /// Return the cached `VaultSummary` for `vault_id`, if present and not
     /// expired.
     pub fn get_vault_summary(&self, vault_id: &str) -> Option<VaultSummary> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let staleness_ratio = inner.config.staleness_ratio;
         let lookup = inner
             .map
@@ -566,7 +566,7 @@ impl VaultCache {
 
     /// Insert or update the cached `VaultSummary` for `vault_id`.
     pub fn set_vault_summary(&self, vault_id: &str, summary: VaultSummary) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_if_needed();
         let ttl = inner.config.ttl;
         let threshold = inner.config.compression_threshold;
@@ -583,19 +583,19 @@ impl VaultCache {
 
     /// Remove all cached entries for `vault_id`.
     pub fn invalidate(&self, vault_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.remove(vault_id);
     }
 
     /// Remove all entries from the cache.
     pub fn invalidate_all(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.clear();
     }
 
     /// Return how many vault IDs currently have at least one live entry.
     pub fn live_entry_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.values().filter(|e| e.has_live_entry()).count()
     }
 
@@ -606,7 +606,7 @@ impl VaultCache {
     /// The token includes the current version number.  Use this when
     /// broadcasting invalidation requests to other cache instances.
     pub fn get_coherence_token(&self, vault_id: &str) -> Option<CoherenceToken> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.get(vault_id).and_then(|entries| {
             entries.vault.as_ref().map(|e| CoherenceToken {
                 vault_id: vault_id.to_string(),
@@ -623,7 +623,7 @@ impl VaultCache {
     /// Use this when receiving cross-instance invalidation messages: if the
     /// remote instance has a newer version, discard the local entry.
     pub fn invalidate_if_older(&self, vault_id: &str, remote_version: u64) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entries) = inner.map.get(vault_id) {
             let local_version = entries.vault.as_ref().map(|e| e.version).unwrap_or(0);
             if local_version <= remote_version {
@@ -642,7 +642,7 @@ impl VaultCache {
     ///
     /// Use this for quorum-based consistency verification.
     pub fn verify_quorum(&self, vault_id: &str, remote_tokens: &[CoherenceToken]) -> QuorumResult {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let local_version = inner
             .map
             .get(vault_id)
@@ -670,7 +670,7 @@ impl VaultCache {
     ///
     /// Returns `false` if the entry is absent or already expired.
     pub fn is_stale(&self, vault_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ratio = inner.config.staleness_ratio;
         inner
             .map
@@ -692,7 +692,7 @@ impl VaultCache {
     /// `ratio` must be in `(0.0, 1.0)`.  Values outside this range are
     /// clamped.
     pub fn set_staleness_ratio(&self, ratio: f64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.config.staleness_ratio = ratio.clamp(0.0, 1.0);
     }
 
@@ -701,7 +701,7 @@ impl VaultCache {
     /// Return whether the vault entry for `vault_id` is currently stored
     /// compressed.
     pub fn is_vault_compressed(&self, vault_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner
             .map
             .get(vault_id)
@@ -713,7 +713,7 @@ impl VaultCache {
     /// Update the compression threshold at runtime.  Values already stored
     /// are not re-encoded; the new threshold applies to subsequent writes.
     pub fn set_compression_threshold(&self, threshold: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.config.compression_threshold = threshold;
     }
 }

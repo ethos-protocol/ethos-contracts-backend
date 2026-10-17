@@ -90,7 +90,7 @@ impl ExplanationStore {
 
         self.inner
             .write()
-            .expect("explanation store lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .explanations
             .insert(anomaly_id.to_string(), result.clone());
 
@@ -101,7 +101,7 @@ impl ExplanationStore {
     pub fn get_explanation(&self, anomaly_id: &str) -> Option<AnomalyExplanation> {
         self.inner
             .read()
-            .expect("explanation store lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .explanations
             .get(anomaly_id)
             .cloned()

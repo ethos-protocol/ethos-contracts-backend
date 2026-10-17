@@ -224,7 +224,7 @@ pub async fn discover_dependencies(
         kind: body.kind,
     };
 
-    let mut graph = state.graph.lock().unwrap();
+    let mut graph = state.graph.lock().unwrap_or_else(|p| p.into_inner());
 
     if graph.would_create_cycle(&edge.from, &edge.to) {
         return Err((
@@ -248,7 +248,7 @@ pub async fn discover_dependencies(
             removed = change.removed.len(),
             "dependency graph changed"
         );
-        state.changes.lock().unwrap().push(change);
+        state.changes.lock().unwrap_or_else(|p| p.into_inner()).push(change);
     }
 
     Ok((
@@ -265,7 +265,7 @@ pub async fn discover_dependencies(
 pub async fn get_dependency_graph(
     State(state): State<Arc<DependencyMapState>>,
 ) -> Json<serde_json::Value> {
-    let graph = state.graph.lock().unwrap();
+    let graph = state.graph.lock().unwrap_or_else(|p| p.into_inner());
     Json(serde_json::json!({
         "edges": graph.edges,
         "dot": graph.to_dot(),
@@ -278,7 +278,7 @@ pub async fn analyze_impact(
     State(state): State<Arc<DependencyMapState>>,
     Json(body): Json<ImpactAnalysisRequest>,
 ) -> Json<ImpactAnalysisResponse> {
-    let graph = state.graph.lock().unwrap();
+    let graph = state.graph.lock().unwrap_or_else(|p| p.into_inner());
     Json(ImpactAnalysisResponse {
         direct_downstream: graph.downstream_of(&body.service),
         direct_upstream: graph.upstream_of(&body.service),
@@ -292,6 +292,6 @@ pub async fn analyze_impact(
 pub async fn get_recent_changes(
     State(state): State<Arc<DependencyMapState>>,
 ) -> Json<Vec<DependencyChange>> {
-    let changes = state.changes.lock().unwrap();
+    let changes = state.changes.lock().unwrap_or_else(|p| p.into_inner());
     Json(changes.clone())
 }

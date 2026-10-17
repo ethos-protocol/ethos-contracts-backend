@@ -173,21 +173,21 @@ impl CacheInvalidationStrategy {
     }
 
     pub fn register_dependencies(&self, key: &str, deps: Vec<&str>) {
-        let mut map = self.dependencies.lock().unwrap();
+        let mut map = self.dependencies.lock().unwrap_or_else(|p| p.into_inner());
         map.insert(key.to_string(), deps.iter().map(|s| s.to_string()).collect());
     }
 
     pub fn get_dependencies(&self, key: &str) -> Option<Vec<String>> {
-        self.dependencies.lock().unwrap().get(key).cloned()
+        self.dependencies.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
     }
 
     pub fn invalidate(&self, key: &str) {
-        let mut map = self.dependencies.lock().unwrap();
+        let mut map = self.dependencies.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(key);
     }
 
     pub fn invalidate_pattern(&self, pattern: &str) {
-        let mut map = self.dependencies.lock().unwrap();
+        let mut map = self.dependencies.lock().unwrap_or_else(|p| p.into_inner());
         let keys_to_remove: Vec<_> = map
             .keys()
             .filter(|k| {
@@ -248,7 +248,7 @@ impl CacheInvalidator {
 
     /// Process a cache event and invalidate affected entries across both cache layers.
     pub fn handle_event(&self, event: CacheEvent) {
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         stats.total_events += 1;
 
         match &event {
@@ -257,7 +257,7 @@ impl CacheInvalidator {
                 if let Some(ref qc) = self.query_cache {
                     qc.invalidate_all();
                 }
-                self.dependency_graph.lock().unwrap().clear_all();
+                self.dependency_graph.lock().unwrap_or_else(|p| p.into_inner()).clear_all();
                 stats.global_flushes += 1;
                 stats.total_invalidations += 1;
             }
@@ -289,7 +289,7 @@ impl CacheInvalidator {
                     let dependents = self
                         .dependency_graph
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|p| p.into_inner())
                         .get_dependents(vault_id);
 
                     if !dependents.is_empty() {
@@ -298,7 +298,7 @@ impl CacheInvalidator {
                     }
 
                     // Clear dependencies for this vault.
-                    self.dependency_graph.lock().unwrap().clear_vault(vault_id);
+                    self.dependency_graph.lock().unwrap_or_else(|p| p.into_inner()).clear_vault(vault_id);
                 }
             }
         }
@@ -308,18 +308,18 @@ impl CacheInvalidator {
     pub fn register_dependency(&self, vault_id: &str, key: CacheKey) {
         self.dependency_graph
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .add_dependency(vault_id, key);
     }
 
     /// Get invalidation statistics.
     pub fn get_stats(&self) -> InvalidationStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Reset statistics (useful for testing).
     pub fn reset_stats(&self) {
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         *stats = InvalidationStats::default();
     }
 }

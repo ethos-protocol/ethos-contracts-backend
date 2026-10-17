@@ -147,12 +147,12 @@ impl CdcEventStore {
 
     /// Append a CDC event.  Trims the oldest entry when the buffer is full.
     pub fn append(&self, mut event: CdcEvent) {
-        let mut seq = self.next_seq.lock().unwrap();
+        let mut seq = self.next_seq.lock().unwrap_or_else(|p| p.into_inner());
         event.seq = *seq;
         *seq += 1;
         drop(seq);
 
-        let mut events = self.events.write().unwrap();
+        let mut events = self.events.write().unwrap_or_else(|p| p.into_inner());
         if events.len() >= self.max_events {
             events.remove(0);
         }
@@ -161,7 +161,7 @@ impl CdcEventStore {
 
     /// Number of events currently stored.
     pub fn len(&self) -> usize {
-        self.events.read().unwrap().len()
+        self.events.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -173,7 +173,7 @@ impl CdcEventStore {
     where
         F: FnMut(&CdcEvent),
     {
-        let events = self.events.read().unwrap();
+        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
         for event in events.iter().filter(|e| e.seq >= from_seq) {
             consumer(event);
         }
@@ -183,7 +183,7 @@ impl CdcEventStore {
     pub fn events_for_table(&self, table: &str) -> Vec<CdcEvent> {
         self.events
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|e| e.table == table)
             .cloned()
@@ -194,7 +194,7 @@ impl CdcEventStore {
     pub fn range(&self, from: u64, to: u64) -> Vec<CdcEvent> {
         self.events
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|e| e.seq >= from && e.seq < to)
             .cloned()
@@ -204,7 +204,7 @@ impl CdcEventStore {
     /// Check consistency: returns a list of sequence numbers that are missing
     /// from the contiguous sequence starting at the earliest stored event.
     pub fn check_consistency(&self) -> Vec<u64> {
-        let events = self.events.read().unwrap();
+        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
         if events.is_empty() {
             return Vec::new();
         }
@@ -220,7 +220,7 @@ impl CdcEventStore {
 
     /// Snapshot all currently buffered events.
     pub fn snapshot(&self) -> Vec<CdcEvent> {
-        self.events.read().unwrap().clone()
+        self.events.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -294,24 +294,24 @@ impl CdcBus {
     where
         F: Fn(&CdcEvent) + Send + Sync + 'static,
     {
-        let mut id = self.next_id.lock().unwrap();
+        let mut id = self.next_id.lock().unwrap_or_else(|p| p.into_inner());
         let subscriber_id = *id;
         *id += 1;
         self.subscribers
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(subscriber_id, Box::new(f));
         subscriber_id
     }
 
     /// Unregister a previously registered subscriber.
     pub fn unsubscribe(&self, id: SubscriberId) {
-        self.subscribers.write().unwrap().remove(&id);
+        self.subscribers.write().unwrap_or_else(|p| p.into_inner()).remove(&id);
     }
 
     /// Dispatch `event` to all registered subscribers.
     pub fn publish(&self, event: CdcEvent) {
-        let subs = self.subscribers.read().unwrap();
+        let subs = self.subscribers.read().unwrap_or_else(|p| p.into_inner());
         for sub in subs.values() {
             sub(&event);
         }
@@ -319,7 +319,7 @@ impl CdcBus {
 
     /// Number of active subscribers.
     pub fn subscriber_count(&self) -> usize {
-        self.subscribers.read().unwrap().len()
+        self.subscribers.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

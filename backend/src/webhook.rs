@@ -159,7 +159,7 @@ pub async fn register_webhook(
         active: true,
     };
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(registration.id.clone(), registration.clone());
 
     Ok((StatusCode::CREATED, Json(registration)))
@@ -169,7 +169,7 @@ pub async fn register_webhook(
 pub async fn list_webhooks(
     State(state): State<Arc<WebhookState>>,
 ) -> Json<Vec<WebhookRegistration>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let webhooks: Vec<WebhookRegistration> = store.values().cloned().collect();
     Json(webhooks)
 }
@@ -179,7 +179,7 @@ pub async fn delete_webhook(
     State(state): State<Arc<WebhookState>>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(wh) = store.get_mut(&id) {
         wh.active = false;
         StatusCode::NO_CONTENT
@@ -212,7 +212,7 @@ pub fn deliver_event(
     };
 
     let registrations: Vec<WebhookRegistration> = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         store
             .values()
             .filter(|wh| {
@@ -675,7 +675,7 @@ pub async fn rotate_webhook_secret(
     State(state): State<Arc<WebhookState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     match store.get_mut(&id) {
         Some(wh) => {
             let new_secret = generate_secret();
@@ -769,7 +769,7 @@ mod tests {
         let new_secret = rot["secret"].as_str().unwrap().to_string();
         assert_ne!(new_secret, "original-secret");
 
-        let stored = state.store.lock().unwrap().get(&reg.id).unwrap().clone();
+        let stored = state.store.lock().unwrap_or_else(|p| p.into_inner()).get(&reg.id).unwrap().clone();
         assert_eq!(stored.secret.as_deref(), Some(new_secret.as_str()));
 
         let new_sig = standard_signature_256(body, &new_secret);
@@ -819,7 +819,7 @@ mod tests {
         .await;
 
         hook.assert_async().await;
-        assert_eq!(state.dlq_state.store.lock().unwrap().len(), 0);
+        assert_eq!(state.dlq_state.store.lock().unwrap_or_else(|p| p.into_inner()).len(), 0);
     }
 
     #[tokio::test]
@@ -864,7 +864,7 @@ mod tests {
         signed.assert_async().await; // never hit
         unsigned.assert_async().await; // hit on every retry
         assert_eq!(
-            state.dlq_state.store.lock().unwrap().len(),
+            state.dlq_state.store.lock().unwrap_or_else(|p| p.into_inner()).len(),
             1,
             "an unsigned delivery the receiver rejects must be dead-lettered"
         );
@@ -1016,7 +1016,7 @@ mod tests {
         assert!(!reg.id.is_empty());
         assert!(reg.active);
 
-        let stored = state.store.lock().unwrap();
+        let stored = state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(stored.len(), 1);
         assert_eq!(stored.get(&reg.id).unwrap().url, "https://example.test/hook");
     }
@@ -1075,7 +1075,7 @@ mod tests {
         let status = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let stored = state.store.lock().unwrap();
+        let stored = state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert!(!stored.get(&reg.id).unwrap().active);
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
 
         // Event for vault-1 should match the first webhook
         let registrations: Vec<WebhookRegistration> = {
-            let store = state.store.lock().unwrap();
+            let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
             store
                 .values()
                 .filter(|wh| {
@@ -1156,7 +1156,7 @@ mod tests {
 
         // Check that VaultCreated events are included
         let matching: Vec<WebhookRegistration> = {
-            let store = state.store.lock().unwrap();
+            let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
             store
                 .values()
                 .filter(|wh| {
@@ -1237,7 +1237,7 @@ mod tests {
 
         // Deactivated webhooks should not match
         let matching: Vec<WebhookRegistration> = {
-            let store = state.store.lock().unwrap();
+            let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
             store
                 .values()
                 .filter(|wh| wh.active)

@@ -45,7 +45,7 @@ impl RevocationList {
     pub fn revoke(&self, jti: &str, expires_at: i64) {
         self.inner
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(jti.to_string(), expires_at);
     }
 
@@ -54,21 +54,21 @@ impl RevocationList {
     pub fn is_revoked(&self, jti: &str) -> bool {
         let now = Utc::now().timestamp();
         {
-            let map = self.inner.read().unwrap();
+            let map = self.inner.read().unwrap_or_else(|p| p.into_inner());
             match map.get(jti) {
                 None => return false,
                 Some(&exp) if exp > now => return true,
                 Some(_) => {} // expired — fall through to remove
             }
         }
-        self.inner.write().unwrap().remove(jti);
+        self.inner.write().unwrap_or_else(|p| p.into_inner()).remove(jti);
         false
     }
 
     /// Drop every entry whose expiry is at or before `now` (Unix seconds).
     /// Returns the number of entries removed.
     pub fn purge_expired(&self, now: i64) -> usize {
-        let mut map = self.inner.write().unwrap();
+        let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let before = map.len();
         map.retain(|_, &mut exp| exp > now);
         before - map.len()
@@ -76,7 +76,7 @@ impl RevocationList {
 
     /// Current number of (possibly not-yet-purged) entries.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -938,7 +938,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_returns_all_scenarios() {
         let store = create_vault_store();
         let vault = make_vault("vault-1", 86_400, Some(3600));
-        store.lock().unwrap().insert("vault-1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-1".to_string(), vault);
 
         let scenarios = vec![
             ScenarioType::NoCheckIns,
@@ -957,7 +957,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_no_check_ins_matches_ttl() {
         let store = create_vault_store();
         let vault = make_vault("vault-2", 86_400, Some(7200));
-        store.lock().unwrap().insert("vault-2".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-2".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-2", vec![ScenarioType::NoCheckIns], 1).unwrap();
@@ -979,7 +979,7 @@ mod simulator_tests {
         let mut vault = make_vault("vault-3", 3600, None); // 1 hour interval, no stored TTL
                                                            // last_check_in is Utc::now() so TTL should be close to 3600 seconds
         vault.ttl_remaining = None;
-        store.lock().unwrap().insert("vault-3".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-3".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-3", vec![ScenarioType::NoCheckIns], 1).unwrap();
@@ -999,7 +999,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_single_scenario_subset() {
         let store = create_vault_store();
         let vault = make_vault("vault-4", 86_400, Some(43200));
-        store.lock().unwrap().insert("vault-4".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-4".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-4", vec![ScenarioType::MissedCheckInDates], 2)

@@ -37,7 +37,7 @@ impl TrafficHistory {
     }
 
     pub fn record(&self, sample: TrafficSample) {
-        let mut samples = self.samples.lock().unwrap();
+        let mut samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
         if samples.len() == self.capacity {
             samples.pop_front();
         }
@@ -45,11 +45,11 @@ impl TrafficHistory {
     }
 
     pub fn samples(&self) -> Vec<TrafficSample> {
-        self.samples.lock().unwrap().iter().copied().collect()
+        self.samples.lock().unwrap_or_else(|p| p.into_inner()).iter().copied().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.samples.lock().unwrap().len()
+        self.samples.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -309,7 +309,7 @@ impl PredictiveScaler {
             .model
             .forecast(&samples, self.config.forecast_periods_ahead)?;
 
-        *self.last_forecast_requests.lock().unwrap() = forecast;
+        *self.last_forecast_requests.lock().unwrap_or_else(|p| p.into_inner()) = forecast;
 
         let raw_replicas = (forecast / self.config.requests_per_replica).ceil() as u32;
         let recommended = raw_replicas.clamp(self.config.min_replicas, self.config.max_replicas);
@@ -335,7 +335,7 @@ impl PredictiveScaler {
     pub fn metrics(&self) -> ScalingMetrics {
         ScalingMetrics {
             recommended_replicas: self.last_recommended_replicas.load(Ordering::Relaxed),
-            forecast_requests: *self.last_forecast_requests.lock().unwrap(),
+            forecast_requests: *self.last_forecast_requests.lock().unwrap_or_else(|p| p.into_inner()),
             history_samples: self.history.len(),
             scaling_decisions_total: self.scaling_decisions_total.load(Ordering::Relaxed),
         }

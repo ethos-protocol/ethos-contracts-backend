@@ -189,7 +189,7 @@ impl<T> PriorityQueue<T> {
     /// Enqueue an item at the given priority.
     pub fn push(&self, priority: Priority, item: T) {
         let sequence = self.next_sequence.fetch_add(1, AtomicOrdering::Relaxed);
-        self.heap.lock().unwrap().push(QueueEntry {
+        self.heap.lock().unwrap_or_else(|p| p.into_inner()).push(QueueEntry {
             priority,
             sequence,
             item,
@@ -198,11 +198,11 @@ impl<T> PriorityQueue<T> {
 
     /// Dequeue the highest-priority, oldest-enqueued item.
     pub fn pop(&self) -> Option<T> {
-        self.heap.lock().unwrap().pop().map(|e| e.item)
+        self.heap.lock().unwrap_or_else(|p| p.into_inner()).pop().map(|e| e.item)
     }
 
     pub fn len(&self) -> usize {
-        self.heap.lock().unwrap().len()
+        self.heap.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {

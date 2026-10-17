@@ -174,7 +174,7 @@ impl Default for HealthRoutingState {
 /// Record the outcome of a delivery attempt against `endpoint`, updating its
 /// rolling health score, slow-start progress, and effective weight.
 pub fn record_outcome(state: &HealthRoutingState, endpoint: &str, success: bool) {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let health = store
         .entry(endpoint.to_string())
         .or_insert_with(|| EndpointHealth::new(endpoint.to_string()));
@@ -213,7 +213,7 @@ pub fn record_outcome(state: &HealthRoutingState, endpoint: &str, success: bool)
 /// seen before default to the initial slow-start weight so brand-new
 /// targets are exercised cautiously rather than being skipped outright.
 pub fn routing_weight(state: &HealthRoutingState, endpoint: &str) -> f64 {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store
         .get(endpoint)
         .map(|h| h.weight)
@@ -231,7 +231,7 @@ pub fn should_route(state: &HealthRoutingState, endpoint: &str) -> bool {
 pub async fn list_health(
     State(state): State<Arc<HealthRoutingState>>,
 ) -> Json<Vec<EndpointHealth>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut endpoints: Vec<EndpointHealth> = store.values().cloned().collect();
     endpoints.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
     Json(endpoints)
@@ -239,7 +239,7 @@ pub async fn list_health(
 
 /// `GET /admin/routing/metrics` — aggregate routing health metrics.
 pub async fn routing_metrics(State(state): State<Arc<HealthRoutingState>>) -> Json<RoutingMetrics> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let total_endpoints = store.len();
     let healthy_endpoints = store.values().filter(|h| h.is_healthy()).count();
     let endpoints_in_slow_start = store
@@ -267,7 +267,7 @@ pub async fn test_routing_decision(
     State(state): State<Arc<HealthRoutingState>>,
     Json(body): Json<TestRoutingRequest>,
 ) -> Json<TestRoutingResponse> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let (weight, reason) = match store.get(&body.endpoint) {
         None => (
             slow_start_weight(0),

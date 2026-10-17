@@ -219,7 +219,7 @@ pub fn open_incident(
         "incident opened"
     );
 
-    store.lock().unwrap().insert(incident.id.clone(), incident.clone());
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(incident.id.clone(), incident.clone());
     incident
 }
 
@@ -233,7 +233,7 @@ pub async fn create_incident(
     state
         .store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(incident.id.clone(), incident.clone());
 
     (StatusCode::CREATED, Json(incident))
@@ -241,7 +241,7 @@ pub async fn create_incident(
 
 /// `GET /incidents` — list all tracked incidents.
 pub async fn list_incidents(State(state): State<Arc<IncidentState>>) -> Json<Vec<Incident>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     Json(store.values().cloned().collect())
 }
 
@@ -250,7 +250,7 @@ pub async fn get_incident(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Incident>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -260,7 +260,7 @@ pub async fn add_timeline_entry(
     Path(id): Path<String>,
     Json(body): Json<AddTimelineEntryRequest>,
 ) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     incident.timeline.push(timeline_entry(body.actor, body.note));
     incident.updated_at = Utc::now();
@@ -274,7 +274,7 @@ pub async fn acknowledge_incident(
     Path(id): Path<String>,
     Json(body): Json<AcknowledgeIncidentRequest>,
 ) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     let now = Utc::now();
@@ -296,7 +296,7 @@ pub async fn update_incident_status(
     Path(id): Path<String>,
     Json(body): Json<UpdateStatusRequest>,
 ) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     let note = format!("status changed from {:?} to {:?}", incident.status, body.status);
@@ -339,7 +339,7 @@ pub async fn escalate_incident(
     Path(id): Path<String>,
     Json(body): Json<EscalateIncidentRequest>,
 ) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     escalate_to_next_tier(incident, &body.reason);
@@ -359,7 +359,7 @@ pub async fn escalate_incident(
 pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Vec<Incident> {
     let now = Utc::now();
     let mut escalated = Vec::new();
-    let mut store = store.lock().unwrap();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
 
     for incident in store.values_mut() {
         if incident.acknowledged_at.is_some() {
@@ -391,7 +391,7 @@ mod tests {
 
         // Acknowledge before the deadline elapses.
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
             let stored = guard.get_mut(&incident.id).unwrap();
             stored.acknowledged_at = Some(Utc::now());
             stored.acknowledgment_deadline = None;
@@ -400,7 +400,7 @@ mod tests {
         let escalated = enforce_acknowledgment_timeouts(&store);
         assert!(escalated.is_empty(), "acknowledged incident must not escalate");
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let stored = guard.get(&incident.id).unwrap();
         assert_eq!(stored.escalation_level, 0);
     }
@@ -412,7 +412,7 @@ mod tests {
 
         // Force the deadline into the past to simulate an unacknowledged timeout.
         {
-            let mut guard = store.lock().unwrap();
+            let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
             let stored = guard.get_mut(&incident.id).unwrap();
             stored.acknowledgment_deadline = Some(Utc::now() - Duration::minutes(1));
         }
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(escalated.len(), 1);
         assert_eq!(escalated[0].escalation_level, 1);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let stored = guard.get(&incident.id).unwrap();
         assert_eq!(stored.escalation_level, 1);
         assert!(stored.acknowledgment_deadline.unwrap() > Utc::now());

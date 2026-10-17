@@ -157,7 +157,7 @@ impl QueryCache {
     /// Returns `Some(value)` on a live hit, `None` on a miss or if the entry
     /// has expired. Expired entries are removed lazily on access.
     pub fn get(&self, key: &str) -> Option<Value> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match map.get(key) {
             Some(entry) if !entry.is_expired() => {
                 let value = entry.value.clone();
@@ -188,12 +188,12 @@ impl QueryCache {
             ttl: self.default_ttl,
             query_key: key.to_string(),
         };
-        self.inner.lock().unwrap().insert(key.to_string(), entry);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), entry);
     }
 
     /// Remove the entry for `key`, if present.
     pub fn invalidate(&self, key: &str) {
-        self.inner.lock().unwrap().remove(key);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
     }
 
     /// Remove all entries whose key starts with `prefix`.
@@ -201,13 +201,13 @@ impl QueryCache {
     /// Useful for invalidating a logical group of related queries, e.g. all
     /// entries for a specific vault: `invalidate_prefix("vault:42:")`.
     pub fn invalidate_prefix(&self, prefix: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         map.retain(|k, _| !k.starts_with(prefix));
     }
 
     /// Remove every entry from the cache.
     pub fn invalidate_all(&self) {
-        self.inner.lock().unwrap().clear();
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     // ── Domain-specific invalidation helpers ───────────────────────────────────
@@ -257,7 +257,7 @@ impl QueryCache {
 
     /// Return a point-in-time snapshot of cache statistics.
     pub fn stats(&self) -> CacheStats {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let total_entries = map.len();
         let expired_entries = map.values().filter(|e| e.is_expired()).count();
         let hit_count = self.hit_count.load(Ordering::Relaxed);
