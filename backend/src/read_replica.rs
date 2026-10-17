@@ -159,7 +159,21 @@ impl ReadReplicaRouter {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .ok()
             .filter(|s| !s.trim().is_empty());
+        Self::from_env_with_primary_url(primary_url)
+    }
 
+    /// Build a router using the environment settings and an explicit primary
+    /// path when neither primary URL variable is set.
+    pub fn from_env_with_primary(primary_path: &str) -> Self {
+        let primary_url = std::env::var("PRIMARY_DB_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some(primary_path.to_string()));
+        Self::from_env_with_primary_url(primary_url)
+    }
+
+    fn from_env_with_primary_url(primary_url: Option<String>) -> Self {
         let primary = primary_url.and_then(|url| {
             Connection::open(&url).ok().map(|conn| {
                 Arc::new(ReplicaConn {

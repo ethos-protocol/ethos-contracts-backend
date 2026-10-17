@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install XML signature verification libraries
+        run: sudo apt-get update && sudo apt-get install --yes libxml2-dev libxmlsec1-dev libxmlsec1-openssl libclang-dev pkg-config
+
       # Pinned (not @stable): newer rustc releases reject an unsound transmute
       # in ethnum 1.5.2 (a transitive Soroban SDK dependency) with E0512, which
       # broke every CI run once rustc moved past 1.96.x. Bump deliberately.

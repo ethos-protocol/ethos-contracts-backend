@@ -6,13 +6,13 @@
 
 use std::sync::{Arc, RwLock};
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    db::AppState,
+    models::AuditLogEntry,
+};
 
 /// Fraud risk score from 0.0 (legitimate) to 1.0 (fraudulent).
 pub type FraudScore = f32;
@@ -140,18 +140,44 @@ impl Default for FraudDetector {
 
 /// `POST /fraud/score` - get fraud score for a transaction.
 pub async fn score_transaction(
-    State(detector): State<Arc<FraudDetector>>,
+    State(state): State<AppState>,
     Json(req): Json<ScoringRequest>,
-) -> impl IntoResponse {
-    let score = detector.get_fraud_score(&req.transaction);
-    let is_fraud = detector.is_fraud(&req.transaction);
+) -> Result<(StatusCode, Json<FraudScoreResult>), StatusCode> {
+    let score = state.fraud_detector.get_fraud_score(&req.transaction);
+    let is_fraud = state.fraud_detector.is_fraud(&req.transaction);
     let result = FraudScoreResult {
         transaction_id: req.transaction.id,
         score,
         is_fraud,
         confidence: (score.abs() - 0.5).abs() * 2.0,
     };
-    (StatusCode::OK, Json(result))
+    let audit_entry = AuditLogEntry {
+        id: 0,
+        timestamp: chrono::Utc::now(),
+        user_id: req.transaction.user_id,
+        action: "fraud_score".to_string(),
+        resource: format!("transaction:{}", result.transaction_id),
+        result: if result.is_fraud {
+            "fraud".to_string()
+        } else {
+            "clear".to_string()
+        },
+        ip_address: "unknown".to_string(),
+        details: Some(serde_json::json!({
+            "transaction_id": result.transaction_id,
+            "score": result.score,
+            "confidence": result.confidence,
+            "is_fraud": result.is_fraud,
+        })),
+    };
+    state
+        .db
+        .insert_audit_log(&audit_entry)
+        .map_err(|error| {
+            tracing::error!(%error, transaction_id = %result.transaction_id, "failed to persist fraud score audit entry");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok((StatusCode::OK, Json(result)))
 }
 
 #[cfg(test)]
