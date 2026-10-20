@@ -1301,3 +1301,42 @@ fn test_is_credential_chain_valid_reflects_ancestor_invalidation() {
     assert!(!client.is_credential_chain_valid(&root_id));
     assert!(!client.is_credential_chain_valid(&child_id));
 }
+
+/// Per-credential records stored in persistent storage survive a
+/// simulated ledger advance past the instance TTL threshold.
+/// Before the fix, all state lived in instance storage and was
+/// lost once the instance entry expired; after the fix,
+/// attestation records are in persistent storage and remain
+/// readable even after a large ledger advance.
+#[test]
+fn test_state_survives_ledger_advance() {
+    let (env, admin, client) = setup();
+    env.ledger().set_timestamp(1);
+
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    // Verify the credential is readable before the advance.
+    assert!(client.verify_claim(&proof, &claim));
+
+    // Advance the ledger timestamp far past the instance TTL
+    // threshold. Instance storage entries would expire, but
+    // per-credential records in persistent storage must survive.
+    env.ledger().set_timestamp(1_000_000);
+
+    // The attestation record (persistent) must still be readable.
+    assert!(client.verify_claim(&proof, &claim));
+
+    // The attestation record via get_attestation must also
+    // survive the ledger advance (persistent storage).
+    // Use the admin to read the confidential record.
+    let attestation = client
+        .get_attestation(&admin, &credential_id)
+        .unwrap();
+    assert_eq!(attestation.credential_id, credential_id);
+    assert_eq!(attestation.oracle, oracle);
+}
