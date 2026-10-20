@@ -1301,3 +1301,24 @@ fn test_is_credential_chain_valid_reflects_ancestor_invalidation() {
     assert!(!client.is_credential_chain_valid(&root_id));
     assert!(!client.is_credential_chain_valid(&child_id));
 }
+
+// ── Malformed input tests ────────────────────────────────────────────
+
+/// Truncated XDR input must return `Err(MalformedConditionalProof)`
+/// instead of panicking, so callers can distinguish malformed input
+/// from an unattested proof.
+#[test]
+fn test_verify_conditional_proof_truncated_xdr_returns_error() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    // A truncated XDR byte sequence — not a valid ConditionalProof
+    // encoding. The function must return Err(MalformedConditionalProof)
+    // rather than panicking with a host error.
+    let truncated_proof = bytes!(&env, 0x00, 0x01, 0x02);
+    let condition = bytes!(&env, 0xcafebabe);
+
+    let result = client.verify_conditional_proof(&truncated_proof, &condition);
+    assert!(result.is_err());
+}
