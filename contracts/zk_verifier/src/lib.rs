@@ -104,6 +104,8 @@ pub enum VerifierError {
     /// The caller is not permitted to view this credential's attestation
     /// record at its current privacy level.
     AccessDenied = 21,
+    /// The contract is paused.
+    Paused = 22,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -198,6 +200,9 @@ mod keys {
         /// proof_sha256 -> ledger timestamp of the most recent
         /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
         LastVerificationTime(BytesN<32>),
+        /// Global pause flag. When `true`, all state-changing entry
+        /// points revert with `VerifierError::Paused`.
+        Paused,
     }
 
     /// A single entry in a proof's verification audit trail. See
