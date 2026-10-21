@@ -19,13 +19,15 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::{audit::authorize_admin, error::ApiError};
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ pub struct DlqEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListDlqQuery {
     pub status: Option<String>,
     pub source: Option<String>,
@@ -64,6 +67,7 @@ pub struct ListDlqQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayDlqRequest {
     /// Replay a specific entry by id.
     pub id: Option<String>,
@@ -143,7 +147,7 @@ pub fn route_to_dlq(
         last_attempt_at: now,
     };
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(entry.id.clone(), entry.clone());
     tracing::warn!(dlq_id = %entry.id, source = %entry.source, "delivery routed to dead-letter queue");
 
@@ -156,8 +160,11 @@ pub fn route_to_dlq(
 pub async fn list_dlq_entries(
     State(state): State<Arc<DlqState>>,
     Query(query): Query<ListDlqQuery>,
-) -> Json<Vec<DlqEntry>> {
-    let store = state.store.lock().unwrap();
+    headers: HeaderMap,
+) -> Result<Json<Vec<DlqEntry>>, ApiError> {
+    authorize_admin(&headers)?;
+
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut entries: Vec<DlqEntry> = store
         .values()
         .filter(|e| {
@@ -187,16 +194,24 @@ pub async fn list_dlq_entries(
         entries.truncate(limit);
     }
 
-    Json(entries)
+    Ok(Json(entries))
 }
 
 /// `POST /admin/dlq/replay` — replay a specific entry, or every pending entry.
 pub async fn replay_dlq_entries(
     State(state): State<Arc<DlqState>>,
+    headers: HeaderMap,
     Json(body): Json<ReplayDlqRequest>,
 ) -> Result<Json<ReplayResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = authorize_admin(&headers) {
+        let status = error.status();
+        let body = serde_json::to_value(error)
+            .unwrap_or_else(|_| serde_json::json!({ "error": "unauthorized" }));
+        return Err((status, Json(body)));
+    }
+
     let targets: Vec<DlqEntry> = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         if body.replay_all {
             store
                 .values()
@@ -291,7 +306,7 @@ async fn replay_one(state: &DlqState, entry: &DlqEntry) -> ReplayResult {
 }
 
 fn mark_status(state: &DlqState, id: &str, status: DlqStatus) {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(entry) = store.get_mut(id) {
         entry.status = status;
         entry.last_attempt_at = Utc::now();

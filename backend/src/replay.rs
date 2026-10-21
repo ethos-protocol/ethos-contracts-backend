@@ -103,13 +103,13 @@ pub fn create_request_log_store() -> RequestLogStore {
 /// Append a new log entry and return its ID.
 pub fn record_request(store: &RequestLogStore, log: RequestLog) -> String {
     let id = log.id.clone();
-    store.lock().unwrap().push(log);
+    store.lock().unwrap_or_else(|p| p.into_inner()).push(log);
     id
 }
 
 /// Retrieve a log entry by ID.
 pub fn get_log(store: &RequestLogStore, id: &str) -> Option<RequestLog> {
-    store.lock().unwrap().iter().find(|l| l.id == id).cloned()
+    store.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|l| l.id == id).cloned()
 }
 
 /// List all logs, newest first, with optional path prefix filter.
@@ -118,7 +118,7 @@ pub fn list_logs(
     path_prefix: Option<&str>,
     limit: usize,
 ) -> Vec<RequestLog> {
-    let store = store.lock().unwrap();
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut logs: Vec<RequestLog> = store
         .iter()
         .filter(|l| path_prefix.map_or(true, |p| l.path.starts_with(p)))
@@ -261,6 +261,7 @@ fn compare_responses(
 // ── HTTP request / response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRequest {
     /// ID of the log entry to replay. Required.
     pub log_id: String,
@@ -271,6 +272,7 @@ pub struct ReplayRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListLogsQuery {
     /// Filter by path prefix.
     pub path: Option<String>,
@@ -279,6 +281,7 @@ pub struct ListLogsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchReplayRequest {
     pub log_ids: Vec<String>,
     pub conditions: Option<Vec<ReplayCondition>>,
@@ -298,17 +301,20 @@ pub struct BatchReplayResponse {
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 
-use crate::error::AppError;
+use crate::{audit::authorize_admin, error::AppError};
 
 /// POST /replay — replay a single logged request (admin endpoint).
 pub async fn replay_handler(
     State(log_store): State<RequestLogStore>,
+    headers: HeaderMap,
     Json(body): Json<ReplayRequest>,
 ) -> Result<(StatusCode, Json<ReplayResult>), AppError> {
+    authorize_admin(&headers)?;
+
     let log = get_log(&log_store, &body.log_id).ok_or(AppError::NotFound)?;
 
     let conditions = body
@@ -323,8 +329,11 @@ pub async fn replay_handler(
 /// POST /replay/batch — replay multiple logged requests at once.
 pub async fn batch_replay_handler(
     State(log_store): State<RequestLogStore>,
+    headers: HeaderMap,
     Json(body): Json<BatchReplayRequest>,
 ) -> Result<(StatusCode, Json<BatchReplayResponse>), AppError> {
+    authorize_admin(&headers)?;
+
     if body.log_ids.is_empty() {
         return Err(AppError::InvalidInput("log_ids must not be empty".into()));
     }
@@ -390,7 +399,10 @@ pub async fn batch_replay_handler(
 pub async fn list_logs_handler(
     State(log_store): State<RequestLogStore>,
     Query(query): Query<ListLogsQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<RequestLog>>, AppError> {
+    authorize_admin(&headers)?;
+
     let limit = query.limit.unwrap_or(50).min(200);
     let logs = list_logs(&log_store, query.path.as_deref(), limit);
     Ok(Json(logs))
@@ -400,7 +412,10 @@ pub async fn list_logs_handler(
 pub async fn get_log_handler(
     State(log_store): State<RequestLogStore>,
     Path(log_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<RequestLog>, AppError> {
+    authorize_admin(&headers)?;
+
     let log = get_log(&log_store, &log_id).ok_or(AppError::NotFound)?;
     Ok(Json(log))
 }

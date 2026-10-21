@@ -74,7 +74,7 @@ impl SignatureVerifier {
     }
 
     pub fn add_public_key(&self, key: String) {
-        let mut keys = self.public_keys.lock().unwrap();
+        let mut keys = self.public_keys.lock().unwrap_or_else(|p| p.into_inner());
         keys.push(key);
     }
 
@@ -88,7 +88,7 @@ impl SignatureVerifier {
         }
 
         // 2. Check nonce hasn't been used
-        let mut nonces = self.used_nonces.lock().unwrap();
+        let mut nonces = self.used_nonces.lock().unwrap_or_else(|p| p.into_inner());
         if nonces.contains(&req.nonce) {
             return VerificationResult {
                 valid: false,
@@ -491,7 +491,7 @@ mod tests {
         verifier.add_public_key("key-1".to_string());
         verifier.add_public_key("key-2".to_string());
 
-        let keys = verifier.public_keys.lock().unwrap();
+        let keys = verifier.public_keys.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(keys.len(), 2, "should have 2 public keys");
         assert!(keys.contains(&"key-1".to_string()));
         assert!(keys.contains(&"key-2".to_string()));

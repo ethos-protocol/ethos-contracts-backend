@@ -33,6 +33,7 @@ pub struct TimeoutPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTimeoutPolicyRequest {
     pub endpoint_pattern: String,
     pub timeout_ms: u64,
@@ -83,17 +84,17 @@ impl TimeoutPolicyStore {
                 max_override_ms: self.max_override_ms,
             });
         }
-        let mut guard = self.policies.lock().unwrap();
+        let mut guard = self.policies.lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(policy.id.clone(), policy.clone());
         Ok(policy)
     }
 
     pub fn get(&self, id: &str) -> Option<TimeoutPolicy> {
-        self.policies.lock().unwrap().get(id).cloned()
+        self.policies.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
     }
 
     pub fn list(&self) -> Vec<TimeoutPolicy> {
-        self.policies.lock().unwrap().values().cloned().collect()
+        self.policies.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
     }
 
     /// Resolves the configured timeout (ms) for `path`, preferring the most
@@ -101,7 +102,7 @@ impl TimeoutPolicyStore {
     pub fn resolve_timeout_ms(&self, path: &str) -> u64 {
         self.policies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .filter(|p| path.starts_with(p.endpoint_pattern.trim_end_matches('*')))
             .max_by_key(|p| p.endpoint_pattern.len())

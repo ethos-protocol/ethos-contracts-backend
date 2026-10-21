@@ -1343,3 +1343,119 @@ fn test_verify_credentials_consistent_oversized_batch_panics() {
 
     client.verify_credentials_consistent(&proofs, &claims);
 }
+
+// ── reschedule_consistency_check authorization ────────────────────────────────
+
+/// The attesting oracle (the one recorded in the AttestationRecord) may
+/// reschedule a credential's consistency check.
+#[test]
+fn test_reschedule_consistency_check_attesting_oracle_succeeds() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    // Should not panic.
+    client.reschedule_consistency_check(&oracle, &credential_id);
+}
+
+/// The admin may reschedule a credential's consistency check.
+#[test]
+fn test_reschedule_consistency_check_admin_succeeds() {
+    let (env, admin, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    // Should not panic.
+    client.reschedule_consistency_check(&admin, &credential_id);
+}
+
+/// An unrelated account that is neither the admin nor the attesting oracle
+/// must be rejected with AccessDenied (#21).
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reschedule_consistency_check_unrelated_account_rejected() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+
+    let unrelated = Address::generate(&env);
+    client.reschedule_consistency_check(&unrelated, &credential_id);
+}
+
+/// A registered oracle that did NOT attest the credential is also rejected —
+/// only the specific attesting oracle is permitted.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reschedule_consistency_check_different_oracle_rejected() {
+    let (env, _, client) = setup();
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    // oracle_a attests; oracle_b is registered but did not attest.
+    let credential_id = client.attest(&oracle_a, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    client.reschedule_consistency_check(&oracle_b, &credential_id);
+}
+
+/// Truncated XDR input must return `Err(MalformedConditionalProof)`
+/// instead of panicking, so callers can distinguish malformed input
+/// from an unattested proof.
+#[test]
+fn test_verify_conditional_proof_truncated_xdr_returns_error() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    // A truncated XDR byte sequence — not a valid ConditionalProof
+    // encoding. The function must return Err(MalformedConditionalProof)
+    // rather than panicking with a host error.
+    let truncated_proof = bytes!(&env, 0x000102);
+    let condition = bytes!(&env, 0xcafebabe);
+
+    let result = client.verify_conditional_proof(&truncated_proof, &condition);
+    assert!(result.is_err());
+}
+
+/// Per-credential records stored in persistent storage survive a
+/// simulated ledger advance past the instance TTL threshold.
+/// Before the fix, all state lived in instance storage and was
+/// lost once the instance entry expired; after the fix,
+/// attestation records are in persistent storage and remain
+/// readable even after a large ledger advance.
+#[test]
+fn test_state_survives_ledger_advance() {
+    let (env, admin, client) = setup();
+    env.ledger().set_timestamp(1);
+
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    // Verify the credential is readable before the advance.
+    assert!(client.verify_claim(&proof, &claim));
+
+    // Advance the ledger timestamp far past the instance TTL
+    // threshold. Instance storage entries would expire, but
+    // per-credential records in persistent storage must survive.
+    env.ledger().set_timestamp(1_000_000);
+
+    // The attestation record (persistent) must still be readable.
+    assert!(client.verify_claim(&proof, &claim));
+
+    // The attestation record via get_attestation must also
+    // survive the ledger advance (persistent storage).
+    // Use the admin to read the confidential record.
+    let attestation = client
+        .get_attestation(&admin, &credential_id)
+        .unwrap();
+    assert_eq!(attestation.credential_id, credential_id);
+    assert_eq!(attestation.oracle, oracle);
+}

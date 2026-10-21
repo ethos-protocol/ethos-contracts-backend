@@ -60,6 +60,10 @@ pub struct AppState {
     pub consensus: Arc<crate::consensus::NodeCache>,
     /// Webhook registry and HTTP delivery client (#65).
     pub webhook_state: Arc<crate::webhook::WebhookState>,
+    /// Live vault-event broadcaster used by authenticated WebSocket streams.
+    pub vault_broadcaster: Arc<crate::websocket::VaultBroadcaster>,
+    /// In-memory request log store used by the admin replay API.
+    pub request_log_store: crate::replay::RequestLogStore,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
     /// Prometheus-style counters exposed at `/metrics`.
@@ -86,12 +90,22 @@ pub struct AppState {
     pub query_cache: Arc<crate::query_cache::QueryCache>,
     /// Distributed-lock deadlock detector stats (#82).
     pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
+    /// Push notification token, schedule, and delivery state.
+    pub notification_service: Arc<crate::notifications::NotificationService>,
+    /// Continuous HTTP request profiling and regression tracking.
+    pub profiler_state: Arc<crate::profiler::ProfilerState>,
     /// Incident tracking: shared by the incident HTTP API and the scheduled
     /// consensus reconciliation job (#373), so a conflict opens the same
     /// kind of record a manually-filed incident would.
     pub incident_state: Arc<crate::incidents::IncidentState>,
     /// RPC connection pool; probed by `/ready` (#698).
     pub rpc_pool: Arc<crate::rpc_pool::RpcPool>,
+    /// In-memory deny-list shared by token revocation and authentication.
+    pub token_revocations: Arc<crate::token_revocation::RevocationList>,
+    /// Enterprise SAML service-provider configuration and replay state.
+    pub saml_state: Arc<crate::saml::SamlState>,
+    /// Fraud scoring model shared by the fraud-scoring endpoint.
+    pub fraud_detector: Arc<crate::fraud_detection::FraudDetector>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -109,6 +123,30 @@ impl axum::extract::FromRef<AppState> for Arc<AppState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
     fn from_ref(state: &AppState) -> Arc<crate::webhook::WebhookState> {
         Arc::clone(&state.webhook_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::token_revocation::RevocationList> {
+    fn from_ref(state: &AppState) -> Arc<crate::token_revocation::RevocationList> {
+        Arc::clone(&state.token_revocations)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
+    fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
+        Arc::clone(&state.webhook_state.dlq_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::websocket::VaultBroadcaster> {
+    fn from_ref(state: &AppState) -> Arc<crate::websocket::VaultBroadcaster> {
+        Arc::clone(&state.vault_broadcaster)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::replay::RequestLogStore {
+    fn from_ref(state: &AppState) -> crate::replay::RequestLogStore {
+        Arc::clone(&state.request_log_store)
     }
 }
 
@@ -136,6 +174,24 @@ impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
     }
 }
 
+impl axum::extract::FromRef<AppState> for Arc<crate::notifications::NotificationService> {
+    fn from_ref(state: &AppState) -> Arc<crate::notifications::NotificationService> {
+        Arc::clone(&state.notification_service)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::saml::SamlState> {
+    fn from_ref(state: &AppState) -> Arc<crate::saml::SamlState> {
+        Arc::clone(&state.saml_state)
+    }
+}
+
 // NOTE: The following FromRef implementations reference fields that are not currently
 // in AppState. When these features are properly implemented, uncomment and add the
 // corresponding fields to AppState.
@@ -153,7 +209,7 @@ impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
 // }
 
 pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let page = query.page.unwrap_or(1);
     let limit = query.limit.unwrap_or(10);
     let offset = ((page - 1) * limit) as usize;
@@ -209,7 +265,7 @@ pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
 pub fn get_vault_history(event_store: &EventStore, vault_id: &str) -> Vec<VaultEvent> {
     event_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|e| e.vault_id == vault_id)
         .cloned()
@@ -219,7 +275,7 @@ pub fn get_vault_history(event_store: &EventStore, vault_id: &str) -> Vec<VaultE
 pub fn get_vault_audit_log(audit_store: &AuditStore, vault_id: &str) -> Vec<AuditEntry> {
     audit_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|a| {
             a.details
@@ -236,7 +292,7 @@ pub fn compute_vault_analytics(store: &VaultStore) -> crate::models::VaultAnalyt
     use crate::models::{TimeSeriesPoint, VaultAnalytics, VaultStatus};
     use std::collections::BTreeMap;
 
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let total_vaults = vaults.len() as u64;
     let active_vaults = vaults
         .values()
@@ -303,7 +359,7 @@ pub fn compute_vault_analytics(store: &VaultStore) -> crate::models::VaultAnalyt
 pub fn store_backup(backup_store: &BackupStore, backup: crate::models::VaultBackup) {
     backup_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(backup.backup_id.clone(), backup);
 }
 
@@ -311,13 +367,13 @@ pub fn get_backup(
     backup_store: &BackupStore,
     backup_id: &str,
 ) -> Option<crate::models::VaultBackup> {
-    backup_store.lock().unwrap().get(backup_id).cloned()
+    backup_store.lock().unwrap_or_else(|p| p.into_inner()).get(backup_id).cloned()
 }
 
 // ── Task 3: Sharing ───────────────────────────────────────────────────────────
 
 pub fn add_vault_share(share_store: &ShareStore, share: crate::models::VaultShare) {
-    share_store.lock().unwrap().push(share);
+    share_store.lock().unwrap_or_else(|p| p.into_inner()).push(share);
 }
 
 pub fn get_vault_shares(
@@ -326,7 +382,7 @@ pub fn get_vault_shares(
 ) -> Vec<crate::models::VaultShare> {
     share_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|s| s.vault_id == vault_id)
         .cloned()
@@ -336,17 +392,17 @@ pub fn get_vault_shares(
 // ── Share token persistence ──────────────────────────────────────────────────
 
 pub fn add_share_token(store: &ShareTokenStore, token: ShareToken) {
-    store.lock().unwrap().insert(token.token.clone(), token);
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(token.token.clone(), token);
 }
 
 pub fn get_share_token(store: &ShareTokenStore, token: &str) -> Option<ShareToken> {
-    store.lock().unwrap().get(token).cloned()
+    store.lock().unwrap_or_else(|p| p.into_inner()).get(token).cloned()
 }
 
 pub fn get_vault_share_tokens(store: &ShareTokenStore, vault_id: &str) -> Vec<ShareToken> {
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .values()
         .filter(|t| t.vault_id == vault_id)
         .cloned()
@@ -354,7 +410,7 @@ pub fn get_vault_share_tokens(store: &ShareTokenStore, vault_id: &str) -> Vec<Sh
 }
 
 pub fn revoke_share_token(store: &ShareTokenStore, token: &str) -> Option<ShareToken> {
-    let mut lock = store.lock().unwrap();
+    let mut lock = store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(t) = lock.get_mut(token) {
         t.revoked = true;
         Some(t.clone())
@@ -371,7 +427,7 @@ pub fn append_audit_entry(
     actor: &str,
     details: serde_json::Value,
 ) {
-    audit_store.lock().unwrap().push(AuditEntry {
+    audit_store.lock().unwrap_or_else(|p| p.into_inner()).push(AuditEntry {
         timestamp: Utc::now(),
         action: action.to_string(),
         actor: actor.to_string(),
@@ -387,7 +443,7 @@ pub fn set_notification_preferences(
 ) {
     notif_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(prefs.owner.clone(), prefs);
 }
 
@@ -395,7 +451,7 @@ pub fn get_notification_preferences(
     notif_store: &NotificationStore,
     owner: &str,
 ) -> Option<crate::models::VaultNotificationPreferences> {
-    notif_store.lock().unwrap().get(owner).cloned()
+    notif_store.lock().unwrap_or_else(|p| p.into_inner()).get(owner).cloned()
 }
 
 // ── TTL Insurance persistence (SQLite) ───────────────────────────────────────
@@ -413,7 +469,7 @@ impl Db {
 
         let enabled_i = i64::from(policy.enabled);
 
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO ttl_insurance_policies (
                 vault_id,
@@ -447,7 +503,7 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Option<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
@@ -509,7 +565,7 @@ impl Db {
         owner_id: u64,
         last_active_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO owner_activity (owner_id, last_active_at)
             VALUES (?1, ?2)
@@ -525,7 +581,7 @@ impl Db {
         &self,
         owner_id: u64,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT last_active_at
@@ -558,7 +614,7 @@ impl Db {
     pub fn all_enabled_insurance_policies(
         &self,
     ) -> Result<Vec<TtlInsurancePolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, extension_seconds, inactivity_threshold_seconds, enabled, purchased_at, last_extended_at
@@ -616,6 +672,7 @@ impl Db {
     }
 }
 
+use crate::db_read_pool::{open_writer, resolve_target, ReadGuard, ReadPool};
 use rusqlite::{params, Connection, OptionalExtension};
 
 fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
@@ -699,11 +756,17 @@ impl PoolConfig {
     }
 }
 
+/// Database handle.
+///
+/// Concurrency model (#696, #697): all writes go through `conn`, a single
+/// mutex-guarded writer connection. Read-only queries check a connection out of
+/// `read_pool` (see [`crate::db_read_pool`]), so readers run in parallel with each
+/// other and with the writer. When the read pool is exhausted, reads fall back to
+/// `conn`.
 pub struct Db {
-    conn: std::sync::Mutex<Connection>,
-    // DB_POOL_MIN/DB_POOL_MAX are accepted for forward compatibility but unused:
-    // `conn` is a single mutex-guarded connection, not a real pool. Only
-    // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
+    pub(crate) conn: std::sync::Mutex<Connection>,
+    read_pool: ReadPool,
+    read_router: Option<crate::read_replica::ReadReplicaRouter>,
     #[allow(dead_code)]
     pool_config: PoolConfig,
     /// In-memory read cache mirroring the `vaults` table, kept in sync by
@@ -727,11 +790,90 @@ impl Db {
         Self::open_with_pool_config(path, &PoolConfig::default())
     }
 
+    /// Open the database with the given pool settings.
+    ///
+    /// `min` read connections are opened immediately and the read pool grows up
+    /// to `max` on demand. `timeout_secs` is the SQLite busy timeout and also how
+    /// long a read waits for a free pooled connection before falling back to the
+    /// writer.
     pub fn open_with_pool_config(path: &str, config: &PoolConfig) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(config.timeout_secs as u64))?;
+        let primary_path = std::env::var("PRIMARY_DB_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| path.to_string());
+        let replica_paths: Vec<_> = std::env::var("READ_REPLICA_URLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !replica_paths.is_empty() && primary_path == ":memory:" {
+            return Err(rusqlite::Error::InvalidPath(
+                "READ_REPLICA_URLS requires a file-backed primary database".into(),
+            ));
+        }
+
+        let read_router = if replica_paths.is_empty() {
+            None
+        } else {
+            let router = crate::read_replica::ReadReplicaRouter::from_env_with_primary(&primary_path);
+            if router.replica_count() != replica_paths.len() {
+                return Err(rusqlite::Error::InvalidPath(
+                    "one or more READ_REPLICA_URLS could not be opened".into(),
+                ));
+            }
+            router.check_all_replicas();
+            Some(router)
+        };
+
+        Self::open_with_router(&primary_path, config, read_router)
+    }
+
+    /// Open a database with an explicit set of replica paths. Reads use the
+    /// configured replica-routing policy; all writes still use `path`.
+    pub fn open_with_read_replicas(
+        path: &str,
+        config: &PoolConfig,
+        replica_paths: &[&str],
+        strategy: crate::read_replica::ReplicaRoutingStrategy,
+        lag_threshold_ms: u64,
+    ) -> Result<Self, rusqlite::Error> {
+        let router = crate::read_replica::ReadReplicaRouter::new_with_primary(
+            Some(path),
+            replica_paths,
+            strategy,
+            lag_threshold_ms,
+        );
+        if router.replica_count() != replica_paths.len() {
+            return Err(rusqlite::Error::InvalidPath(
+                "one or more read replica paths could not be opened".into(),
+            ));
+        }
+        router.check_all_replicas();
+        Self::open_with_router(path, config, Some(router))
+    }
+
+    fn open_with_router(
+        path: &str,
+        config: &PoolConfig,
+        read_router: Option<crate::read_replica::ReadReplicaRouter>,
+    ) -> Result<Self, rusqlite::Error> {
+        let timeout = std::time::Duration::from_secs(u64::from(config.timeout_secs));
+        let target = resolve_target(path);
+        let conn = open_writer(&target, timeout)?;
+        let read_pool = ReadPool::new(
+            &target,
+            config.min as usize,
+            config.max as usize,
+            timeout,
+            timeout,
+        )?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
+            read_pool,
+            read_router,
             pool_config: PoolConfig {
                 min: config.min,
                 max: config.max,
@@ -741,12 +883,119 @@ impl Db {
         })
     }
 
+    /// Check out a connection for a read-only query: a pooled reader when one is
+    /// available, otherwise the writer.
+    ///
+    /// Do not call this while holding the writer lock (`conn`) or another reader.
+    /// If the pool is exhausted, the fallback would wait on a mutex the current
+    /// thread already holds. Scope the outer guard so it drops first.
+    fn reader(&self) -> ReadGuard<'_> {
+        match self.read_pool.acquire() {
+            Some(conn) => ReadGuard::pooled(&self.read_pool, conn),
+            None => ReadGuard::writer(self.conn.lock().unwrap_or_else(|p| p.into_inner())),
+        }
+    }
+
+    /// Read connections the pool may open (`DB_POOL_MAX`, at least 1).
+    pub fn max_read_connections(&self) -> usize {
+        self.read_pool.max_size()
+    }
+
+    /// Read connections opened so far, including the `DB_POOL_MIN` set opened at startup.
+    pub fn open_read_connections(&self) -> usize {
+        self.read_pool.open_connections()
+    }
+
+    /// Add a CAPTCHA activity event and return the event count for `ip` in
+    /// the trailing `window_secs` window.
+    pub fn record_captcha_event(
+        &self,
+        ip: &str,
+        window_secs: i64,
+    ) -> Result<u32, rusqlite::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now.saturating_sub(window_secs.max(1));
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM captcha_ip_events WHERE occurred_at < ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "INSERT INTO captcha_ip_events (ip, occurred_at) VALUES (?1, ?2)",
+            params![ip, now],
+        )?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM captcha_ip_events
+             WHERE ip = ?1 AND occurred_at >= ?2",
+            params![ip, cutoff],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Return the number of CAPTCHA activity events for `ip` in the trailing
+    /// `window_secs` window.
+    pub fn captcha_event_count(
+        &self,
+        ip: &str,
+        window_secs: i64,
+    ) -> Result<u32, rusqlite::Error> {
+        let cutoff = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(window_secs.max(1));
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM captcha_ip_events
+             WHERE ip = ?1 AND occurred_at >= ?2",
+            params![ip, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Remove all CAPTCHA activity events for `ip`.
+    pub fn reset_captcha_events(&self, ip: &str) -> Result<(), rusqlite::Error> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM captcha_ip_events WHERE ip = ?1", params![ip])?;
+        Ok(())
+    }
+
+    /// Return the active read-replica router, if `READ_REPLICA_URLS` or an
+    /// explicit replica configuration was supplied.
+    pub fn read_replica_router(&self) -> Option<&crate::read_replica::ReadReplicaRouter> {
+        self.read_router.as_ref()
+    }
+
+    fn with_read_connection<T>(
+        &self,
+        query: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, rusqlite::Error> {
+        if let Some(router) = &self.read_router {
+            if let Ok(target) = router
+                .select_target_for_read(&crate::read_replica::ReadOptions::eventual())
+            {
+                let conn = target.conn.lock().unwrap_or_else(|p| p.into_inner());
+                let result = query(&conn);
+                if result.is_ok() {
+                    target.metrics.lock().unwrap_or_else(|p| p.into_inner()).total_reads += 1;
+                }
+                return result;
+            }
+        }
+
+        query(&self.reader())
+    }
+
     /// Insert or replace a vault. Persists to the `vaults` table so the vault
     /// survives process restarts and is visible to every instance sharing the
     /// same SQLite file, then mirrors the write into the in-memory
     /// `vault_store` cache.
     pub fn insert_vault(&self, vault: crate::models::Vault) {
-        let _ = self.conn.lock().unwrap().execute(
+        let _ = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO vaults
                 (id, owner, beneficiary, balance, check_in_interval, last_check_in, created_at, status, ttl_remaining)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -764,53 +1013,52 @@ impl Db {
         );
         self.vault_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(vault.id.clone(), vault);
     }
 
     /// Retrieve a vault by string ID from the `vaults` table.
     pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding
-            .prepare(
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
                 r"SELECT id, owner, beneficiary, balance, check_in_interval, last_check_in,
                          created_at, status, ttl_remaining
                   FROM vaults WHERE id = ?1",
-            )
-            .ok()?;
-        stmt.query_row(params![vault_id], |r| {
-            let balance_str: String = r.get(3)?;
-            let last_check_in_str: String = r.get(5)?;
-            let created_at_str: String = r.get(6)?;
-            let status_str: String = r.get(7)?;
-            Ok(crate::models::Vault {
-                id: r.get(0)?,
-                owner: r.get(1)?,
-                beneficiary: r.get(2)?,
-                balance: balance_str.parse().unwrap_or(0),
-                check_in_interval: r.get::<_, i64>(4)? as u64,
-                last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                status: vault_status_from_str(&status_str),
-                ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+            )?;
+            stmt.query_row(params![vault_id], |r| {
+                let balance_str: String = r.get(3)?;
+                let last_check_in_str: String = r.get(5)?;
+                let created_at_str: String = r.get(6)?;
+                let status_str: String = r.get(7)?;
+                Ok(crate::models::Vault {
+                    id: r.get(0)?,
+                    owner: r.get(1)?,
+                    beneficiary: r.get(2)?,
+                    balance: balance_str.parse().unwrap_or(0),
+                    check_in_interval: r.get::<_, i64>(4)? as u64,
+                    last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    status: vault_status_from_str(&status_str),
+                    ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+                })
             })
         })
         .ok()
     }
 
     pub fn check_connectivity(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute_batch("SELECT 1")?;
         Ok(())
     }
 
     pub fn migrate(&self) -> Result<(), rusqlite::Error> {
         // Bootstrap the migration tracking table before anything else.
-        self.conn.lock().unwrap().execute_batch(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version    TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -1246,11 +1494,25 @@ impl Db {
                     ON vaults(owner, created_at);
                 ",
             ),
+            (
+                "20",
+                r"
+                CREATE TABLE IF NOT EXISTS captcha_ip_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip          TEXT    NOT NULL,
+                    occurred_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_captcha_ip_events_ip_time
+                    ON captcha_ip_events(ip, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_captcha_ip_events_time
+                    ON captcha_ip_events(occurred_at);
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
             let already_applied: bool = {
-                let conn = self.conn.lock().unwrap();
+                let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
                 conn.query_row(
                     "SELECT 1 FROM schema_migrations WHERE version = ?1",
                     params![version],
@@ -1263,8 +1525,8 @@ impl Db {
                 tracing::debug!(version = version, "migration already applied, skipping");
             } else {
                 tracing::info!(version = version, "applying migration");
-                self.conn.lock().unwrap().execute_batch(sql)?;
-                self.conn.lock().unwrap().execute(
+                self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute_batch(sql)?;
+                self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                     params![version, chrono::Utc::now().to_rfc3339()],
                 )?;
@@ -1337,6 +1599,12 @@ impl Db {
             ),
             ("9", "DROP TABLE IF EXISTS idempotency_keys_cleanup;"),
             (
+                "20",
+                "DROP INDEX IF EXISTS idx_captcha_ip_events_time;
+                 DROP INDEX IF EXISTS idx_captcha_ip_events_ip_time;
+                 DROP TABLE IF EXISTS captcha_ip_events;",
+            ),
+            (
                 "10",
                 "ALTER TABLE reminder_preferences DROP COLUMN normalized_frequency;",
             ),
@@ -1374,8 +1642,8 @@ impl Db {
             .unwrap_or_else(|| panic!("no down migration registered for version {version}"));
 
         tracing::info!(version = version, "rolling back migration");
-        self.conn.lock().unwrap().execute_batch(down_sql)?;
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute_batch(down_sql)?;
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM schema_migrations WHERE version = ?1",
             params![version],
         )?;
@@ -1389,7 +1657,7 @@ impl Db {
     /// rollback + re-apply cycle.
     #[cfg(test)]
     pub(crate) fn schema_object_names(&self) -> Vec<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn
             .prepare(
                 "SELECT name FROM sqlite_master \
@@ -1408,7 +1676,7 @@ impl Db {
     /// schemas before/after a rollback + re-apply cycle.
     #[cfg(test)]
     pub(crate) fn table_columns(&self, table: &str) -> Vec<(String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
@@ -1422,7 +1690,7 @@ impl Db {
 
     pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
         let channels_json = serde_json::to_string(&prefs.channels).unwrap();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO reminder_preferences (vault_id, channels, hours_before_expiry, frequency)
             VALUES (?1, ?2, ?3, ?4)
@@ -1443,26 +1711,26 @@ impl Db {
     }
 
     pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE vault_id = ?1 AND deleted_at IS NULL",
-        )?;
-        let row = stmt.query_row(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at: None,
+            )?;
+            stmt.query_row(params![vault_id.cast_signed()], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at: None,
+                })
             })
-        })?;
-        Ok(row)
+        })
     }
 
     /// Reads the raw `normalized_frequency` column for `vault_id`. Only used
@@ -1473,7 +1741,7 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Option<String>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         conn.query_row(
             "SELECT normalized_frequency FROM reminder_preferences WHERE vault_id = ?1",
             params![vault_id.cast_signed()],
@@ -1482,35 +1750,36 @@ impl Db {
     }
 
     pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE deleted_at IS NULL",
-        )?;
-        let iter = stmt.query_map([], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at: None,
-            })
-        })?;
+            )?;
+            let iter = stmt.query_map([], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at: None,
+                })
+            })?;
 
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            for item in iter {
+                out.push(item?);
+            }
+            Ok(out)
+        })
     }
 
     pub fn soft_delete_reminder(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "UPDATE reminder_preferences SET deleted_at = ?1 WHERE vault_id = ?2 AND deleted_at IS NULL",
             params![chrono::Utc::now().to_rfc3339(), vault_id.cast_signed()],
         )?;
@@ -1521,43 +1790,44 @@ impl Db {
         &self,
         vault_id: u64,
     ) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+        self.with_read_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
                FROM reminder_preferences
                WHERE vault_id = ?1",
-        )?;
-        let iter = stmt.query_map(params![vault_id.cast_signed()], |r| {
-            let channels_str: String = r.get(1)?;
-            let frequency_str: String = r.get(3)?;
-            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
-            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
-            let deleted_at_str: Option<String> = r.get(4)?;
-            let deleted_at = deleted_at_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-            });
-            Ok(ReminderPreferences {
-                vault_id: r.get::<_, i64>(0)? as u64,
-                channels,
-                hours_before_expiry: r.get::<_, i64>(2)? as u32,
-                frequency,
-                deleted_at,
-            })
-        })?;
+            )?;
+            let iter = stmt.query_map(params![vault_id.cast_signed()], |r| {
+                let channels_str: String = r.get(1)?;
+                let frequency_str: String = r.get(3)?;
+                let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+                let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+                let deleted_at_str: Option<String> = r.get(4)?;
+                let deleted_at = deleted_at_str.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                });
+                Ok(ReminderPreferences {
+                    vault_id: r.get::<_, i64>(0)? as u64,
+                    channels,
+                    hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                    frequency,
+                    deleted_at,
+                })
+            })?;
 
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            for item in iter {
+                out.push(item?);
+            }
+            Ok(out)
+        })
     }
 
     pub fn upsert_subscription(&self, sub: &Subscription) -> Result<(), rusqlite::Error> {
         let channels_json = serde_json::to_string(&sub.channels).unwrap();
         let frequency_json = serde_json::to_string(&sub.frequency).unwrap();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO vault_subscriptions (vault_id, owner, channels, frequency)
             VALUES (?1, ?2, ?3, ?4)
@@ -1577,7 +1847,7 @@ impl Db {
     }
 
     pub fn delete_subscription(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM vault_subscriptions WHERE vault_id = ?1",
             params![vault_id.cast_signed()],
         )?;
@@ -1585,7 +1855,7 @@ impl Db {
     }
 
     pub fn get_subscription(&self, vault_id: u64) -> Result<Option<Subscription>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT vault_id, owner, channels, frequency
                FROM vault_subscriptions
@@ -1614,7 +1884,7 @@ impl Db {
     // ── Idempotency (#825) ──────────────────────────────────────────────────
 
     pub fn store_idempotency(&self, key: &str, status_code: u16, response_body: &str) {
-        let _ = self.conn.lock().unwrap().execute(
+        let _ = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO idempotency_keys (key, status_code, response_body, created_at)
                VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -1627,7 +1897,7 @@ impl Db {
     }
 
     pub fn check_idempotency(&self, key: &str) -> Option<crate::models::IdempotencyRecord> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding
             .prepare("SELECT key, status_code, response_body, created_at FROM idempotency_keys WHERE key = ?1")
             .ok()?;
@@ -1661,7 +1931,7 @@ impl Db {
     // ── Unsubscribe (#828) ──────────────────────────────────────────────────
 
     pub fn store_unsubscribe_token(&self, token: &str, owner: &str) {
-        let _ = self.conn.lock().unwrap().execute(
+        let _ = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO unsubscribe_tokens (token, owner, created_at)
                VALUES (?1, ?2, ?3)",
             params![token, owner, chrono::Utc::now().to_rfc3339()],
@@ -1669,7 +1939,7 @@ impl Db {
     }
 
     pub fn process_unsubscribe(&self, token: &str) -> Result<String, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let owner: String = conn
             .query_row(
                 "SELECT owner FROM unsubscribe_tokens WHERE token = ?1",
@@ -1690,7 +1960,7 @@ impl Db {
     pub fn is_unsubscribed(&self, owner: &str) -> bool {
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .query_row(
                 "SELECT 1 FROM unsubscribed_users WHERE owner = ?1",
                 params![owner],
@@ -1713,7 +1983,7 @@ impl Db {
         let method_str = serde_json::to_string(&config.method).unwrap();
         let backup_codes_json = serde_json::to_string(&config.backup_codes).unwrap();
 
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO two_factor_config (vault_id, method, enabled, secret, phone, email, created_at, verified_at, backup_codes)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -1746,7 +2016,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Option<TwoFactorConfig>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"
             SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at, backup_codes
@@ -1806,7 +2076,7 @@ impl Db {
     }
 
     pub fn delete_2fa_config(&self, vault_id: &str) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM two_factor_config WHERE vault_id = ?1",
             params![vault_id],
         )?;
@@ -1816,7 +2086,7 @@ impl Db {
     // ── Audit Log persistence (#961) ─────────────────────────────────────────
 
     pub fn insert_audit_log(&self, entry: &AuditLogEntry) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             INSERT INTO audit_logs (timestamp, user_id, action, resource, result, ip_address, details)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1838,7 +2108,7 @@ impl Db {
         &self,
         query: &AuditLogQuery,
     ) -> Result<Vec<AuditLogEntry>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
 
         let mut sql = String::from(
             "SELECT id, timestamp, user_id, action, resource, result, ip_address, details FROM audit_logs WHERE 1=1"
@@ -1919,7 +2189,7 @@ impl Db {
 
     pub fn purge_old_audit_logs(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
-        let count = self.conn.lock().unwrap().execute(
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM audit_logs WHERE timestamp < ?1",
             params![cutoff],
         )?;
@@ -1944,7 +2214,7 @@ pub fn get_vault_cached(
     if let Some(v) = cache.get_vault(vault_id) {
         return Some(v);
     }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    let vault = store.lock().unwrap_or_else(|p| p.into_inner()).get(vault_id).cloned()?;
     cache.set_vault(vault_id, vault.clone());
     Some(vault)
 }
@@ -1962,7 +2232,7 @@ pub fn get_ttl_remaining_cached(
     if let Some(ttl) = cache.get_ttl_remaining(vault_id) {
         return Some(ttl);
     }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    let vault = store.lock().unwrap_or_else(|p| p.into_inner()).get(vault_id).cloned()?;
     let ttl = vault.ttl_remaining;
     cache.set_ttl_remaining(vault_id, ttl);
     Some(ttl)
@@ -1980,7 +2250,7 @@ pub fn get_vault_summary_cached(
     if let Some(s) = cache.get_vault_summary(vault_id) {
         return Some(s);
     }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    let vault = store.lock().unwrap_or_else(|p| p.into_inner()).get(vault_id).cloned()?;
     let summary = VaultSummary::from(&vault);
     cache.set_vault_summary(vault_id, summary.clone());
     Some(summary)
@@ -1997,7 +2267,7 @@ impl Db {
 
     pub fn cleanup_expired_idempotency_keys(&self) -> Result<u64, rusqlite::Error> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
-        let count = self.conn.lock().unwrap().execute(
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "DELETE FROM idempotency_keys WHERE created_at < ?1",
             params![cutoff.to_rfc3339()],
         )?;
@@ -2007,7 +2277,7 @@ impl Db {
     // ── #69: Multi-Tenancy Support ──────────────────────────────────────────
 
     pub fn create_tenant(&self, tenant: &crate::models::Tenant) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO tenants (id, name, owner, created_at, updated_at, is_active)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2026,7 +2296,7 @@ impl Db {
         &self,
         tenant_id: &str,
     ) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             "SELECT id, name, owner, created_at, updated_at, is_active FROM tenants WHERE id = ?1",
         )?;
@@ -2073,7 +2343,7 @@ impl Db {
         tenant_id: &str,
         vault_id: &str,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "INSERT OR IGNORE INTO tenant_vaults (tenant_id, vault_id) VALUES (?1, ?2)",
             params![tenant_id, vault_id],
         )?;
@@ -2081,7 +2351,7 @@ impl Db {
     }
 
     pub fn get_tenant_vaults(&self, tenant_id: &str) -> Result<Vec<String>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt =
             binding.prepare("SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1")?;
         let iter = stmt.query_map(params![tenant_id], |r| r.get(0))?;
@@ -2096,7 +2366,7 @@ impl Db {
         &self,
         billing: &crate::models::TenantBilling,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO tenant_billing (tenant_id, monthly_charge, billing_cycle_start, billing_cycle_end, total_vaults, status)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2120,7 +2390,7 @@ impl Db {
         &self,
         update: &crate::models::CredentialUpdate,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO credential_updates (id, vault_id, user_id, field, old_value, new_value, timestamp, operation_id)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -2141,7 +2411,7 @@ impl Db {
         &self,
         transform: &crate::models::OperationalTransform,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -2162,7 +2432,7 @@ impl Db {
         &self,
         resolution: &crate::models::ConflictResolution,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO conflict_resolutions (conflict_id, vault_id, update1_id, update2_id, resolution_strategy, resolved_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2181,7 +2451,7 @@ impl Db {
         &self,
         presence: &crate::models::UserPresence,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO user_presence (user_id, vault_id, status, last_seen, session_id)
                VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -2199,7 +2469,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             "SELECT user_id, vault_id, status, last_seen, session_id FROM user_presence WHERE vault_id = ?1",
         )?;
@@ -2234,7 +2504,7 @@ impl Db {
         session: &crate::models::CollaborativeSession,
     ) -> Result<(), rusqlite::Error> {
         let participants_json = serde_json::to_string(&session.participants).unwrap_or_default();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO collaborative_sessions (session_id, vault_id, created_at, participants, is_active)
                VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -2258,7 +2528,7 @@ impl Db {
     ) -> Result<(), rusqlite::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO full_text_search_index (id, vault_id, title, content, created_at, indexed_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, vault_id, title, content, now, now],
@@ -2271,7 +2541,7 @@ impl Db {
         query: &str,
         limit: u32,
     ) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, vault_id, title, content FROM full_text_search_index
                WHERE title LIKE ?1 OR content LIKE ?1
@@ -2308,7 +2578,7 @@ impl Db {
         facet_name: &str,
         value: &str,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO search_facets (vault_id, facet_name, value, count)
                VALUES (?1, ?2, ?3, 1)
                ON CONFLICT(vault_id, facet_name, value) DO UPDATE SET
@@ -2322,7 +2592,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt =
             binding.prepare("SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1")?;
         let facet_names: Vec<String> = stmt
@@ -2358,7 +2628,7 @@ impl Db {
         &self,
         policy: &crate::models::DataRetentionPolicy,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO data_retention_policies
                 (data_type, retention_days, enabled, description, created_at, updated_at)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -2384,7 +2654,7 @@ impl Db {
         &self,
         data_type: &str,
     ) -> Result<Option<crate::models::DataRetentionPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
                FROM data_retention_policies WHERE data_type = ?1",
@@ -2400,7 +2670,7 @@ impl Db {
     pub fn list_retention_policies(
         &self,
     ) -> Result<Vec<crate::models::DataRetentionPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
                FROM data_retention_policies ORDER BY data_type",
@@ -2457,7 +2727,7 @@ impl Db {
         let deleted = self
             .conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(&sql, params![cutoff, data_type, now])?;
 
         // Write an audit entry in the deletion log.
@@ -2466,7 +2736,7 @@ impl Db {
             "cutoff": cutoff,
             "retention_days": retention_days,
         });
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO retention_deletion_log (data_type, deleted_rows, purged_at, actor, details)
                VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -2486,7 +2756,7 @@ impl Db {
         &self,
         exc: &crate::models::RetentionException,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO retention_exceptions
                 (data_type, record_id, reason, expires_at, created_at, created_by)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2508,7 +2778,7 @@ impl Db {
         data_type: &str,
     ) -> Result<Vec<crate::models::RetentionException>, rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, data_type, record_id, reason, expires_at, created_at, created_by
                FROM retention_exceptions
@@ -2546,7 +2816,7 @@ impl Db {
         data_type: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::models::RetentionDeletionLog>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let (sql, param): (String, Option<String>) = if let Some(dt) = data_type {
             (
                 format!(
@@ -2606,11 +2876,11 @@ impl Db {
     pub fn insert_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         // Mark any previously active key as 'retiring'.
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "UPDATE encryption_key_versions SET status = 'retiring' WHERE status = 'active'",
             [],
         )?;
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR IGNORE INTO encryption_key_versions (version, status, created_at)
                VALUES (?1, 'active', ?2)",
             params![version as i64, now],
@@ -2622,7 +2892,7 @@ impl Db {
     pub fn list_encryption_key_versions(
         &self,
     ) -> Result<Vec<crate::models::EncryptionKeyInfo>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT version, status, created_at, rotated_at
                FROM encryption_key_versions ORDER BY version DESC",
@@ -2659,7 +2929,7 @@ impl Db {
     /// Mark a key version as fully retired.
     pub fn retire_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             "UPDATE encryption_key_versions SET status = 'retired', rotated_at = ?1 WHERE version = ?2",
             params![now, version as i64],
         )?;
@@ -2675,7 +2945,7 @@ impl Db {
     ) -> Result<(), rusqlite::Error> {
         let secret_type = serde_json::to_string(&policy.secret_type).unwrap();
         let channels_json = serde_json::to_string(&policy.notify_channels).unwrap();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO secret_rotation_policies
                 (secret_type, rotation_interval_days, grace_period_hours, max_token_lifetime_hours,
                  auto_rotate, notify_channels, created_at, updated_at)
@@ -2707,7 +2977,7 @@ impl Db {
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationPolicy>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
                      notify_channels, created_at, updated_at, max_token_lifetime_hours
@@ -2726,7 +2996,7 @@ impl Db {
     pub fn list_secret_rotation_policies(
         &self,
     ) -> Result<Vec<crate::models::SecretRotationPolicy>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
                      notify_channels, created_at, updated_at, max_token_lifetime_hours
@@ -2776,7 +3046,7 @@ impl Db {
         log: &crate::models::SecretRotationLog,
     ) -> Result<(), rusqlite::Error> {
         let secret_type_str = serde_json::to_string(&log.secret_type).unwrap();
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO secret_rotation_logs
                 (secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2798,7 +3068,7 @@ impl Db {
         secret_type: &crate::models::SecretType,
     ) -> Result<Option<crate::models::SecretRotationLog>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
                FROM secret_rotation_logs WHERE secret_type = ?1
@@ -2818,7 +3088,7 @@ impl Db {
         limit: u32,
     ) -> Result<Vec<crate::models::SecretRotationLog>, rusqlite::Error> {
         let secret_type_str = serde_json::to_string(secret_type).unwrap();
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
                FROM secret_rotation_logs WHERE secret_type = ?1
@@ -2933,7 +3203,7 @@ impl Db {
         &self,
         status: &crate::degradation::CapabilityStatus,
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             r"
             INSERT INTO capability_statuses (name, level, reason, fallback_available, updated_at)
@@ -2958,7 +3228,7 @@ impl Db {
     /// Remove a capability's registered status (used when a capability is
     /// restored to `Full`, so `check` falls back to the default).
     pub fn delete_capability_status(&self, name: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "DELETE FROM capability_statuses WHERE name = ?1",
             params![name],
@@ -2971,7 +3241,7 @@ impl Db {
         &self,
         name: &str,
     ) -> Result<crate::degradation::CapabilityStatus, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT name, level, reason, fallback_available, updated_at 
              FROM capability_statuses 
@@ -3017,7 +3287,7 @@ impl Db {
     pub fn list_capability_statuses(
         &self,
     ) -> Result<Vec<crate::degradation::CapabilityStatus>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT name, level, reason, fallback_available, updated_at 
              FROM capability_statuses
@@ -3058,14 +3328,14 @@ impl Db {
     /// (e.g. `consistency.rs`) can execute one-off queries without going through
     /// individual `Db` methods.
     pub fn conn_lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn.lock().unwrap()
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Run SQLite's `PRAGMA foreign_key_check` and return one descriptive
     /// string per violation.  Returns an empty `Vec` if the database is
     /// clean.
     pub fn run_consistency_pragma(&self) -> Result<Vec<String>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
         let rows = stmt.query_map([], |r| {
             // Columns: table, rowid, parent, fkid
@@ -3099,7 +3369,7 @@ impl Db {
         data: &str,
         schema_version: u32,
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             r"
             INSERT INTO events (vault_id, sequence, event_type, timestamp, data, schema_version)
@@ -3122,7 +3392,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Vec<(u64, String, String, String, u32)>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             r"
             SELECT sequence, event_type, timestamp, data, schema_version
@@ -3157,7 +3427,7 @@ impl Db {
         taken_at: &chrono::DateTime<chrono::Utc>,
         state: &str,
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             r"
             INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
@@ -3182,7 +3452,7 @@ impl Db {
         &self,
         vault_id: &str,
     ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             r"
             SELECT snapshot_sequence, taken_at, state
@@ -3202,7 +3472,7 @@ impl Db {
         &self,
         cutoff_date: &chrono::DateTime<chrono::Utc>,
     ) -> Result<usize, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "DELETE FROM snapshots WHERE taken_at < ?1",
             rusqlite::params![cutoff_date.to_rfc3339()],
@@ -3214,7 +3484,7 @@ impl Db {
         &self,
         cutoff_date: &chrono::DateTime<chrono::Utc>,
     ) -> Result<usize, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "DELETE FROM events WHERE timestamp < ?1",
             rusqlite::params![cutoff_date.to_rfc3339()],
@@ -3231,7 +3501,7 @@ impl Db {
         &self,
         flag: &crate::feature_flags::FeatureFlag,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT INTO feature_flags
                 (key, description, enabled, rollout_percentage, version, created_at, updated_at)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -3262,7 +3532,7 @@ impl Db {
         match self.get_feature_flag(&req.key)? {
             Some(existing) => {
                 // Snapshot the old state into history.
-                self.conn.lock().unwrap().execute(
+                self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
                     r"INSERT INTO feature_flag_history
                         (flag_key, version, enabled, rollout_percentage, updated_at, updated_by)
                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -3282,7 +3552,7 @@ impl Db {
                     .clone()
                     .or_else(|| existing.description.clone());
 
-                self.conn.lock().unwrap().execute(
+                self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
                     r"UPDATE feature_flags
                          SET description = ?1,
                              enabled = ?2,
@@ -3338,7 +3608,7 @@ impl Db {
         // mutex guard is released before we call get_feature_flag_history,
         // which also needs to acquire the lock.
         let maybe_flag = {
-            let binding = self.conn.lock().unwrap();
+            let binding = self.reader();
             let mut stmt = binding.prepare(
                 r"SELECT key, description, enabled, rollout_percentage, version, created_at, updated_at
                    FROM feature_flags WHERE key = ?1",
@@ -3401,7 +3671,7 @@ impl Db {
         &self,
     ) -> Result<Vec<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
         let keys: Vec<String> = {
-            let binding = self.conn.lock().unwrap();
+            let binding = self.reader();
             let mut stmt = binding.prepare("SELECT key FROM feature_flags ORDER BY key")?;
             let iter = stmt.query_map([], |r| r.get(0))?;
             let mut keys = Vec::new();
@@ -3425,7 +3695,7 @@ impl Db {
         &self,
         key: &str,
     ) -> Result<Vec<crate::feature_flags::FlagVersionSnapshot>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.reader();
         let mut stmt = binding.prepare(
             r"SELECT version, enabled, rollout_percentage, updated_at, updated_by
                FROM feature_flag_history
@@ -3481,7 +3751,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(100_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let query = SearchQuery {
             owner: Some("owner1".to_string()),
@@ -3513,7 +3783,7 @@ mod tests {
                 status: VaultStatus::Active,
                 ttl_remaining: Some(100_000),
             };
-            store.lock().unwrap().insert(format!("v{i}"), vault);
+            store.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("v{i}"), vault);
         }
 
         let query = SearchQuery {
@@ -3669,5 +3939,96 @@ mod tests {
 
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn captcha_activity_is_shared_across_db_handles() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_captcha_events_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+        let db_a = Db::open(path_str).unwrap();
+        db_a.migrate().unwrap();
+        let db_b = Db::open(path_str).unwrap();
+        db_b.migrate().unwrap();
+
+        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 1);
+        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 2);
+        assert_eq!(db_b.captcha_event_count("192.0.2.80", 300).unwrap(), 2);
+
+        db_b.reset_captcha_events("192.0.2.80").unwrap();
+        assert_eq!(db_a.captcha_event_count("192.0.2.80", 300).unwrap(), 0);
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_reads_use_replica_and_fall_back_to_primary() {
+        let primary_path = std::env::temp_dir().join(format!(
+            "ethos_replica_primary_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let replica_path = std::env::temp_dir().join(format!(
+            "ethos_replica_copy_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let primary_path_str = primary_path.to_str().unwrap();
+        let replica_path_str = replica_path.to_str().unwrap();
+        let primary = Db::open(primary_path_str).unwrap();
+        primary.migrate().unwrap();
+        let replica = Db::open(replica_path_str).unwrap();
+        replica.migrate().unwrap();
+
+        primary
+            .upsert(&ReminderPreferences {
+                vault_id: 1,
+                channels: vec![Channel::Email],
+                hours_before_expiry: 24,
+                frequency: Frequency::Daily,
+                deleted_at: None,
+            })
+            .unwrap();
+        replica
+            .upsert(&ReminderPreferences {
+                vault_id: 1,
+                channels: vec![Channel::Sms],
+                hours_before_expiry: 24,
+                frequency: Frequency::Daily,
+                deleted_at: None,
+            })
+            .unwrap();
+
+        let routed = Db::open_with_read_replicas(
+            primary_path_str,
+            &PoolConfig::default(),
+            &[replica_path_str],
+            crate::read_replica::ReplicaRoutingStrategy::RoundRobin,
+            500,
+        )
+        .unwrap();
+        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Sms]);
+        assert_eq!(
+            routed
+                .read_replica_router()
+                .unwrap()
+                .all_metrics()[1]
+                .total_reads,
+            1
+        );
+
+        routed
+            .read_replica_router()
+            .unwrap()
+            .mark_unreachable(replica_path_str);
+        assert_eq!(routed.get(1).unwrap().channels, vec![Channel::Email]);
+
+        drop(routed);
+        drop(replica);
+        drop(primary);
+        let _ = std::fs::remove_file(replica_path);
+        let _ = std::fs::remove_file(primary_path);
     }
 }

@@ -4,25 +4,23 @@
 // request IP is considered "suspicious" (exceeded a configurable threshold of
 // recent events).  Trusted users are exempt.
 //
-// Integration with Google reCAPTCHA v2/v3 is optional:
+// Google reCAPTCHA v2/v3 verification:
 //   - Set RECAPTCHA_SITE_KEY   → sent to the frontend so it can render the widget.
-//   - Set RECAPTCHA_SECRET_KEY → used for server-side token verification.
-//   - Leave RECAPTCHA_SECRET_KEY empty to run in *development mode* (all tokens
-//     accepted without contacting Google).
+//   - Set RECAPTCHA_SECRET_KEY → required for server-side token verification.
 //
 // The suspicious-activity threshold is controlled by the
 // `CAPTCHA_SUSPICIOUS_THRESHOLD` env var (default: 10 events per window).
 //
-// These handlers are not yet registered in main.rs::build_router — see task
-// instructions.  They follow the same axum pattern used throughout this crate:
+// These handlers follow the same axum pattern used throughout this crate:
 //   `async fn foo(State(state): State<Arc<AppState>>, headers: HeaderMap, ...) -> Result<Json<T>, AppError>`
 #![allow(clippy::unused_async)]
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -49,6 +47,9 @@ const DEFAULT_CHALLENGE_TTL_SECS: i64 = 300;
 /// Default number of events in a window before an IP is considered suspicious.
 const DEFAULT_SUSPICIOUS_THRESHOLD: u32 = 10;
 
+/// Default rolling window for suspicious-activity events (5 minutes).
+const DEFAULT_SUSPICIOUS_WINDOW_SECS: i64 = 300;
+
 /// Lifetime of the session token minted after a successful CAPTCHA (1 hour).
 const SESSION_TOKEN_TTL_SECS: i64 = 3_600;
 
@@ -64,11 +65,6 @@ static CHALLENGE_STORE: std::sync::LazyLock<
 
 static TRUSTED_STORE: std::sync::LazyLock<Arc<Mutex<Vec<TrustedUser>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
-
-/// Per-IP event counter used by `is_suspicious`.
-/// Maps IP → count of events seen in the current window.
-static IP_EVENT_COUNTER: std::sync::LazyLock<Arc<Mutex<HashMap<String, u32>>>> =
-    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// Per-IP CAPTCHA failure tracking, used to detect automated bypass attempts
 /// (#392): a client that repeatedly fails CAPTCHA and retries rapidly looks
@@ -166,23 +162,8 @@ pub fn consecutive_failures_for_ip(ip: &str) -> u32 {
 
 // ── Helper: extract IP from request headers ───────────────────────────────────
 
-fn extract_ip(headers: &HeaderMap) -> String {
-    // Prefer X-Forwarded-For (first entry), fall back to X-Real-IP.
-    if let Some(val) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        return val
-            .split(',')
-            .next()
-            .unwrap_or("unknown")
-            .trim()
-            .to_string();
-    }
-    if let Some(val) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        return val.to_string();
-    }
-    "unknown".to_string()
+fn extract_ip(headers: &HeaderMap, peer_ip: IpAddr) -> String {
+    crate::audit::extract_client_ip(headers, Some(peer_ip))
 }
 
 /// Extract the optional `X-User-ID` header value.
@@ -214,30 +195,34 @@ pub fn is_trusted_user(user_id: &str, ip: &str, _state: &AppState) -> bool {
 /// threshold.
 ///
 /// The threshold is read from `CAPTCHA_SUSPICIOUS_THRESHOLD` (default 10).
-/// The counter is a simple in-memory stub; a production implementation would
-/// use a sliding-window backed by Redis or the SQLite `Db`.
-pub fn is_suspicious(ip: &str, _state: &AppState) -> bool {
+/// Events are stored in the shared SQLite database over a rolling window.
+pub fn is_suspicious(ip: &str, state: &AppState) -> Result<bool, rusqlite::Error> {
     let threshold = std::env::var("CAPTCHA_SUSPICIOUS_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SUSPICIOUS_THRESHOLD);
 
-    let counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    counter.get(ip).copied().unwrap_or(0) >= threshold
+    let window_secs = std::env::var("CAPTCHA_SUSPICIOUS_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SUSPICIOUS_WINDOW_SECS);
+    Ok(state.db.captcha_event_count(ip, window_secs)? >= threshold)
 }
 
 /// Increment the per-IP event counter (used by other modules to signal
 /// potentially suspicious activity from an IP).
-pub fn record_event_for_ip(ip: &str) {
-    let mut counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    *counter.entry(ip.to_string()).or_insert(0) += 1;
+pub fn record_event_for_ip(ip: &str, state: &AppState) -> Result<u32, rusqlite::Error> {
+    let window_secs = std::env::var("CAPTCHA_SUSPICIOUS_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SUSPICIOUS_WINDOW_SECS);
+    state.db.record_captcha_event(ip, window_secs)
 }
 
 /// Reset the per-IP event counter (e.g. after a successful CAPTCHA verification
 /// or when the observation window rolls over).
-pub fn reset_event_counter_for_ip(ip: &str) {
-    let mut counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    counter.remove(ip);
+pub fn reset_event_counter_for_ip(ip: &str, state: &AppState) -> Result<(), rusqlite::Error> {
+    state.db.reset_captcha_events(ip)
 }
 
 /// Generate a fresh `CaptchaChallenge`.
@@ -268,14 +253,25 @@ pub fn generate_challenge(_state: &AppState) -> CaptchaChallenge {
     challenge
 }
 
+fn recaptcha_secret_key() -> Result<String, String> {
+    std::env::var("RECAPTCHA_SECRET_KEY")
+        .map_err(|_| "RECAPTCHA_SECRET_KEY is not configured".to_string())
+        .and_then(|secret| {
+            let secret = secret.trim().to_string();
+            if secret.is_empty() {
+                Err("RECAPTCHA_SECRET_KEY is not configured".to_string())
+            } else {
+                Ok(secret)
+            }
+        })
+}
+
 /// Verify a CAPTCHA token against the Google reCAPTCHA API.
 ///
 /// # Behaviour
-/// * If `RECAPTCHA_SECRET_KEY` is empty (development / CI mode), the function
-///   skips the HTTP call and returns a stub success response.
-/// * Otherwise, a `POST` is sent to
-///   `https://www.google.com/recaptcha/api/siteverify` with the secret key and
-///   the user-supplied token.
+/// A `POST` is sent to `https://www.google.com/recaptcha/api/siteverify` with
+/// the configured secret key and user-supplied token. Missing configuration
+/// is an error; it never accepts a token without verification.
 ///
 /// # Errors
 /// Returns `Err(String)` if the challenge is unknown / expired, or if the
@@ -296,26 +292,8 @@ pub async fn verify_captcha(
         return Err("challenge has expired".to_string());
     }
 
-    // 2. Validate against reCAPTCHA (or return stub success in dev mode).
-    let secret_key = std::env::var("RECAPTCHA_SECRET_KEY").unwrap_or_default();
-
-    if secret_key.is_empty() {
-        // Development / CI mode — accept any token without contacting Google.
-        tracing::debug!("RECAPTCHA_SECRET_KEY not set; returning stub success (dev mode)");
-
-        // Remove the used challenge.
-        CHALLENGE_STORE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&req.challenge_id);
-
-        let session_token = Uuid::new_v4().to_string();
-        return Ok(CaptchaVerifyResponse {
-            verified: true,
-            session_token: Some(session_token),
-            message: "CAPTCHA verified (development mode)".to_string(),
-        });
-    }
+    // 2. Validate against reCAPTCHA; missing configuration is a hard failure.
+    let secret_key = recaptcha_secret_key()?;
 
     // 3. Real reCAPTCHA verification via reqwest.
     let client = reqwest::Client::new();
@@ -387,31 +365,32 @@ pub async fn verify_captcha(
 
 /// `POST /captcha/challenge`
 ///
-/// Inspects `X-Forwarded-For` / `X-User-ID` headers.  If the caller is a
-/// trusted user, returns `204 No Content` (no challenge needed).  Otherwise,
-/// issues a challenge and returns `200 OK` with the `CaptchaChallenge` body.
+/// Uses the socket peer IP and honors forwarded headers only from a trusted
+/// proxy. If the caller is a trusted user, returns `204 No Content` (no
+/// challenge needed); otherwise, issues a challenge and returns `200 OK`.
 pub async fn post_challenge_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let ip = extract_ip(&headers);
+) -> Result<impl IntoResponse, AppError> {
+    let ip = extract_ip(&headers, peer.ip());
     let user_id = extract_user_id(&headers).unwrap_or_default();
 
     // Trusted users are exempt.
     if !user_id.is_empty() && is_trusted_user(&user_id, &ip, &state) {
-        return (StatusCode::NO_CONTENT, Json(json!(null))).into_response();
+        return Ok((StatusCode::NO_CONTENT, Json(json!(null))).into_response());
     }
 
     // Only issue a challenge when the IP looks suspicious (or when the user
     // has no recorded trust entry — i.e. unknown users always get a challenge
     // if the IP is flagged, and known users only if they are not trusted).
-    if !user_id.is_empty() && !is_suspicious(&ip, &state) {
+    if !user_id.is_empty() && !is_suspicious(&ip, &state)? {
         // Known, non-suspicious user — no challenge needed.
-        return (StatusCode::NO_CONTENT, Json(json!(null))).into_response();
+        return Ok((StatusCode::NO_CONTENT, Json(json!(null))).into_response());
     }
 
     let challenge = generate_challenge(&state);
-    (StatusCode::OK, Json(json!(challenge))).into_response()
+    Ok((StatusCode::OK, Json(json!(challenge))).into_response())
 }
 
 /// `POST /captcha/verify`
@@ -424,14 +403,25 @@ pub async fn post_challenge_handler(
 pub async fn post_verify_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<CaptchaVerifyRequest>,
 ) -> Result<Json<CaptchaVerifyResponse>, AppError> {
-    let ip = extract_ip(&headers);
+    let ip = extract_ip(&headers, peer.ip());
 
     if is_backoff_active(&ip) {
         return Err(AppError::TooManyRequests(
             "too many failed CAPTCHA attempts; please wait before retrying".to_string(),
         ));
+    }
+
+    if let Err(error) = recaptcha_secret_key() {
+        tracing::error!(%error, "CAPTCHA verification is unavailable");
+        return Err(crate::error::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "captcha_unavailable",
+            "CAPTCHA verification is not configured",
+        )
+        .into());
     }
 
     match verify_captcha(&req, &state).await {
@@ -441,7 +431,7 @@ pub async fn post_verify_handler(
                 // and the suspicious-activity counter for this IP so that
                 // subsequent requests are not immediately flagged again.
                 record_captcha_success(&ip);
-                reset_event_counter_for_ip(&ip);
+                reset_event_counter_for_ip(&ip, &state)?;
                 tracing::debug!(
                     challenge_id = %req.challenge_id,
                     ip = %ip,
@@ -578,8 +568,11 @@ mod tests {
             audit_store: create_audit_store(),
             share_store: create_share_store(),
             share_token_store: create_share_token_store(),
+            incident_state: Arc::new(crate::incidents::IncidentState::new()),
             consensus: NodeCache::from_env().expect("valid CONSENSUS_STRATEGY"),
             webhook_state: Arc::new(WebhookState::new()),
+            vault_broadcaster: Arc::new(crate::websocket::VaultBroadcaster::new(16)),
+            request_log_store: crate::replay::create_request_log_store(),
             graphql_schema,
             metrics: Metrics::new(),
             priority_enforcer: Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
@@ -606,6 +599,12 @@ mod tests {
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
             deadlock_detector: Arc::new(DeadlockDetector::new()),
+            notification_service: crate::notifications::create_service(),
+            profiler_state: Arc::new(crate::profiler::ProfilerState::new()),
+            incident_state: Arc::new(crate::incidents::IncidentState::new()),
+            token_revocations: crate::token_revocation::RevocationList::new(),
+            saml_state: Arc::new(crate::saml::SamlState::disabled()),
+            fraud_detector: crate::fraud_detection::FraudDetector::new(),
         }
     }
 
@@ -621,7 +620,7 @@ mod tests {
 
         // Directly insert into the static store.
         {
-            let mut store = TRUSTED_STORE.lock().unwrap();
+            let mut store = TRUSTED_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.push(TrustedUser {
                 user_id: "test-user-trusted".to_string(),
                 ip: "10.0.0.1".to_string(),
@@ -635,7 +634,7 @@ mod tests {
         // Clean up.
         TRUSTED_STORE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .retain(|u| u.user_id != "test-user-trusted");
     }
 
@@ -643,7 +642,7 @@ mod tests {
     fn not_suspicious_below_threshold() {
         let state = dummy_state();
         // Use a unique IP to avoid interference from other tests.
-        assert!(!is_suspicious("192.0.2.1", &state));
+        assert!(!is_suspicious("192.0.2.1", &state).unwrap());
     }
 
     #[test]
@@ -652,11 +651,11 @@ mod tests {
         let ip = "192.0.2.2";
         // Default threshold is 10.
         for _ in 0..10 {
-            record_event_for_ip(ip);
+            record_event_for_ip(ip, &state).unwrap();
         }
-        assert!(is_suspicious(ip, &state));
-        reset_event_counter_for_ip(ip);
-        assert!(!is_suspicious(ip, &state));
+        assert!(is_suspicious(ip, &state).unwrap());
+        reset_event_counter_for_ip(ip, &state).unwrap();
+        assert!(!is_suspicious(ip, &state).unwrap());
     }
 
     #[test]
@@ -669,8 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_captcha_dev_mode_succeeds() {
-        // Ensure no secret key is set for this test.
+    async fn verify_captcha_without_secret_fails_closed() {
         std::env::remove_var("RECAPTCHA_SECRET_KEY");
 
         let state = dummy_state();
@@ -683,10 +681,39 @@ mod tests {
         };
 
         let result = verify_captcha(&req, &state).await;
-        assert!(result.is_ok());
-        let resp = result.unwrap();
-        assert!(resp.verified);
-        assert!(resp.session_token.is_some());
+        assert_eq!(
+            result.unwrap_err(),
+            "RECAPTCHA_SECRET_KEY is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_verify_handler_reports_unavailable_without_secret() {
+        std::env::remove_var("RECAPTCHA_SECRET_KEY");
+        let state = Arc::new(dummy_state());
+        let ip = "203.0.113.16";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", ip.parse().unwrap());
+        let req = CaptchaVerifyRequest {
+            challenge_id: "unneeded".to_string(),
+            captcha_token: "unneeded".to_string(),
+            user_token: "unneeded".to_string(),
+        };
+
+        let result = post_verify_handler(
+            State(state),
+            headers,
+            ConnectInfo("203.0.113.16:3000".parse().unwrap()),
+            Json(req),
+        )
+        .await;
+        match result {
+            Err(AppError::Api(error)) => {
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected unavailable response, got {other:?}"),
+        }
+        assert_eq!(consecutive_failures_for_ip(ip), 0);
     }
 
     #[tokio::test]
@@ -750,13 +777,13 @@ mod tests {
             record_captcha_failure(ip);
         }
         let blocked_until_first = {
-            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.get(ip).and_then(|r| r.blocked_until).unwrap()
         };
 
         record_captcha_failure(ip);
         let blocked_until_second = {
-            let store = CAPTCHA_FAILURE_STORE.lock().unwrap();
+            let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
             store.get(ip).and_then(|r| r.blocked_until).unwrap()
         };
 
@@ -767,7 +794,7 @@ mod tests {
     #[test]
     fn repeated_failures_flag_ip_in_reputation_store() {
         let ip = "203.0.113.14";
-        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
 
         for _ in 0..REPUTATION_FLAG_THRESHOLD {
             record_captcha_failure(ip);
@@ -775,7 +802,7 @@ mod tests {
 
         let score = crate::ip_reputation::IP_REPUTATION_STORE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .get(ip)
             .cloned()
             .expect("ip should have been flagged in the reputation store");
@@ -783,7 +810,7 @@ mod tests {
         assert_eq!(score.source, "local-penalty");
 
         record_captcha_success(ip);
-        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        crate::ip_reputation::IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
     }
 
     #[tokio::test]
@@ -805,7 +832,8 @@ mod tests {
             user_token: "irrelevant".to_string(),
         };
 
-        let result = post_verify_handler(State(state), headers, Json(req)).await;
+        let peer = ConnectInfo("203.0.113.15:3000".parse().unwrap());
+        let result = post_verify_handler(State(state), headers, peer, Json(req)).await;
         match result {
             Err(AppError::TooManyRequests(_)) => {}
             other => panic!("expected TooManyRequests, got {other:?}"),

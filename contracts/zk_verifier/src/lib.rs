@@ -22,6 +22,25 @@ pub const MAX_EXTERNAL_FORMAT_SIZE: u32 = 8192;
 /// with. This is a structural tag only — see [`ZkVerifierContract::is_valid_lattice_proof`]
 /// for what it does and does not prove.
 pub const LATTICE_PROOF_HEADER: &[u8] = b"LATTICE_V1";
+/// Minimum number of ledgers remaining on an instance-storage entry's TTL
+/// before [`ZkVerifierContract`] extends it. Mirrors the ttl-vault contract's
+/// `INSTANCE_TTL_THRESHOLD` so that instance entries are renewed well before
+/// expiry, avoiding a sudden loss of all on-chain state.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 1000;
+/// Number of ledgers that instance-storage entries are extended to when
+/// [`ZkVerifierContract`] renews them. Chosen to be long enough that normal
+/// contract activity keeps entries alive, but short enough that stale entries
+/// are eventually cleaned up by the ledger.
+pub const INSTANCE_TTL_LEDGERS: u32 = 200_000;
+/// Minimum number of ledgers remaining on a persistent-storage entry's TTL
+/// before [`ZkVerifierContract`] extends it.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 1000;
+/// Number of ledgers that persistent-storage entries are extended to when
+/// [`ZkVerifierContract`] renews them. Persistent entries carry a TTL so
+/// that storage-cleanup mechanisms can reclaim space for entries that are
+/// no longer referenced, even though the entries themselves are not
+/// automatically evicted.
+pub const PERSISTENT_TTL_LEDGERS: u32 = 200_000;
 /// Number of concurring oracle votes required to resolve a dispute (either
 /// upholding or rejecting it) when no explicit threshold has been configured
 /// by the admin via [`ZkVerifierContract::set_dispute_threshold`].
@@ -48,6 +67,14 @@ pub const MAX_CREDENTIAL_BATCH_SIZE: u32 = 100;
 /// out by the same window. See docs/zk-verifier.md, "Scheduled Consistency
 /// Re-Checks".
 pub const CONSISTENCY_CHECK_INTERVAL: u64 = 30 * 24 * 60 * 60;
+
+/// Bit index of [`AttestationRecord::oracle`] in the field bitmask recorded by
+/// `redact_attestation_record`. `credential_id` (index 0) is never masked.
+pub const ATTESTATION_RECORD_FIELD_ORACLE: u32 = 1;
+
+/// Strkey of the all-zero Ed25519 account, used as the placeholder `oracle`
+/// in a redacted [`AttestationRecord`]. See `masked_oracle`.
+pub const MASKED_ORACLE_STRKEY: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
@@ -112,6 +139,8 @@ pub enum VerifierError {
     /// The batch passed to `verify_credentials_consistent` exceeds
     /// `MAX_CREDENTIAL_BATCH_SIZE`.
     BatchTooLarge = 22,
+    /// The contract is paused.
+    Paused = 23,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -206,6 +235,9 @@ mod keys {
         /// proof_sha256 -> ledger timestamp of the most recent
         /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
         LastVerificationTime(BytesN<32>),
+        /// Global pause flag. When `true`, all state-changing entry
+        /// points revert with `VerifierError::Paused`.
+        Paused,
     }
 
     /// A single entry in a proof's verification audit trail. See
@@ -347,6 +379,9 @@ impl ZkVerifierContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
     /// Register a trusted oracle. Admin only.
@@ -355,12 +390,18 @@ impl ZkVerifierContract {
         env.storage()
             .instance()
             .set(&DataKey::Oracle(oracle), &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
     /// Revoke a trusted oracle. Admin only.
     pub fn revoke_oracle(env: Env, oracle: Address) {
         Self::require_admin(&env);
         env.storage().instance().remove(&DataKey::Oracle(oracle));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
     /// Returns whether the given address is a registered oracle.
@@ -392,20 +433,30 @@ impl ZkVerifierContract {
 
         let credential_id = Self::mint_or_reuse_credential_id(&env, &proof_hash, &claim_hash);
 
-        env.storage().instance().set(
-            &DataKey::Attestation(proof_hash, claim_hash),
-            &AttestationRecord {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Attestation(proof_hash.clone(), claim_hash.clone()), &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
                 next_check_due: env
                     .ledger()
                     .timestamp()
                     .saturating_add(CONSISTENCY_CHECK_INTERVAL),
-            },
-        );
+            });
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::Attestation(proof_hash.clone(), claim_hash.clone()),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
 
         let invalidated = Self::is_credential_invalidated(env.clone(), credential_id);
         Self::record_credential_snapshot(&env, credential_id, oracle, invalidated);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         credential_id
     }
@@ -450,7 +501,7 @@ impl ZkVerifierContract {
         }
         if !env
             .storage()
-            .instance()
+            .persistent()
             .has(&DataKey::CredentialHashes(parent_id))
         {
             panic_with_error!(&env, VerifierError::CredentialNotFound);
@@ -474,25 +525,42 @@ impl ZkVerifierContract {
             }
             _ => {
                 env.storage()
-                    .instance()
+                    .persistent()
                     .set(&DataKey::CredentialParent(credential_id), &parent_id);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(
+                        &DataKey::CredentialParent(credential_id),
+                        PERSISTENT_TTL_THRESHOLD,
+                        PERSISTENT_TTL_LEDGERS,
+                    );
             }
         }
 
-        env.storage().instance().set(
-            &DataKey::Attestation(proof_hash, claim_hash),
-            &AttestationRecord {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Attestation(proof_hash.clone(), claim_hash.clone()), &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
                 next_check_due: env
                     .ledger()
                     .timestamp()
                     .saturating_add(CONSISTENCY_CHECK_INTERVAL),
-            },
-        );
+            });
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::Attestation(proof_hash, claim_hash),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
 
         let invalidated = Self::is_credential_invalidated(env.clone(), credential_id);
         Self::record_credential_snapshot(&env, credential_id, oracle, invalidated);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         credential_id
     }
@@ -568,7 +636,7 @@ impl ZkVerifierContract {
 
         let result = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
                 proof_hash.clone(),
                 claim_hash.clone(),
@@ -585,6 +653,9 @@ impl ZkVerifierContract {
             &DataKey::LastVerificationTime(proof_hash.clone()),
             &current_time,
         );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         env.events()
             .publish((VERIFY_LATTICE_TOPIC,), (result, proof_hash.clone()));
@@ -695,6 +766,9 @@ impl ZkVerifierContract {
                 version: 1,
             },
         );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         env.events().publish((PROOF_MASKED_TOPIC,), (proof_hash,));
 
@@ -719,7 +793,7 @@ impl ZkVerifierContract {
 
         let result = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, AttestationRecord>(&DataKey::Attestation(masked_hash, claim_hash))
             .is_some_and(|record| {
                 env.storage()
@@ -745,15 +819,21 @@ impl ZkVerifierContract {
     /// branch otherwise — the caller cannot pick a branch that skips the
     /// condition check.
     ///
-    /// Returns `false` (does not panic) when the condition or the selected
-    /// branch is unattested; panics with `MalformedConditionalProof` if
-    /// `proof` is not a valid `ConditionalProof` encoding.
+    /// Returns `Ok(false)` when the condition or the selected branch is
+    /// unattested. Returns `Err(VerifierError::MalformedConditionalProof)`
+    /// when `proof` is not a valid `ConditionalProof` XDR encoding — this
+    /// is a typed, recoverable error rather than a host panic, so callers
+    /// can distinguish malformed input from an unattested proof.
     ///
     /// Emits a `vfy_cond` event with `(result, condition_result, claim_hash)`
     /// of the branch that was checked.
-    pub fn verify_conditional_proof(env: Env, proof: Bytes, condition: Bytes) -> bool {
+    pub fn verify_conditional_proof(
+        env: Env,
+        proof: Bytes,
+        condition: Bytes,
+    ) -> Result<bool, VerifierError> {
         let bundle = ConditionalProof::from_xdr(&env, &proof)
-            .unwrap_or_else(|_| panic_with_error!(&env, VerifierError::MalformedConditionalProof));
+            .map_err(|_| VerifierError::MalformedConditionalProof)?;
 
         let condition_result = Self::verify_internal(&env, &bundle.condition_proof, &condition);
 
@@ -771,7 +851,7 @@ impl ZkVerifierContract {
             (result, condition_result, claim_hash),
         );
 
-        result
+        Ok(result)
     }
 
     /// Sets the [`PrivacyLevel`] governing who may call
@@ -780,21 +860,31 @@ impl ZkVerifierContract {
         Self::require_admin(&env);
         if !env
             .storage()
-            .instance()
+            .persistent()
             .has(&DataKey::CredentialHashes(credential_id))
         {
             panic_with_error!(&env, VerifierError::CredentialNotFound);
         }
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::CredentialPrivacy(credential_id), &level);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialPrivacy(credential_id),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
     /// Returns `credential_id`'s current [`PrivacyLevel`], defaulting to
     /// `Public` if it has never been explicitly set.
     pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::CredentialPrivacy(credential_id))
             .unwrap_or(PrivacyLevel::Public)
     }
@@ -905,6 +995,9 @@ impl ZkVerifierContract {
         env.storage()
             .instance()
             .set(&DataKey::VerificationHistory(proof_hash.clone()), &history);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         env.events().publish(
             (AUDIT_LOG_TOPIC,),
@@ -942,10 +1035,10 @@ impl ZkVerifierContract {
     fn load_attestation_record(env: &Env, credential_id: u64) -> Option<AttestationRecord> {
         let (proof_hash, claim_hash): (BytesN<32>, BytesN<32>) = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::CredentialHashes(credential_id))?;
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Attestation(proof_hash, claim_hash))
     }
 
@@ -961,19 +1054,29 @@ impl ZkVerifierContract {
     /// masked, so the redacted record still identifies itself.
     fn redact_attestation_record(env: &Env, record: &AttestationRecord) -> AttestationRecord {
         let field_mask = 1u32 << ATTESTATION_RECORD_FIELD_ORACLE;
-        env.storage().instance().set(
-            &DataKey::AttestationMasking(record.credential_id),
-            &MaskingConfig {
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttestationMasking(record.credential_id), &MaskingConfig {
                 masked_fields: env
                     .crypto()
                     .sha256(&Bytes::from_array(env, &field_mask.to_le_bytes()))
                     .into(),
                 version: 1,
-            },
-        );
+            });
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::AttestationMasking(record.credential_id),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         AttestationRecord {
             credential_id: record.credential_id,
             oracle: Self::masked_oracle(env),
+            next_check_due: record.next_check_due,
         }
     }
 
@@ -1007,17 +1110,34 @@ impl ZkVerifierContract {
 
         let credential_id = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, u64>(&DataKey::CredentialCount)
             .unwrap_or(0)
             + 1;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::CredentialCount, &credential_id);
-        env.storage().instance().set(
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialCount,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage().persistent().set(
             &DataKey::CredentialHashes(credential_id),
             &(proof_hash.clone(), claim_hash.clone()),
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialHashes(credential_id),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
         credential_id
     }
@@ -1030,7 +1150,7 @@ impl ZkVerifierContract {
     /// resolution work only has to set the flag.
     pub fn is_credential_invalidated(env: Env, credential_id: u64) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, bool>(&DataKey::CredentialInvalidated(credential_id))
             .unwrap_or(false)
     }
@@ -1047,18 +1167,18 @@ impl ZkVerifierContract {
         let timestamp = env.ledger().timestamp();
         let mut timestamps = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, Vec<u64>>(&DataKey::CredentialSnapshotTimestamps(credential_id))
             .unwrap_or_else(|| Vec::new(env));
         let mut versions = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, Vec<u32>>(&DataKey::CredentialSnapshotVersions(credential_id))
             .unwrap_or_else(|| Vec::new(env));
 
         let version = versions.last().unwrap_or(0) + 1;
 
-        env.storage().instance().set(
+        env.storage().persistent().set(
             &DataKey::CredentialSnapshot(credential_id, timestamp),
             &CredentialSnapshot {
                 credential_id,
@@ -1066,8 +1186,14 @@ impl ZkVerifierContract {
                 invalidated,
                 timestamp,
                 version,
-            },
-        );
+            });
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialSnapshot(credential_id, timestamp),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
 
         timestamps.push_back(timestamp);
         versions.push_back(version);
@@ -1076,27 +1202,44 @@ impl ZkVerifierContract {
             let pruned_timestamp = timestamps.pop_front_unchecked();
             versions.pop_front_unchecked();
             env.storage()
-                .instance()
+                .persistent()
                 .remove(&DataKey::CredentialSnapshot(
                     credential_id,
                     pruned_timestamp,
                 ));
         }
 
-        env.storage().instance().set(
+        env.storage().persistent().set(
             &DataKey::CredentialSnapshotTimestamps(credential_id),
             &timestamps,
         );
-        env.storage().instance().set(
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialSnapshotTimestamps(credential_id),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage().persistent().set(
             &DataKey::CredentialSnapshotVersions(credential_id),
             &versions,
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CredentialSnapshotVersions(credential_id),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
     /// Returns `credential_id`'s immediate parent, or `None` if it is a root.
     fn load_parent(env: &Env, credential_id: u64) -> Option<u64> {
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, u64>(&DataKey::CredentialParent(credential_id))
     }
 
@@ -1162,7 +1305,7 @@ impl ZkVerifierContract {
         let claim_hash: BytesN<32> = env.crypto().sha256(claim).into();
 
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, AttestationRecord>(&DataKey::Attestation(proof_hash, claim_hash))
             .is_some_and(|record| {
                 env.storage()
@@ -1252,12 +1395,12 @@ impl ZkVerifierContract {
     pub fn is_consistency_check_due(env: Env, credential_id: u64) -> bool {
         let Some((proof_hash, claim_hash)) = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
         else {
             return false;
         };
-        let Some(record) = env.storage().instance().get::<DataKey, AttestationRecord>(
+        let Some(record) = env.storage().persistent().get::<DataKey, AttestationRecord>(
             &DataKey::Attestation(proof_hash, claim_hash),
         ) else {
             return false;
@@ -1278,13 +1421,21 @@ impl ZkVerifierContract {
     ///
     /// Off-chain workers call this after performing the re-verification the
     /// `cons_due` event signalled, which is what makes the check *periodic*
-    /// rather than due-once-and-forever. It has no privileged inputs — it
-    /// only moves a timer forward — so anyone may call it. Panics with
-    /// `CredentialNotFound` if `credential_id` was never attested.
-    pub fn reschedule_consistency_check(env: Env, credential_id: u64) {
+    /// rather than due-once-and-forever.
+    ///
+    /// **Authorization**: `caller` must be either the contract admin or the
+    /// oracle that originally attested the credential (i.e. the oracle
+    /// recorded in the credential's [`AttestationRecord`]). Any other
+    /// address is rejected with [`VerifierError::AccessDenied`]. This
+    /// prevents third parties from arbitrarily moving a credential's check
+    /// window.
+    ///
+    /// Panics with `CredentialNotFound` if `credential_id` was never
+    /// attested.
+    pub fn reschedule_consistency_check(env: Env, caller: Address, credential_id: u64) {
         let Some((proof_hash, claim_hash)) = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
         else {
             panic_with_error!(&env, VerifierError::CredentialNotFound);
@@ -1292,19 +1443,41 @@ impl ZkVerifierContract {
 
         let mut record = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
                 proof_hash.clone(),
                 claim_hash.clone(),
             ))
             .unwrap_or_else(|| panic_with_error!(&env, VerifierError::CredentialNotFound));
+
+        // Only the admin or the oracle that attested this credential may
+        // reschedule its consistency check.
+        let is_attesting_oracle = caller == record.oracle;
+        if !Self::is_admin(&env, &caller) && !is_attesting_oracle {
+            panic_with_error!(&env, VerifierError::AccessDenied);
+        }
+        caller.require_auth();
+
         record.next_check_due = env
             .ledger()
             .timestamp()
             .saturating_add(CONSISTENCY_CHECK_INTERVAL);
         env.storage()
+            .persistent()
+            .set(
+                &DataKey::Attestation(proof_hash.clone(), claim_hash.clone()),
+                &record,
+            );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::Attestation(proof_hash, claim_hash),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        env.storage()
             .instance()
-            .set(&DataKey::Attestation(proof_hash, claim_hash), &record);
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 }
 

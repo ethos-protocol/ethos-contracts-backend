@@ -1,7 +1,7 @@
-/// Issue #562 — Check-in batch accumulation tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and do **not** run the full
-/// contract binary.  Do not add integration/end-to-end assertions here.
+//! Issue #562 — Check-in batch accumulation tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and do **not** run the full
+//! contract binary.  Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;

@@ -258,10 +258,13 @@ impl Inner {
             return;
         }
         let threshold = Duration::from_secs(self.config.idle_timeout_secs);
+        let min = self.config.min;
+        // Read the length before `retain` borrows `idle` mutably.
+        let total = self.idle.len() as u32;
         let mut culled = 0_u32;
         self.idle.retain(|c| {
             let idle_for = c.meta.last_used_at.elapsed();
-            let keep = idle_for < threshold || (self.idle.len() as u32 - culled) <= self.config.min;
+            let keep = idle_for < threshold || (total - culled) <= min;
             if !keep {
                 culled += 1;
             }
@@ -338,7 +341,7 @@ impl OptimizedConnectionPool {
     /// Pre-fill the pool up to `min` connections.
     pub fn prefill(&self) -> Result<(), PoolError> {
         let (lock, _) = &*self.inner;
-        let mut inner = lock.lock().unwrap();
+        let mut inner = lock.lock().unwrap_or_else(|p| p.into_inner());
         while (inner.idle.len() as u32) < inner.config.min {
             let pc = inner.open_conn()?;
             inner.idle.push(pc);
@@ -355,14 +358,14 @@ impl OptimizedConnectionPool {
     pub fn acquire(&self) -> Result<PoolGuard<'_>, PoolError> {
         let (lock, cvar) = &*self.inner;
         let timeout = {
-            let inner = lock.lock().unwrap();
+            let inner = lock.lock().unwrap_or_else(|p| p.into_inner());
             Duration::from_millis(inner.config.queue_timeout_ms)
         };
 
         let deadline = Instant::now() + timeout;
 
         loop {
-            let mut inner = lock.lock().unwrap();
+            let mut inner = lock.lock().unwrap_or_else(|p| p.into_inner());
             inner.evict_stale();
 
             // Try to pop an idle connection.
@@ -376,6 +379,7 @@ impl OptimizedConnectionPool {
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
+                    _marker: std::marker::PhantomData,
                 });
             }
 
@@ -390,6 +394,7 @@ impl OptimizedConnectionPool {
                 return Ok(PoolGuard {
                     conn: Some(pc),
                     pool: Arc::clone(&self.inner),
+                    _marker: std::marker::PhantomData,
                 });
             }
 
@@ -416,7 +421,7 @@ impl OptimizedConnectionPool {
     /// Should be called periodically (e.g., by a background task).
     pub fn maintain(&self) {
         let (lock, _) = &*self.inner;
-        let mut inner = lock.lock().unwrap();
+        let mut inner = lock.lock().unwrap_or_else(|p| p.into_inner());
         inner.evict_stale();
         inner.cull_idle();
     }
@@ -424,7 +429,7 @@ impl OptimizedConnectionPool {
     /// Snapshot current pool metrics.
     pub fn metrics(&self) -> PoolMetrics {
         let (lock, _) = &*self.inner;
-        lock.lock().unwrap().metrics()
+        lock.lock().unwrap_or_else(|p| p.into_inner()).metrics()
     }
 
     /// List connections currently checked out longer than
@@ -432,7 +437,7 @@ impl OptimizedConnectionPool {
     /// returned). Should be called periodically alongside [`Self::maintain`].
     pub fn detect_leaks(&self) -> Vec<LeakFinding> {
         let (lock, _) = &*self.inner;
-        lock.lock().unwrap().detect_leaks()
+        lock.lock().unwrap_or_else(|p| p.into_inner()).detect_leaks()
     }
 
     /// Run leak detection and, for anything found, log an error and raise an
@@ -466,13 +471,13 @@ impl OptimizedConnectionPool {
     /// Current number of idle connections.
     pub fn idle_count(&self) -> usize {
         let (lock, _) = &*self.inner;
-        lock.lock().unwrap().idle.len()
+        lock.lock().unwrap_or_else(|p| p.into_inner()).idle.len()
     }
 
     /// Current number of live connections.
     pub fn live_count(&self) -> u32 {
         let (lock, _) = &*self.inner;
-        lock.lock().unwrap().live_count
+        lock.lock().unwrap_or_else(|p| p.into_inner()).live_count
     }
 }
 
@@ -500,7 +505,7 @@ impl Drop for PoolGuard<'_> {
             pc.meta.last_used_at = Instant::now();
 
             let (lock, cvar) = &*self.pool;
-            let mut inner = lock.lock().unwrap();
+            let mut inner = lock.lock().unwrap_or_else(|p| p.into_inner());
             inner.in_use_count = inner.in_use_count.saturating_sub(1);
             inner.checked_out.remove(&pc.meta.id);
             inner.idle.push(pc);
@@ -818,7 +823,7 @@ mod tests {
         oncall_state
             .store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(schedule.id.clone(), schedule);
 
         // Should not panic and should log/alert for the one leaked connection.

@@ -201,7 +201,7 @@ impl PartitionedCache {
 
     /// Insert a value with a custom TTL.
     pub fn set_with_ttl(&self, tenant_id: &str, key: &str, value: String, ttl: Duration) {
-        let mut partitions = self.partitions.lock().unwrap();
+        let mut partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         partitions
             .entry(tenant_id.to_string())
             .or_insert_with(TenantPartition::new)
@@ -212,7 +212,7 @@ impl PartitionedCache {
     ///
     /// Returns `None` on cache miss or if the entry has expired.
     pub fn get(&self, tenant_id: &str, key: &str) -> Option<String> {
-        let mut partitions = self.partitions.lock().unwrap();
+        let mut partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         partitions
             .get_mut(tenant_id)
             .and_then(|p| p.get(key))
@@ -220,7 +220,7 @@ impl PartitionedCache {
 
     /// Remove a single key from the given tenant's partition.
     pub fn remove(&self, tenant_id: &str, key: &str) {
-        let mut partitions = self.partitions.lock().unwrap();
+        let mut partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = partitions.get_mut(tenant_id) {
             p.remove(key);
         }
@@ -228,7 +228,7 @@ impl PartitionedCache {
 
     /// Remove all entries for the given tenant.
     pub fn clear_tenant(&self, tenant_id: &str) {
-        let mut partitions = self.partitions.lock().unwrap();
+        let mut partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = partitions.get_mut(tenant_id) {
             p.clear();
         }
@@ -236,7 +236,7 @@ impl PartitionedCache {
 
     /// Remove all entries across all tenants.
     pub fn clear_all(&self) {
-        let mut partitions = self.partitions.lock().unwrap();
+        let mut partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         for p in partitions.values_mut() {
             p.clear();
         }
@@ -288,13 +288,13 @@ impl PartitionedCache {
     ///
     /// Returns `None` if the tenant has never accessed the cache.
     pub fn partition_stats(&self, tenant_id: &str) -> Option<PartitionStats> {
-        let partitions = self.partitions.lock().unwrap();
+        let partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         partitions.get(tenant_id).map(|p| p.stats())
     }
 
     /// Return statistics for all known tenant partitions.
     pub fn all_partition_stats(&self) -> HashMap<String, PartitionStats> {
-        let partitions = self.partitions.lock().unwrap();
+        let partitions = self.partitions.lock().unwrap_or_else(|p| p.into_inner());
         partitions
             .iter()
             .map(|(id, p)| (id.clone(), p.stats()))
@@ -303,7 +303,7 @@ impl PartitionedCache {
 
     /// Return the number of known tenant partitions (including empty ones).
     pub fn tenant_count(&self) -> usize {
-        self.partitions.lock().unwrap().len()
+        self.partitions.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

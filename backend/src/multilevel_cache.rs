@@ -8,13 +8,20 @@
 /// on miss (read-through with promotion), and via a scheduled consistency
 /// verification job with automatic drift healing (#360).
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Vault, VaultSummary};
+
+fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    cache.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("recovering poisoned multilevel cache lock");
+        poisoned.into_inner()
+    })
+}
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -432,20 +439,20 @@ impl MultiLevelCache {
     pub fn get_vault(&self, vault_id: &str) -> Option<Vault> {
         // Try L1.
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             if let Some(v) = l1.get_vault(vault_id) {
                 return Some(v);
             }
         }
 
         // Try L2 with promotion to L1.
-        let mut l2 = self.l2.lock().unwrap();
+        let mut l2 = lock_cache(&self.l2);
         if let Some(v) = l2.get_vault(vault_id) {
             l2.stats.promotions += 1;
             drop(l2);
 
             // Promote to L1.
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_vault(vault_id, v.clone(), self.l1_ttl);
             return Some(v);
         }
@@ -456,11 +463,11 @@ impl MultiLevelCache {
     /// Write vault to both L1 and L2 (write-through).
     pub fn set_vault(&self, vault_id: &str, vault: Vault) {
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_vault(vault_id, vault.clone(), self.l1_ttl);
         }
         {
-            let mut l2 = self.l2.lock().unwrap();
+            let mut l2 = lock_cache(&self.l2);
             l2.set_vault(vault_id, vault, self.l2_ttl);
         }
     }
@@ -470,16 +477,16 @@ impl MultiLevelCache {
     #[allow(clippy::option_option)]
     pub fn get_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             if let Some(v) = l1.get_ttl_remaining(vault_id) {
                 return Some(v);
             }
         }
 
-        let mut l2 = self.l2.lock().unwrap();
+        let mut l2 = lock_cache(&self.l2);
         if let Some(v) = l2.get_ttl_remaining(vault_id) {
             drop(l2);
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_ttl_remaining(vault_id, v, self.l1_ttl);
             return Some(v);
         }
@@ -489,11 +496,11 @@ impl MultiLevelCache {
 
     pub fn set_ttl_remaining(&self, vault_id: &str, value: Option<u64>) {
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_ttl_remaining(vault_id, value, self.l1_ttl);
         }
         {
-            let mut l2 = self.l2.lock().unwrap();
+            let mut l2 = lock_cache(&self.l2);
             l2.set_ttl_remaining(vault_id, value, self.l2_ttl);
         }
     }
@@ -502,16 +509,16 @@ impl MultiLevelCache {
 
     pub fn get_summary(&self, vault_id: &str) -> Option<VaultSummary> {
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             if let Some(v) = l1.get_summary(vault_id) {
                 return Some(v);
             }
         }
 
-        let mut l2 = self.l2.lock().unwrap();
+        let mut l2 = lock_cache(&self.l2);
         if let Some(v) = l2.get_summary(vault_id) {
             drop(l2);
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_summary(vault_id, v.clone(), self.l1_ttl);
             return Some(v);
         }
@@ -521,11 +528,11 @@ impl MultiLevelCache {
 
     pub fn set_summary(&self, vault_id: &str, summary: VaultSummary) {
         {
-            let mut l1 = self.l1.lock().unwrap();
+            let mut l1 = lock_cache(&self.l1);
             l1.set_summary(vault_id, summary.clone(), self.l1_ttl);
         }
         {
-            let mut l2 = self.l2.lock().unwrap();
+            let mut l2 = lock_cache(&self.l2);
             l2.set_summary(vault_id, summary, self.l2_ttl);
         }
     }
@@ -534,14 +541,14 @@ impl MultiLevelCache {
 
     /// Invalidate all cached data for a vault in both levels.
     pub fn invalidate(&self, vault_id: &str) {
-        self.l1.lock().unwrap().invalidate(vault_id);
-        self.l2.lock().unwrap().invalidate(vault_id);
+        lock_cache(&self.l1).invalidate(vault_id);
+        lock_cache(&self.l2).invalidate(vault_id);
     }
 
     /// Flush both cache levels entirely.
     pub fn invalidate_all(&self) {
-        self.l1.lock().unwrap().invalidate_all();
-        self.l2.lock().unwrap().invalidate_all();
+        lock_cache(&self.l1).invalidate_all();
+        lock_cache(&self.l2).invalidate_all();
     }
 
     // ── #360 Consistency Verification & Drift Healing ────────────────────────
@@ -556,13 +563,13 @@ impl MultiLevelCache {
         let mut keys: HashSet<String> = HashSet::new();
 
         {
-            let l1 = self.l1.lock().unwrap();
+            let l1 = lock_cache(&self.l1);
             for k in l1.all_vault_keys() {
                 keys.insert(k);
             }
         }
         {
-            let l2 = self.l2.lock().unwrap();
+            let l2 = lock_cache(&self.l2);
             for k in l2.all_vault_keys() {
                 keys.insert(k);
             }
@@ -572,8 +579,8 @@ impl MultiLevelCache {
         let mut details: Vec<CacheDriftDetail> = Vec::new();
 
         for key in &keys {
-            let l1_val = self.l1.lock().unwrap().peek_vault(key);
-            let l2_val = self.l2.lock().unwrap().peek_vault(key);
+            let l1_val = lock_cache(&self.l1).peek_vault(key);
+            let l2_val = lock_cache(&self.l2).peek_vault(key);
 
             let drift_opt = match (&l1_val, &l2_val) {
                 (Some(_), None) => Some((
@@ -619,7 +626,7 @@ impl MultiLevelCache {
 
         // Update drift metrics
         {
-            let mut m = self.drift_metrics.lock().unwrap();
+            let mut m = lock_cache(&self.drift_metrics);
             m.total_verifications += 1;
             m.total_drifts_detected += drift_count as u64;
             m.total_drifts_healed += healed_count as u64;
@@ -641,13 +648,13 @@ impl MultiLevelCache {
         let mut keys: HashSet<String> = HashSet::new();
 
         {
-            let l1 = self.l1.lock().unwrap();
+            let l1 = lock_cache(&self.l1);
             for k in l1.all_vault_keys() {
                 keys.insert(k);
             }
         }
         {
-            let l2 = self.l2.lock().unwrap();
+            let l2 = lock_cache(&self.l2);
             for k in l2.all_vault_keys() {
                 keys.insert(k);
             }
@@ -657,8 +664,8 @@ impl MultiLevelCache {
         let mut details: Vec<CacheDriftDetail> = Vec::new();
 
         for key in &keys {
-            let l1_val = self.l1.lock().unwrap().peek_vault(key);
-            let l2_val = self.l2.lock().unwrap().peek_vault(key);
+            let l1_val = lock_cache(&self.l1).peek_vault(key);
+            let l2_val = lock_cache(&self.l2).peek_vault(key);
 
             let drift_opt = match (&l1_val, &l2_val) {
                 (Some(_), None) => Some((
@@ -689,7 +696,7 @@ impl MultiLevelCache {
         let drift_count = details.len();
 
         {
-            let mut m = self.drift_metrics.lock().unwrap();
+            let mut m = lock_cache(&self.drift_metrics);
             m.total_verifications += 1;
             m.total_drifts_detected += drift_count as u64;
             m.last_verification_at = Some(now);
@@ -706,12 +713,12 @@ impl MultiLevelCache {
 
     /// Snapshot current drift metrics.
     pub fn drift_metrics(&self) -> DriftMetrics {
-        self.drift_metrics.lock().unwrap().clone()
+        lock_cache(&self.drift_metrics).clone()
     }
 
     /// Reset drift metrics (useful in tests).
     pub fn reset_drift_metrics(&self) {
-        let mut m = self.drift_metrics.lock().unwrap();
+        let mut m = lock_cache(&self.drift_metrics);
         *m = DriftMetrics::default();
     }
 
@@ -719,10 +726,10 @@ impl MultiLevelCache {
 
     /// Get per-level cache statistics and drift metrics.
     pub fn get_stats(&self) -> CacheStats {
-        let l1_stats = self.l1.lock().unwrap().stats.clone();
-        let l2_stats = self.l2.lock().unwrap().stats.clone();
-        let l1_entries = self.l1.lock().unwrap().live_entry_count();
-        let l2_entries = self.l2.lock().unwrap().live_entry_count();
+        let l1_stats = lock_cache(&self.l1).stats.clone();
+        let l2_stats = lock_cache(&self.l2).stats.clone();
+        let l1_entries = lock_cache(&self.l1).live_entry_count();
+        let l2_entries = lock_cache(&self.l2).live_entry_count();
         let drift = self.drift_metrics();
 
         CacheStats {
@@ -780,6 +787,20 @@ mod tests {
             ttl_remaining: Some(86400),
             balance: 1000,
         }
+    }
+
+    #[test]
+    fn poisoned_cache_lock_is_recovered() {
+        let cache = MultiLevelCache::new();
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.l1.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison L1 cache lock");
+        }));
+        assert!(poison_result.is_err());
+
+        assert!(cache.get_vault("v1").is_none());
+        cache.set_vault("v1", make_vault("v1"));
+        assert_eq!(cache.get_vault("v1").unwrap().id, "v1");
     }
 
     #[test]
@@ -912,8 +933,8 @@ mod tests {
         vault_l2.balance = 2000;
 
         // Manually inject mismatched values into L1 and L2
-        cache.l1.lock().unwrap().set_vault("v1", vault_l1, Duration::from_secs(60));
-        cache.l2.lock().unwrap().set_vault("v1", vault_l2, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_l1, Duration::from_secs(60));
+        cache.l2.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_l2, Duration::from_secs(60));
 
         let report = cache.verify_consistency();
         assert_eq!(report.drift_count, 1);
@@ -931,9 +952,9 @@ mod tests {
         let vault2 = make_vault("v2");
 
         // v1 in L1 only
-        cache.l1.lock().unwrap().set_vault("v1", vault1, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault1, Duration::from_secs(60));
         // v2 in L2 only
-        cache.l2.lock().unwrap().set_vault("v2", vault2, Duration::from_secs(60));
+        cache.l2.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v2", vault2, Duration::from_secs(60));
 
         let report = cache.verify_consistency();
         assert_eq!(report.drift_count, 2);
@@ -950,7 +971,7 @@ mod tests {
         let cache = MultiLevelCache::new();
         let mut vault_stale = make_vault("v1");
         vault_stale.balance = 500;
-        cache.l1.lock().unwrap().set_vault("v1", vault_stale, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_stale, Duration::from_secs(60));
 
         // Source of truth has the authoritative state (balance 5000)
         let true_vault = {
@@ -972,8 +993,8 @@ mod tests {
         assert!(report.details[0].healed);
 
         // Verify both L1 and L2 now reflect authoritative source of truth
-        let l1_val = cache.l1.lock().unwrap().peek_vault("v1").unwrap();
-        let l2_val = cache.l2.lock().unwrap().peek_vault("v1").unwrap();
+        let l1_val = cache.l1.lock().unwrap_or_else(|p| p.into_inner()).peek_vault("v1").unwrap();
+        let l2_val = cache.l2.lock().unwrap_or_else(|p| p.into_inner()).peek_vault("v1").unwrap();
         assert_eq!(l1_val.balance, 5000);
         assert_eq!(l2_val.balance, 5000);
 
@@ -988,7 +1009,7 @@ mod tests {
     #[test]
     fn test_auto_heal_clears_deleted_vault_from_cache() {
         let cache = MultiLevelCache::new();
-        cache.l1.lock().unwrap().set_vault("v-deleted", make_vault("v-deleted"), Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v-deleted", make_vault("v-deleted"), Duration::from_secs(60));
 
         // Source of truth returns None (record was deleted in DB)
         let report = cache.verify_and_heal_consistency(|_| None);
@@ -1010,7 +1031,7 @@ mod tests {
         assert_eq!(metrics_initial.total_drifts_healed, 0);
 
         // Inject drift and run healing
-        cache.l1.lock().unwrap().set_vault("v1", make_vault("v1"), Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", make_vault("v1"), Duration::from_secs(60));
         let true_v = make_vault("v1");
         cache.verify_and_heal_consistency(|_| Some(true_v.clone()));
 

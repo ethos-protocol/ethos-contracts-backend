@@ -69,7 +69,7 @@ fn hash_backup_code(code: &str) -> String {
 /// the call that actually consumed the code; under concurrent attempts with
 /// the same code, exactly one caller sees `true`.
 fn verify_and_consume_backup_code(db: &Db, vault_id: &str, code: &str) -> Result<bool, AppError> {
-    let _guard = BACKUP_CODE_CONSUME_LOCK.lock().unwrap();
+    let _guard = BACKUP_CODE_CONSUME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let Some(mut config) = db.get_2fa_config(vault_id)? else {
         return Ok(false);
@@ -133,7 +133,7 @@ fn verify_totp_code(secret: &str, code: &str) -> bool {
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     let time_step = now / 30;
 
@@ -195,20 +195,36 @@ fn base32_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn verify_pending_otp(vault_id: &str, code: &str) -> bool {
-    let mut store = PENDING_OTPS.lock().unwrap();
+    let mut store = PENDING_OTPS.lock().unwrap_or_else(|p| p.into_inner());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
 
     if let Some(codes) = store.get_mut(vault_id) {
         codes.retain(|otp| otp.expires_at > now);
-        if let Some(pos) = codes.iter().position(|otp| otp.code == code) {
-            codes.remove(pos);
+        let mut matched_pos = codes.len();
+        for (pos, otp) in codes.iter().enumerate() {
+            let match_mask = 0usize
+                .wrapping_sub(constant_time_eq(otp.code.as_bytes(), code.as_bytes()) as usize);
+            matched_pos = (matched_pos & !match_mask) | (pos & match_mask);
+        }
+        if matched_pos < codes.len() {
+            codes.remove(matched_pos);
             return true;
         }
     }
     false
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut difference = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        let left = a.get(index).copied().unwrap_or_default();
+        let right = b.get(index).copied().unwrap_or_default();
+        difference |= (left ^ right) as usize;
+    }
+    difference == 0
 }
 
 // ── Route handlers ───────────────────────────────────────────────────────────
@@ -221,7 +237,7 @@ pub async fn get_2fa_status(
     let config = db.get_2fa_config(&vault_id)?;
     let session_verified = SESSION_VERIFIED
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&vault_id)
         .copied()
         .unwrap_or(false);
@@ -303,13 +319,13 @@ pub async fn enable_2fa(
             let code = generate_otp_code();
             let expires_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
                 + 300;
 
             PENDING_OTPS
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .entry(vault_id.clone())
                 .or_default()
                 .push(PendingOtp {
@@ -345,13 +361,13 @@ pub async fn enable_2fa(
             let code = generate_otp_code();
             let expires_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
                 + 300;
 
             PENDING_OTPS
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .entry(vault_id.clone())
                 .or_default()
                 .push(PendingOtp {
@@ -431,7 +447,7 @@ pub async fn verify_2fa(
     };
     db.upsert_2fa_config(&updated)?;
 
-    SESSION_VERIFIED.lock().unwrap().insert(vault_id, true);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).insert(vault_id, true);
 
     Ok(StatusCode::OK)
 }
@@ -442,8 +458,8 @@ pub async fn disable_2fa(
     Path(vault_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     db.delete_2fa_config(&vault_id)?;
-    SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
-    PENDING_OTPS.lock().unwrap().remove(&vault_id);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
+    PENDING_OTPS.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -455,7 +471,7 @@ pub async fn challenge_2fa(
     let config = db.get_2fa_config(&vault_id)?;
     let session_verified = SESSION_VERIFIED
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&vault_id)
         .copied()
         .unwrap_or(false);
@@ -485,7 +501,7 @@ pub async fn challenge_2fa(
 
 /// POST /api/vaults/{vault_id}/2fa/session/clear
 pub async fn clear_2fa_session(Path(vault_id): Path<String>) -> Result<StatusCode, AppError> {
-    SESSION_VERIFIED.lock().unwrap().remove(&vault_id);
+    SESSION_VERIFIED.lock().unwrap_or_else(|p| p.into_inner()).remove(&vault_id);
     Ok(StatusCode::OK)
 }
 
@@ -555,6 +571,47 @@ mod tests {
             db.get_2fa_config("vault-1").unwrap().unwrap().backup_codes.len(),
             1
         );
+    }
+
+    #[test]
+    fn pending_otp_comparison_checks_full_values_and_lengths() {
+        assert!(constant_time_eq(b"123456", b"123456"));
+        assert!(!constant_time_eq(b"023456", b"123456"));
+        assert!(!constant_time_eq(b"123450", b"123456"));
+        assert!(!constant_time_eq(b"12345", b"123456"));
+    }
+
+    #[test]
+    fn pending_otp_is_consumed_after_full_scan() {
+        let vault_id = "pending-otp-scan-test";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut store = PENDING_OTPS.lock().unwrap();
+            store.insert(
+                vault_id.to_string(),
+                vec![
+                    PendingOtp {
+                        code: "111111".to_string(),
+                        expires_at: now + 60,
+                    },
+                    PendingOtp {
+                        code: "222222".to_string(),
+                        expires_at: now + 60,
+                    },
+                    PendingOtp {
+                        code: "333333".to_string(),
+                        expires_at: now + 60,
+                    },
+                ],
+            );
+        }
+
+        assert!(verify_pending_otp(vault_id, "333333"));
+        assert!(!verify_pending_otp(vault_id, "333333"));
+        PENDING_OTPS.lock().unwrap().remove(vault_id);
     }
 
     /// Regression test: two threads racing to consume the same backup code

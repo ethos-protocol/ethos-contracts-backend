@@ -14,6 +14,10 @@ http://localhost:3000/api
 
 - `ALLOWED_ORIGINS` — Comma-separated CORS origins (e.g., `http://localhost:3001,https://example.com`)
 - `DB_PATH` — SQLite file path (default `/var/lib/ethos-protocol/ethos-protocol.db`). `:memory:` is refused unless `ALLOW_EPHEMERAL_DB=true`
+- `CAPTCHA_SUSPICIOUS_THRESHOLD` — Number of per-IP events that trigger a CAPTCHA (default: `10`)
+- `CAPTCHA_SUSPICIOUS_WINDOW_SECS` — Rolling event-count window in seconds (default: `300`)
+- `TRUSTED_PROXY_IPS` — Comma-separated exact IP addresses of trusted reverse proxies; only these peers may supply forwarded client IP headers
+- `RECAPTCHA_SECRET_KEY` — Required server-side CAPTCHA verification secret; missing or blank configuration disables verification with `503 Service Unavailable`
 - `DATABASE_POOL_MIN` — Minimum connections (default: 5)
 - `DATABASE_POOL_MAX` — Maximum connections (default: 20)
 - `DATABASE_POOL_TIMEOUT_SECS` — Connection timeout (default: 30)

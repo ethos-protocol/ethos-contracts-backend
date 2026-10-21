@@ -200,18 +200,25 @@ pub fn set_vault_governance_config(
 
     env.events().publish(
         (GOV_CONFIG_SET_TOPIC, vault_id),
-        (config.voting_period, config.min_quorum, config.approval_threshold_bps),
+        (
+            config.voting_period,
+            config.min_quorum,
+            config.approval_threshold_bps,
+        ),
     );
 }
 
 /// Get governance configuration for a vault with sensible defaults.
 pub fn get_vault_governance_config(env: &Env, vault_id: u64) -> VaultGovernanceConfig {
     let key = GovernanceKey::Config(vault_id);
-    env.storage().persistent().get(&key).unwrap_or(VaultGovernanceConfig {
-        voting_period: DEFAULT_GOVERNANCE_VOTING_PERIOD,
-        min_quorum: DEFAULT_GOVERNANCE_MIN_QUORUM,
-        approval_threshold_bps: DEFAULT_APPROVAL_THRESHOLD_BPS,
-    })
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(VaultGovernanceConfig {
+            voting_period: DEFAULT_GOVERNANCE_VOTING_PERIOD,
+            min_quorum: DEFAULT_GOVERNANCE_MIN_QUORUM,
+            approval_threshold_bps: DEFAULT_APPROVAL_THRESHOLD_BPS,
+        })
 }
 
 /// Register stakeholders (eligible voters) for a vault.
@@ -295,7 +302,9 @@ pub fn create_proposal(
     );
 
     // Update counter
-    env.storage().persistent().set(&counter_key, &new_proposal_id);
+    env.storage()
+        .persistent()
+        .set(&counter_key, &new_proposal_id);
     env.storage().persistent().extend_ttl(
         &counter_key,
         crate::VAULT_TTL_THRESHOLD,
@@ -304,7 +313,11 @@ pub fn create_proposal(
 
     // Track in vault proposal list
     let list_key = GovernanceKey::VaultProposals(vault_id);
-    let mut proposals: Vec<u64> = env.storage().persistent().get(&list_key).unwrap_or_else(|| Vec::new(env));
+    let mut proposals: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&list_key)
+        .unwrap_or_else(|| Vec::new(env));
     proposals.push_back(new_proposal_id);
     env.storage().persistent().set(&list_key, &proposals);
     env.storage().persistent().extend_ttl(

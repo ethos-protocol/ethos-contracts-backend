@@ -155,19 +155,19 @@ impl NetworkPartitionSimulator {
     }
 
     pub fn partition(&self, node: &str) {
-        self.partitioned.lock().unwrap().insert(node.to_string());
+        self.partitioned.lock().unwrap_or_else(|p| p.into_inner()).insert(node.to_string());
     }
 
     pub fn heal(&self, node: &str) {
-        self.partitioned.lock().unwrap().remove(node);
+        self.partitioned.lock().unwrap_or_else(|p| p.into_inner()).remove(node);
     }
 
     pub fn heal_all(&self) {
-        self.partitioned.lock().unwrap().clear();
+        self.partitioned.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     pub fn is_partitioned(&self, node: &str) -> bool {
-        self.partitioned.lock().unwrap().contains(node)
+        self.partitioned.lock().unwrap_or_else(|p| p.into_inner()).contains(node)
     }
 
     /// Simulate an RPC between two nodes; fails if either side is partitioned.
@@ -621,6 +621,7 @@ mod tests {
                 failure_threshold: 4,
                 success_threshold: 2,
                 open_duration: Duration::from_secs(30),
+                half_open_max_requests: 1,
             },
         ));
 

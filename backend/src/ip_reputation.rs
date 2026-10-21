@@ -69,9 +69,9 @@ fn score_to_risk(score: f64) -> RiskLevel {
 ///
 /// - If `ABUSEIPDB_API_KEY` is set in the environment, calls the AbuseIPDB v2
 ///   API and returns the real abuse confidence score.
-/// - Otherwise returns a stub score of `0.0` (`RiskLevel::Low`) so the
-///   system remains functional without third-party credentials.
-pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputationScore {
+/// - Otherwise returns an unverified, fail-closed score so missing provider
+///   configuration cannot be interpreted as a clean reputation result.
+pub async fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputationScore {
     if !config.check_enabled {
         return stub_score(ip, "disabled");
     }
@@ -81,8 +81,18 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
         _ => return stub_score(ip, "stub"),
     };
 
-    // Synchronous HTTP call via reqwest blocking client.
-    let client = reqwest::blocking::Client::new();
+    // Async client so the call does not block the runtime thread serving the
+    // request. The timeout keeps a slow upstream from stalling the handler.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(ip, error = %e, "failed to build AbuseIPDB HTTP client");
+            return stub_score(ip, "abuseipdb-request-error");
+        }
+    };
     let url = "https://api.abuseipdb.com/api/v2/check";
 
     match client
@@ -91,6 +101,7 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
         .header("Accept", "application/json")
         .query(&[("ipAddress", ip), ("maxAgeInDays", "90")])
         .send()
+        .await
     {
         Ok(resp) => {
             let status = resp.status();
@@ -98,7 +109,7 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
                 tracing::warn!(ip, %status, "AbuseIPDB returned non-2xx response");
                 return stub_score(ip, "abuseipdb-error");
             }
-            match resp.json::<serde_json::Value>() {
+            match resp.json::<serde_json::Value>().await {
                 Ok(body) => {
                     let data = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
                     let confidence = data
@@ -129,17 +140,19 @@ pub fn check_ip_reputation(ip: &str, config: &IpReputationConfig) -> IpReputatio
     }
 }
 
-/// Build a zero-risk stub score used when no API key is configured or the
-/// subsystem is disabled.
+/// Build an unverified fail-closed score when no authoritative result exists.
 fn stub_score(ip: &str, source: &str) -> IpReputationScore {
     IpReputationScore {
         ip: ip.to_string(),
-        score: 0.0,
-        risk_level: RiskLevel::Low,
-        is_blocked: false,
+        score: 100.0,
+        risk_level: RiskLevel::Critical,
+        is_blocked: true,
         last_checked: Utc::now(),
         source: source.to_string(),
-        details: serde_json::json!({ "note": "stub — no API key configured" }),
+        details: serde_json::json!({
+            "verified": false,
+            "note": "AbuseIPDB reputation is unavailable and must be treated as unverified."
+        }),
     }
 }
 
@@ -254,6 +267,7 @@ pub fn is_ip_blocked(ip: &str, rules: &[IpBlockRule]) -> bool {
 // ── Query parameter structs ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpQuery {
     pub ip: String,
 }
@@ -277,15 +291,15 @@ pub async fn get_ip_reputation_handler(
         return Err(AppError::InvalidInput("ip query parameter is required".into()));
     }
 
-    let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
-    let mut score = check_ip_reputation(&ip, &config);
+    let config = IP_REPUTATION_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mut score = check_ip_reputation(&ip, &config).await;
 
     // When there's no authoritative upstream check (subsystem disabled, or no
     // API key configured), prefer a decayed local score over resetting to a
     // flat 0.0 on every lookup — otherwise an IP locally penalized by #392
     // would never stay flagged between admin lookups. See #393.
     if score.source == "disabled" || score.source == "stub" {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = store.get_mut(&ip) {
             let now = Utc::now();
             let decayed = apply_score_decay(existing, &config, now);
@@ -293,18 +307,24 @@ pub async fn get_ip_reputation_handler(
             existing.risk_level = score_to_risk(decayed);
             existing.last_checked = now;
             score = existing.clone();
+            score.is_blocked = true;
+            score.details = serde_json::json!({
+                "verified": false,
+                "note": "AbuseIPDB reputation is unavailable; the local score is unverified.",
+                "local_details": score.details
+            });
         }
     }
 
     // Annotate with current block status.
     {
-        let rules = IP_BLOCK_RULES.lock().unwrap();
-        score.is_blocked = is_ip_blocked(&ip, &rules);
+        let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
+        score.is_blocked |= is_ip_blocked(&ip, &rules);
     }
 
     // Cache the refreshed score.
     {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         store.insert(ip.clone(), score.clone());
     }
 
@@ -350,13 +370,13 @@ pub async fn post_block_ip_handler(
     };
 
     {
-        let mut rules = IP_BLOCK_RULES.lock().unwrap();
+        let mut rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
         rules.push(rule.clone());
     }
 
     // Invalidate cached score for the exact IP so it reflects the new block.
     {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = store.get_mut(&rule.ip_pattern) {
             entry.is_blocked = true;
         }
@@ -374,7 +394,7 @@ pub async fn get_block_rules_handler(
 ) -> Result<Json<Vec<IpBlockRule>>, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let rules = IP_BLOCK_RULES.lock().unwrap().clone();
+    let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner()).clone();
     Ok(Json(rules))
 }
 
@@ -388,7 +408,7 @@ pub async fn delete_block_rule_handler(
 ) -> Result<StatusCode, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let mut rules = IP_BLOCK_RULES.lock().unwrap();
+    let mut rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
     let original_len = rules.len();
     rules.retain(|r| r.id != id);
 
@@ -408,7 +428,7 @@ pub async fn get_reputation_config_handler(
 ) -> Result<Json<IpReputationConfig>, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
+    let config = IP_REPUTATION_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).clone();
     Ok(Json(config))
 }
 
@@ -438,7 +458,7 @@ pub async fn post_check_handler(
 
     // Check against local block rules first (fast path).
     let is_blocked = {
-        let rules = IP_BLOCK_RULES.lock().unwrap();
+        let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
         is_ip_blocked(&ip, &rules)
     };
 
@@ -550,15 +570,18 @@ mod tests {
         assert_eq!(score_to_risk(100.0), RiskLevel::Critical);
     }
 
-    #[test]
-    fn stub_score_returned_when_disabled() {
+    #[tokio::test]
+    async fn stub_score_returned_when_disabled() {
         let config = IpReputationConfig {
             check_enabled: false,
             ..IpReputationConfig::default()
         };
-        let score = check_ip_reputation("1.2.3.4", &config);
+        let score = check_ip_reputation("1.2.3.4", &config).await;
         assert_eq!(score.source, "disabled");
-        assert_eq!(score.score, 0.0);
+        assert_eq!(score.score, 100.0);
+        assert_eq!(score.risk_level, RiskLevel::Critical);
+        assert!(score.is_blocked);
+        assert_eq!(score.details["verified"], false);
     }
 
     #[test]
@@ -654,7 +677,7 @@ mod tests {
     #[test]
     fn local_penalty_raises_and_caches_score() {
         let ip = "192.0.2.55";
-        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
 
         let first = apply_local_penalty(ip, 15.0, "test failure burst");
         assert!((first.score - 15.0).abs() < f64::EPSILON);
@@ -664,6 +687,6 @@ mod tests {
         assert!(second.score >= first.score);
         assert!(second.score <= 100.0);
 
-        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
     }
 }

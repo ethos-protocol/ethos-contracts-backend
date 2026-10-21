@@ -1,7 +1,7 @@
-/// Issue #557 — Vault history archival tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #557 — Vault history archival tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;
@@ -14,7 +14,13 @@ use soroban_sdk::{
     Env,
 };
 
-fn setup() -> (Env, Address, Address, Address, TtlVaultContractClient<'static>) {
+fn setup() -> (
+    Env,
+    Address,
+    Address,
+    Address,
+    TtlVaultContractClient<'static>,
+) {
     let env = Env::default();
     env.mock_all_auths();
 

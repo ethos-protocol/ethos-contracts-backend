@@ -173,6 +173,7 @@ pub struct BatchPreferenceItem {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchSetPreferencesRequest {
     pub items: Vec<BatchPreferenceItem>,
 }

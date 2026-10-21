@@ -59,8 +59,79 @@ tags:
     description: Disaster recovery actions, targets, schedules, and playbooks
   - name: Feature Flags
     description: Feature flag configuration and subject evaluation
+  - name: Fraud Detection
+    description: Transaction fraud scoring and audit logging
 
 paths:
+  /fraud/score:
+    post:
+      summary: Score a transaction for fraud risk
+      description: Return the transaction's fraud score and persist an audit entry.
+      operationId: scoreTransaction
+      tags:
+        - Fraud Detection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - transaction
+              properties:
+                transaction:
+                  type: object
+                  required:
+                    - id
+                    - amount
+                    - merchant_id
+                    - user_id
+                    - timestamp
+                    - location
+                  properties:
+                    id:
+                      type: string
+                    amount:
+                      type: number
+                    merchant_id:
+                      type: string
+                    user_id:
+                      type: string
+                    timestamp:
+                      type: integer
+                      format: int64
+                    location:
+                      type: string
+      responses:
+        '200':
+          description: Fraud score calculated and audited
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - transaction_id
+                  - score
+                  - is_fraud
+                  - confidence
+                properties:
+                  transaction_id:
+                    type: string
+                  score:
+                    type: number
+                    format: float
+                  is_fraud:
+                    type: boolean
+                  confidence:
+                    type: number
+                    format: float
+        '500':
+          description: Fraud score audit could not be persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /health:
     get:
       summary: Health check
@@ -227,6 +298,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete reminder preferences for a vault
+      operationId: deletePreferences
+      tags:
+        - Reminder Preferences
+      responses:
+        '204':
+          description: Preferences deleted successfully
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      summary: Delete reminder preferences for a vault
+      operationId: deletePreferences
+      tags:
+        - Reminder Preferences
+      responses:
+        '204':
+          description: Reminder preferences deleted
 
   /api/notifications/register:
     post:
@@ -260,8 +354,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Unregister a device token
+      description: Remove a registered device push token
+      operationId: unregisterDeviceToken
+      tags:
+        - Notifications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterTokenRequest'
+      responses:
+        '204':
+          description: Device token removed
 
   /api/notifications/preferences:
+    get:
+      summary: Get notification preferences
+      description: Retrieve an owner's current notification preferences
+      operationId: getNotificationPreferences
+      tags:
+        - Notifications
+      parameters:
+        - name: owner
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Notification preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPreferences'
     put:
       summary: Update notification preferences
       description: Update owner notification preferences (channels, frequency, locale)
@@ -293,6 +421,111 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /api/notifications/delivery:
+    get:
+      summary: Get notification delivery history
+      operationId: getNotificationDeliveryLog
+      tags:
+        - Notifications
+      parameters:
+        - name: owner
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delivery records for the owner
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeliveryRecord'
+
+  /api/tenants:
+    post:
+      summary: Create a tenant
+      operationId: createTenant
+      tags:
+        - Tenants
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+      responses:
+        '201':
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+
+  /api/tenants/billing:
+    get:
+      summary: Get tenant billing information
+      operationId: getTenantBilling
+      tags:
+        - Tenants
+      parameters:
+        - name: X-Tenant-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tenant billing information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantBillingResponse'
+
+  /api/tenants/{tenant_id}/vaults:
+    get:
+      summary: List a tenant's vaults
+      operationId: getTenantVaults
+      tags:
+        - Tenants
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vault IDs assigned to the tenant
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+
+  /api/tenants/{tenant_id}/vaults/{vault_id}:
+    post:
+      summary: Add a vault to a tenant
+      operationId: addVaultToTenant
+      tags:
+        - Tenants
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Vault assigned to the tenant
 
   /api/notifications/unsubscribe:
     get:
@@ -2023,8 +2256,585 @@ paths:
                 $ref: '#/components/schemas/FeatureFlagEvaluation'
         '404':
           description: Feature flag not found
+  /admin/capabilities:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/cost/entries:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/allocate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/budget-thresholds:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/budget-breaches:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/gas:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/gas/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/dashboard:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/cost/optimizations:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/dr/actions:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/actions/{token}/confirm:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/rto-rpo:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/test-schedule:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/dr/playbooks:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /admin/flags:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/flags/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /admin/flags/{key}/evaluate:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /alerts/rules:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/rules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/evaluate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /alerts/fired:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /aml/check/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /aml/flags:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /aml/flags/{address}:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /anomaly/observe:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/alerts:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/baseline/{metric}:
+    parameters:
+      - name: metric
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/seasonality:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/seasonality/threshold:
+    put:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/system:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/root-causes:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /anomaly/investigations/{anomaly_id}:
+    parameters:
+      - name: anomaly_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /capabilities/negotiate:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /capabilities/{name}/fallback:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /deployments/canary:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}/evaluate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/canary/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/switch:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/blue-green/{id}/health:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}/run-tests:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/plan/{id}/rollback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /deployments/rollback/history:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /graphql:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /graphql/playground:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /health/consensus:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /metrics:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /sla/policies:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/policies/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    put:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/records:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/report:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/breaches:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /sla/compliance:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /stream/vaults:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /stream/events:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /webauthn/register/begin:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/register/complete:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/authenticate/begin:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/authenticate/complete:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}/{cred_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: cred_id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webauthn/credentials/{user_id}/{cred_id}/backup:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: cred_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+
+  /webhooks:
+    get:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
+  /webhooks/verify:
+    post:
+      responses:
+        default:
+          $ref: '#/components/responses/RouterSurface'
 
 components:
+  responses:
+    RouterSurface:
+      description: Response for this backend router operation.
   schemas:
     # ── Time-Series schemas ────────────────────────────────────────────────
 
@@ -2714,6 +3524,88 @@ components:
           type: integer
         locale:
           $ref: '#/components/schemas/Locale'
+
+    DeliveryRecord:
+      type: object
+      properties:
+        notification_id:
+          type: string
+        vault_id:
+          type: string
+        owner:
+          type: string
+        notification_type:
+          type: string
+          enum:
+            - expiry_warning
+            - check_in_reminder
+            - vault_released
+            - vault_paused
+            - passkey_expiring_soon
+            - passkey_expired
+        status:
+          type: string
+          enum: [pending, sent, failed, retrying]
+        sent_at:
+          type: string
+          format: date-time
+        provider_response:
+          type: string
+      required:
+        - notification_id
+        - vault_id
+        - owner
+        - notification_type
+        - status
+        - sent_at
+        - provider_response
+
+    CreateTenantRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        owner:
+          type: string
+      required:
+        - name
+        - owner
+
+    Tenant:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        owner:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        is_active:
+          type: boolean
+      required:
+        - id
+        - name
+        - owner
+        - created_at
+        - updated_at
+        - is_active
+
+    TenantBillingResponse:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        message:
+          type: string
+      required:
+        - tenant_id
+        - message
 
     TtlInsurancePolicy:
       type: object

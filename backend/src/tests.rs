@@ -81,6 +81,10 @@ fn test_state(db: Arc<Db>) -> AppState {
         share_token_store: create_share_token_store(),
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
+        vault_broadcaster: Arc::new(ethos_protocol_backend::websocket::VaultBroadcaster::new(
+            16,
+        )),
+        request_log_store: ethos_protocol_backend::replay::create_request_log_store(),
         graphql_schema,
         metrics,
         priority_enforcer,
@@ -97,6 +101,11 @@ fn test_state(db: Arc<Db>) -> AppState {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         rpc_pool: test_rpc_pool(),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
+        notification_service: ethos_protocol_backend::notifications::create_service(),
+        profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
+        saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
+        fraud_detector: ethos_protocol_backend::fraud_detection::FraudDetector::new(),
     }
 }
 
@@ -274,10 +283,112 @@ async fn test_set_and_get_preferences() {
 }
 
 #[tokio::test]
+async fn test_fraud_scoring_persists_audit_entry() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let state = test_state(Arc::clone(&db));
+    let app = crate::build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/fraud/score")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token")
+                .header("x-user-tier", "free")
+                .body(Body::from(
+                    json!({
+                        "transaction": {
+                            "id": "fraud-audit-test",
+                            "amount": 125.0,
+                            "merchant_id": "known-merchant",
+                            "user_id": "user-audit-test",
+                            "timestamp": 14400,
+                            "location": "us"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let score: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(score["transaction_id"], "fraud-audit-test");
+
+    let audit_entries = db
+        .query_audit_logs(&ethos_protocol_backend::models::AuditLogQuery {
+            user_id: Some("user-audit-test".to_string()),
+            action: Some("fraud_score".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(audit_entries.len(), 1);
+    assert_eq!(audit_entries[0].resource, "transaction:fraud-audit-test");
+    assert_eq!(audit_entries[0].result, "clear");
+}
+
+#[tokio::test]
 async fn test_get_not_found() {
     let app = test_app();
     let res = get_req(app, "/api/vaults/999/reminder-preferences").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_dlq_operator_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/admin/dlq").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /admin/dlq response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_retention_deletion_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/api/retention/deletion-log").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected retention deletion-log response: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_websocket_vault_route_requires_authentication() {
+    let app = test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ws/vaults")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_replay_log_route_is_mounted_and_authorized() {
+    let app = test_app();
+    let response = get_req(app, "/replay/logs").await;
+    assert!(
+        response.status() == StatusCode::OK || response.status() == StatusCode::UNAUTHORIZED,
+        "unexpected /replay/logs response: {}",
+        response.status()
+    );
 }
 
 #[tokio::test]
@@ -350,8 +461,16 @@ async fn test_health_endpoint() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["status"], "ok");
+    assert!(json["status"] == "ok" || json["status"] == "degraded");
     assert!(json["version"].is_string());
+    assert!(json["rpc"]["status"].is_string());
+    assert!(json["rpc"]["reachable"].is_boolean());
+}
+
+#[tokio::test]
+async fn saml_routes_are_mounted_and_fail_closed_when_unconfigured() {
+    let res = get_req(test_app(), "/saml/metadata").await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -379,6 +498,78 @@ async fn test_ready_endpoint() {
     }
     assert_eq!(json["checks"]["rpc_pool"]["required"], false);
     assert_eq!(json["checks"]["database"]["required"], true);
+}
+
+#[tokio::test]
+async fn test_notification_registration_route() {
+    let response = post_json(
+        test_app(),
+        "/api/notifications/register",
+        json!({
+            "owner": "owner-1",
+            "token": "device-token-1",
+            "platform": "ios",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["owner"], "owner-1");
+    assert_eq!(json["token"], "device-token-1");
+}
+
+#[tokio::test]
+async fn test_tenant_routes_are_mounted() {
+    let app = test_app();
+    let response = post_json(
+        app.clone(),
+        "/api/tenants",
+        json!({
+            "name": "Tenant One",
+            "owner": "owner-1",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tenant: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tenant_id = tenant["id"].as_str().unwrap();
+
+    let response = post_json(
+        app.clone(),
+        &format!("/api/tenants/{tenant_id}/vaults/vault-1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = get_req(app, &format!("/api/tenants/{tenant_id}/vaults")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let vaults: Vec<String> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(vaults, vec!["vault-1"]);
+}
+
+#[tokio::test]
+async fn test_profiler_routes_record_http_samples() {
+    let app = test_app();
+    let _ = get_req(app.clone(), "/admin/profiler/samples").await;
+
+    let response = get_req(app, "/admin/profiler/samples").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let samples: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(!samples.as_array().unwrap().is_empty());
+    assert!(samples[0]["operation"].as_str().unwrap().starts_with("GET "));
 }
 
 // ── #962: Multi-node consensus health check tests ────────────────────────────
@@ -445,6 +636,11 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         rpc_pool: test_rpc_pool(),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
+        notification_service: ethos_protocol_backend::notifications::create_service(),
+        profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
+        saml_state: Arc::new(ethos_protocol_backend::saml::SamlState::disabled()),
+        fraud_detector: ethos_protocol_backend::fraud_detection::FraudDetector::new(),
     };
     db.migrate().unwrap();
 
@@ -996,7 +1192,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_returns_all_scenarios() {
         let store = create_vault_store();
         let vault = make_vault("vault-1", 86_400, Some(3600));
-        store.lock().unwrap().insert("vault-1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-1".to_string(), vault);
 
         let scenarios = vec![
             ScenarioType::NoCheckIns,
@@ -1015,7 +1211,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_no_check_ins_matches_ttl() {
         let store = create_vault_store();
         let vault = make_vault("vault-2", 86_400, Some(7200));
-        store.lock().unwrap().insert("vault-2".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-2".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-2", vec![ScenarioType::NoCheckIns], 1).unwrap();
@@ -1037,7 +1233,7 @@ mod simulator_tests {
         let mut vault = make_vault("vault-3", 3600, None); // 1 hour interval, no stored TTL
                                                            // last_check_in is Utc::now() so TTL should be close to 3600 seconds
         vault.ttl_remaining = None;
-        store.lock().unwrap().insert("vault-3".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-3".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-3", vec![ScenarioType::NoCheckIns], 1).unwrap();
@@ -1057,7 +1253,7 @@ mod simulator_tests {
     fn test_simulate_release_handler_single_scenario_subset() {
         let store = create_vault_store();
         let vault = make_vault("vault-4", 86_400, Some(43200));
-        store.lock().unwrap().insert("vault-4".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("vault-4".to_string(), vault);
 
         let result =
             simulate_release_handler(&store, "vault-4", vec![ScenarioType::MissedCheckInDates], 2)

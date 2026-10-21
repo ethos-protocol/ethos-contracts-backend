@@ -71,8 +71,10 @@ fn test_compromised_passkey_marked_with_status() {
     let passkey = vault.passkeys.get(0).unwrap();
 
     // Initially, passkey should not be marked as compromised
-    assert!(passkey.hash == Bytes::from_array(&env, &passkey_hash.to_array()),
-            "passkey hash should match");
+    assert!(
+        passkey.hash == Bytes::from_array(&env, &passkey_hash.to_array()),
+        "passkey hash should match"
+    );
 }
 
 /// Requirement 506, AC3: Force passkey rotation when compromise is detected.
@@ -100,7 +102,10 @@ fn test_force_passkey_rotation_on_breach_detection() {
 
     // Verify new passkey exists
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkey_hash.is_some(), "vault should have passkey after rotation");
+    assert!(
+        vault.passkey_hash.is_some(),
+        "vault should have passkey after rotation"
+    );
 }
 
 /// Requirement 506, AC4: Breach check history maintains audit trail
@@ -116,7 +121,10 @@ fn test_breach_check_history_maintained() {
     // Breach check would be performed periodically
     // History should be maintained via audit log
     let audit_log = client.get_passkey_audit_log(&vault_id);
-    assert!(audit_log.len() > 0, "audit log should track passkey operations");
+    assert!(
+        audit_log.len() > 0,
+        "audit log should track passkey operations"
+    );
 }
 
 /// Requirement 506, AC5: Alert is triggered when passkey found in breach database.
@@ -163,7 +171,11 @@ fn test_multiple_passkeys_independent_breach_status() {
 
     let vault = client.get_vault(&vault_id);
     // Both passkeys should exist, each with independent status
-    assert_eq!(vault.passkeys.len(), 2, "both passkeys should be registered");
+    assert_eq!(
+        vault.passkeys.len(),
+        2,
+        "both passkeys should be registered"
+    );
 }
 
 /// Requirement 506, AC8: Periodic breach checking can be configured and scheduled.
@@ -177,7 +189,10 @@ fn test_periodic_breach_check_can_be_configured() {
 
     // Vault should support configuration for periodic checks
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "vault is configured for passkey monitoring");
+    assert!(
+        vault.passkeys.len() > 0,
+        "vault is configured for passkey monitoring"
+    );
 }
 
 /// Requirement 506, AC9: Breach notification includes actionable information
@@ -193,7 +208,10 @@ fn test_breach_notification_contains_actionable_info() {
     // Notification system would include details about affected passkey
     let vault = client.get_vault(&vault_id);
     let passkey = vault.passkeys.get(0).unwrap();
-    assert!(passkey.hash.len() > 0, "passkey hash should be present for notification");
+    assert!(
+        passkey.hash.len() > 0,
+        "passkey hash should be present for notification"
+    );
 }
 
 /// Requirement 506, AC10: Breach history doesn't leak information about

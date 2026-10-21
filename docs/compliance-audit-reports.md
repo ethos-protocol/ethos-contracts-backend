@@ -40,11 +40,10 @@ Authorization: Bearer <ADMIN_API_KEY>
         "remediation": ""
       }
     ],
-    "pdf_stub": {
+    "pdf": {
       "format": "pdf",
-      "version": "1.0",
-      "note": "PDF generation requires an external renderer...",
-      "placeholder_base64": ""
+      "content_type": "application/pdf",
+      "base64": "<Base64-encoded PDF bytes>"
     }
   }
 }
@@ -143,7 +142,7 @@ Expand `SECURITY.md` or create `INCIDENT_RESPONSE.md` with severity levels, resp
 
 ## PDF Reports
 
-The endpoint includes a `pdf_stub` field in every report response. True PDF generation requires an external rendering engine (e.g. `printpdf`, `wkhtmltopdf`, or a headless browser). The JSON report fields contain all the data needed to render a PDF via any suitable client-side or server-side tooling.
+The endpoint includes a `pdf` object in every report response. Its `base64` value decodes to a complete PDF containing the report summary, each check, its description, and any remediation guidance. The `content_type` is `application/pdf`.
 
 ## Environment Variables
 
@@ -163,7 +162,7 @@ Set all four variables in production deployments to achieve maximum compliance c
 The core check functions are exposed as public Rust APIs:
 
 ```rust
-use ethos_protocol_backend::compliance::{run_compliance_checks, generate_pdf_stub};
+use ethos_protocol_backend::compliance::{run_compliance_checks, generate_pdf_report};
 
 // Run all GDPR, SOC 2, and ISO 27001 checks
 let checks = run_compliance_checks();
@@ -173,8 +172,8 @@ let failures: Vec<_> = checks.iter()
     .filter(|c| c.status == ComplianceStatus::Fail)
     .collect();
 
-// Get PDF stub metadata
-let pdf = generate_pdf_stub();
+// Generate Base64-encoded PDF bytes from the checks
+let pdf = generate_pdf_report(&chrono::Utc::now(), &checks);
 ```
 
 ## Related Documentation

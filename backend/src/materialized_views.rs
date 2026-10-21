@@ -84,14 +84,14 @@ impl Db {
         ";
         self.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(sql, rusqlite::params![Utc::now().to_rfc3339()])?;
         Ok(())
     }
 
     /// Full refresh of the per-owner vault counts materialized view.
     pub fn mv_refresh_owner_counts(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute("DELETE FROM vault_owner_counts_view", [])?;
         conn.execute_batch(
             r"
@@ -115,7 +115,7 @@ impl Db {
         released_delta: i64,
         expired_delta: i64,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             UPDATE vault_summary_view
             SET
@@ -139,7 +139,7 @@ impl Db {
 
     /// Read the vault summary from the materialized view.
     pub fn mv_get_vault_summary(&self) -> Option<VaultSummaryView> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = binding
             .prepare(
                 r"SELECT total_vaults, active_vaults, released_vaults, expired_vaults,
@@ -171,7 +171,7 @@ impl Db {
 
     /// Read per-owner vault counts from the materialized view.
     pub fn mv_get_owner_counts(&self) -> Vec<VaultOwnerCount> {
-        let binding = self.conn.lock().unwrap();
+        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match binding.prepare(
             "SELECT owner, vault_count, active_count \
              FROM vault_owner_counts_view ORDER BY vault_count DESC",
@@ -195,7 +195,7 @@ impl Db {
     /// Used by `OptimizedQueryRunner::explain_plan`.
     pub fn explain_query_plan(&self, sql: &str) -> Vec<String> {
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let binding = self.conn.lock().unwrap();
+        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match binding.prepare(&explain) {
             Ok(s) => s,
             Err(e) => return vec![format!("Error: {e}")],
@@ -262,7 +262,7 @@ impl MaterializedViewManager {
     /// Full refresh of the vault summary view.
     pub fn refresh_vault_summary(&self) -> Result<(), rusqlite::Error> {
         self.db.mv_refresh_vault_summary()?;
-        let mut sched = self.schedules.lock().unwrap();
+        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = sched.get_mut(Self::SUMMARY_VIEW) {
             s.next_refresh_at = std::time::Instant::now() + s.interval;
         }
@@ -272,7 +272,7 @@ impl MaterializedViewManager {
     /// Full refresh of the per-owner vault counts view.
     pub fn refresh_owner_counts(&self) -> Result<(), rusqlite::Error> {
         self.db.mv_refresh_owner_counts()?;
-        let mut sched = self.schedules.lock().unwrap();
+        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = sched.get_mut(Self::OWNER_VIEW) {
             s.next_refresh_at = std::time::Instant::now() + s.interval;
         }
@@ -322,7 +322,7 @@ impl MaterializedViewManager {
 
     /// Set the refresh interval for the named view.
     pub fn set_refresh_interval(&self, view: &'static str, interval: std::time::Duration) {
-        let mut sched = self.schedules.lock().unwrap();
+        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = sched.get_mut(view) {
             s.interval = interval;
         }
@@ -332,7 +332,7 @@ impl MaterializedViewManager {
     pub fn is_due(&self, view: &'static str) -> bool {
         self.schedules
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .get(view)
             .map_or(false, |s| std::time::Instant::now() >= s.next_refresh_at)
     }
@@ -340,7 +340,7 @@ impl MaterializedViewManager {
     /// Refresh any view that is currently due according to its schedule.
     pub fn refresh_due_views(&self) -> Result<(), rusqlite::Error> {
         let due: Vec<&'static str> = {
-            let sched = self.schedules.lock().unwrap();
+            let sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
             sched
                 .iter()
                 .filter(|(_, s)| std::time::Instant::now() >= s.next_refresh_at)
@@ -384,7 +384,7 @@ mod tests {
         // Insert a sample vault so the views have something to aggregate.
         db.conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .execute(
                 r"INSERT INTO vaults
                     (id, owner, beneficiary, balance, check_in_interval,

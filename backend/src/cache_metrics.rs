@@ -9,6 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Decrement `counter`, stopping at zero. `AtomicU64::fetch_saturating_sub`
+/// is unstable, so this uses a compare-and-swap loop via `fetch_update`.
+fn saturating_decrement(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+}
+
 // ── Rolling window for eviction timestamps ────────────────────────────────────
 
 /// A bounded rolling window that records the timestamps of recent evictions,
@@ -28,7 +34,7 @@ impl EvictionWindow {
     }
 
     fn record(&self) {
-        let mut ts = self.timestamps.lock().unwrap();
+        let mut ts = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         if ts.len() == self.capacity {
             ts.pop_front();
         }
@@ -37,7 +43,7 @@ impl EvictionWindow {
 
     /// Count evictions that occurred within the last `window` duration.
     fn count_within(&self, window: Duration) -> usize {
-        let ts = self.timestamps.lock().unwrap();
+        let ts = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         let cutoff = Instant::now()
             .checked_sub(window)
             .unwrap_or_else(|| Instant::now());
@@ -45,7 +51,7 @@ impl EvictionWindow {
     }
 
     fn total(&self) -> usize {
-        self.timestamps.lock().unwrap().len()
+        self.timestamps.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 
@@ -174,7 +180,7 @@ impl CacheMetrics {
     /// Record a deletion from the cache.
     pub fn record_delete(&self) {
         self.deletes.fetch_add(1, Ordering::Relaxed);
-        self.total_entries.fetch_saturating_sub(1, Ordering::Relaxed);
+        saturating_decrement(&self.total_entries);
     }
 
     /// Record that a cache entry was evicted (e.g. due to TTL expiry).
@@ -182,7 +188,7 @@ impl CacheMetrics {
     /// This decrements the live-entry counter **and** appends a timestamp to
     /// the eviction window for rate analysis.
     pub fn record_eviction(&self) {
-        self.total_entries.fetch_saturating_sub(1, Ordering::Relaxed);
+        saturating_decrement(&self.total_entries);
         self.eviction_window.record();
     }
 

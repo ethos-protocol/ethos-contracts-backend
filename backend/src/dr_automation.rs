@@ -78,6 +78,7 @@ impl DrStep {
 
 /// `POST /admin/dr/actions` request body.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestDrActionRequest {
     pub step: DrStep,
     /// Required for `RestoreVault`; ignored otherwise.
@@ -148,7 +149,7 @@ pub async fn request_dr_action(
     let token = Uuid::new_v4().to_string();
     let expires_at = Utc::now() + Duration::minutes(CONFIRMATION_TTL_MINUTES);
 
-    state.pending.lock().unwrap().insert(
+    state.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(
         token.clone(),
         PendingAction {
             step: body.step,
@@ -175,7 +176,7 @@ pub async fn confirm_dr_action(
     State(state): State<Arc<DrAutomationState>>,
     Path(token): Path<String>,
 ) -> Result<Json<DrActionResult>, (StatusCode, String)> {
-    let pending = state.pending.lock().unwrap().remove(&token);
+    let pending = state.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
 
     let pending = match pending {
         Some(p) if p.expires_at > Utc::now() => p,
@@ -210,7 +211,9 @@ pub async fn confirm_dr_action(
 /// commands documented in `docs/disaster-recovery-runbook.md`. Contract id,
 /// network, and signing identity are read from the same environment
 /// variables the runbook's manual commands reference
-/// (`CONTRACT_TTL_VAULT`, `STELLAR_NETWORK`, `DEPLOYER_IDENTITY`).
+/// (`CONTRACT_TTL_VAULT`, `STELLAR_NETWORK`, `DEPLOYER_IDENTITY`). Restoring a
+/// vault additionally requires `RESTORE_VAULT_CALLER` to be set to the address
+/// represented by the signing identity.
 fn execute_step(step: DrStep, vault_id: Option<u64>) -> DrActionResult {
     let executed_at = Utc::now();
 
@@ -219,11 +222,27 @@ fn execute_step(step: DrStep, vault_id: Option<u64>) -> DrActionResult {
     let args: Vec<String> = match step {
         DrStep::PauseContract => vec!["pause".to_string()],
         DrStep::UnpauseContract => vec!["unpause".to_string()],
-        DrStep::RestoreVault => vec![
-            "restore_vault".to_string(),
-            "--vault_id".to_string(),
-            vault_id.unwrap_or_default().to_string(),
-        ],
+        DrStep::RestoreVault => {
+            let caller = match std::env::var("RESTORE_VAULT_CALLER") {
+                Ok(caller) if !caller.trim().is_empty() => caller,
+                _ => {
+                    return DrActionResult {
+                        step,
+                        success: false,
+                        output: "RESTORE_VAULT_CALLER must be set to the owner or admin address"
+                            .to_string(),
+                        executed_at,
+                    };
+                }
+            };
+            vec![
+                "restore_vault".to_string(),
+                "--vault_id".to_string(),
+                vault_id.unwrap_or_default().to_string(),
+                "--caller".to_string(),
+                caller,
+            ]
+        }
     };
 
     let contract_id = std::env::var("CONTRACT_TTL_VAULT").unwrap_or_default();
@@ -905,7 +924,7 @@ mod tests {
         let state = Arc::new(DrAutomationState::new());
         // Manually insert an already-expired pending action
         let token = "expired-token".to_string();
-        state.pending.lock().unwrap().insert(
+        state.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(
             token.clone(),
             PendingAction {
                 step: DrStep::PauseContract,

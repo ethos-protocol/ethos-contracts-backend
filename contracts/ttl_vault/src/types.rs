@@ -94,7 +94,7 @@ pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
 pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
-// Issue #400: threshold-change timelock events
+                                                   // Issue #400: threshold-change timelock events
 pub const MULTISIG_THRESHOLD_PROPOSED_TOPIC: Symbol = symbol_short!("ms_t_prp");
 pub const MULTISIG_THRESHOLD_APPLIED_TOPIC: Symbol = symbol_short!("ms_t_app");
 pub const MULTISIG_THRESHOLD_CANCELLED_TOPIC: Symbol = symbol_short!("ms_t_can");
@@ -142,6 +142,7 @@ pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
 pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
 pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
 pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
+pub const TOKEN_WHITELISTED_TOPIC: Symbol = symbol_short!("tok_wlad");
 pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
 pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
 pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
@@ -556,6 +557,7 @@ pub enum DataKey {
     // currently running contract, checked by validate_upgrade.
     UpgradeManifest,
     UpgradeFunctionSignaturesHash,
+    PendingUpgrade,
 
     // ── Issue #563: Cursor-based pagination ────────────────────────────────────
     // (No extra storage keys needed; pagination is computed from existing keys.)
@@ -810,11 +812,19 @@ pub struct PasskeyEscrowRecord {
     pub escrowed_at: u64,
 }
 
-/// Backup code entry - Issue #393
+/// Legacy plaintext backup-code entry, retained for storage migration.
 #[contracttype]
 #[derive(Clone)]
 pub struct BackupCode {
     pub code: String,
+    pub used: bool,
+}
+
+/// Hash-only backup code entry for newly generated recovery codes.
+#[contracttype]
+#[derive(Clone)]
+pub struct HashedBackupCode {
+    pub code_hash: BytesN<32>,
     pub used: bool,
 }
 
@@ -1617,6 +1627,19 @@ pub struct UpgradeManifest {
     /// Monotonically increasing manifest version, bumped every time the
     /// admin records a new baseline (i.e. after each successful upgrade).
     pub version: u32,
+}
+
+/// Candidate upgrade staged for execution after the upgrade timelock.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    pub wasm_hash: BytesN<32>,
+    pub exported_fn_count: u32,
+    pub error_code_count: u32,
+    pub storage_schema_hash: BytesN<32>,
+    /// Stored as `Bytes` rather than `BytesN<32>`; see `PasskeyHash::biometric_hash`.
+    pub function_signatures_hash: Option<Bytes>,
+    pub proposed_at: u64,
 }
 
 /// Stored when an owner commits to an anonymous beneficiary.

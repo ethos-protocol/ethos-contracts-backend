@@ -160,18 +160,18 @@ pub fn create_job_store() -> JobStore {
 /// Submit a new job and return its ID.
 pub fn enqueue_job(store: &JobStore, job: BulkJob) -> String {
     let id = job.id.clone();
-    store.lock().unwrap().insert(id.clone(), job);
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), job);
     id
 }
 
 /// Retrieve a job by ID.
 pub fn get_job(store: &JobStore, id: &str) -> Option<BulkJob> {
-    store.lock().unwrap().get(id).cloned()
+    store.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
 }
 
 /// List all jobs, optionally filtered by status.
 pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<BulkJob> {
-    let store = store.lock().unwrap();
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut jobs: Vec<BulkJob> = store
         .values()
         .filter(|j| status_filter.as_ref().map_or(true, |s| &j.status == s))
@@ -183,7 +183,7 @@ pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<Bulk
 
 /// Cancel a queued job. Returns false if the job is not found or not cancellable.
 pub fn cancel_job(store: &JobStore, id: &str) -> bool {
-    let mut store = store.lock().unwrap();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(job) = store.get_mut(id) {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             job.mark_cancelled();
@@ -201,7 +201,7 @@ pub fn cancel_job(store: &JobStore, id: &str) -> bool {
 pub fn process_job(store: &JobStore, id: &str) {
     // Mark running
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = s.get_mut(id) {
             if job.status != JobStatus::Queued {
                 return; // already picked up or cancelled
@@ -214,7 +214,7 @@ pub fn process_job(store: &JobStore, id: &str) {
 
     // Simulate processing — real implementations would call domain logic here.
     let (operation, total_items, request_id) = {
-        let s = store.lock().unwrap();
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
         let job = s.get(id).unwrap();
         (
             job.operation.clone(),
@@ -235,7 +235,7 @@ pub fn process_job(store: &JobStore, id: &str) {
         let chunk = batch_size.min(total_items - processed);
         processed += chunk;
 
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = s.get_mut(id) {
             if job.status == JobStatus::Cancelled {
                 return;
@@ -253,7 +253,7 @@ pub fn process_job(store: &JobStore, id: &str) {
         "message": "Bulk operation completed successfully"
     });
 
-    let mut s = store.lock().unwrap();
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(job) = s.get_mut(id) {
         job.mark_completed(result);
     }
@@ -262,6 +262,7 @@ pub fn process_job(store: &JobStore, id: &str) {
 // ── HTTP request / response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateJobRequest {
     pub operation: BulkOperationType,
     /// The items to process. For `update_ttl`, list of vault IDs; for
@@ -284,6 +285,7 @@ pub struct JobStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListJobsQuery {
     pub status: Option<JobStatus>,
 }

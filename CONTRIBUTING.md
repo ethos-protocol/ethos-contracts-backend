@@ -7,6 +7,7 @@ Thank you for your interest in contributing! This document explains how to get s
 - [Getting Started](#getting-started)
 - [Code Style](#code-style)
 - [Git Workflow](#git-workflow)
+- [Rust Module Declarations](#rust-module-declarations)
 - [Testing Requirements](#testing-requirements)
 - [Pull Request Process](#pull-request-process)
 - [Documentation](#documentation)
@@ -146,6 +147,19 @@ git rebase origin/main
 
 ---
 
+## Rust Module Declarations
+
+Every `.rs` file under `backend/src/` and `contracts/*/src/` must be reachable
+from its crate root (`lib.rs`) through a `mod` declaration. Files that are not
+declared are never compiled, so their tests silently never run (#673-#676).
+
+- Declare a backend module with `pub mod name;` (or `mod name;` if it is
+  internal) in `backend/src/lib.rs`.
+- Declare test-only modules with `#[cfg(test)] mod name_tests;` in the crate
+  root.
+- Do not add a `pub mod` or `pub use` for a file that does not exist.
+- A file that is not wired in should be deleted, not left behind.
+
 ## Testing Requirements
 
 All contributions must include tests. The test coverage expectation depends on the type of change:
@@ -193,6 +207,7 @@ cargo test -p backend
 1. **Open the PR against `main`** with a clear title following the commit message convention.
 2. **Fill in the PR description** (see template below).
 3. **Link the relevant issue(s)** — use `Closes #<number>` in the description so the issue auto-closes on merge.
+3a. **Add a changelog line** for user-visible changes under `## [Unreleased]` in `CHANGELOG.md` (the PR template has a checkbox for this). Maintainers can draft a release section from merged commit subjects with `scripts/generate_release_notes.py --since-ref <commit that added the last entry> --unreleased`.
 4. **Ensure all CI checks pass** before requesting review:
    - `cargo fmt --check`
    - `cargo clippy -- -D warnings`
@@ -229,6 +244,19 @@ Closes #<number>
 - Reviewers aim to respond within 2 business days.
 - "Request changes" feedback must be resolved before merge.
 - Approvals from maintainers with write access are required to merge.
+
+### GitHub Actions pinning
+
+Third-party actions in `.github/workflows/` are pinned to a full commit SHA with the
+version kept in a trailing comment, so a moved or compromised tag cannot change what CI runs:
+
+```yaml
+- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+```
+
+- **Adding or changing an action:** resolve the tag to its commit SHA and keep the `# <version>` comment in sync.
+- **Updates:** the weekly `github-actions` Dependabot job (`.github/dependabot.yml`) proposes new SHAs.
+- **Per release:** re-check every pin against its upstream tag before tagging a release.
 
 ---
 

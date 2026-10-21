@@ -465,7 +465,7 @@ stateDiagram-v2
     Hibernating --> Active : exit_hibernation()
     Hibernating --> Expired : Hibernation ends\n+ TTL already lapsed
 
-    Archived --> Active : restore_vault()
+    Archived --> Active : restore_vault(vault_id, caller)\n[owner/admin authorized]
     Archived --> Released : trigger_release()\n[auto-restores then releases]
 
     Expired --> Released : trigger_release()

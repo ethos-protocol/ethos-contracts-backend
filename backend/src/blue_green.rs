@@ -185,6 +185,7 @@ impl Default for BlueGreenState {
 
 /// `POST /deployments/blue-green`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateBlueGreenRequest {
     pub service: String,
     /// Version currently running in the active (blue) slot.
@@ -204,6 +205,7 @@ fn default_active_slot() -> ActiveSlot {
 
 /// `POST /deployments/blue-green/:id/switch`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SwitchTrafficRequest {
     /// Human-readable reason for this traffic switch.
     pub reason: String,
@@ -216,12 +218,14 @@ fn default_true() -> bool { true }
 
 /// `POST /deployments/blue-green/:id/rollback`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackBlueGreenRequest {
     pub reason: String,
 }
 
 /// `POST /deployments/blue-green/:id/health`
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportHealthRequest {
     pub slot: ActiveSlot,
     pub health: SlotHealth,
@@ -295,7 +299,7 @@ pub async fn create_blue_green_deployment(
         "blue-green deployment created"
     );
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(deployment.id.clone(), deployment.clone());
 
     Ok((StatusCode::CREATED, Json(deployment)))
@@ -305,7 +309,7 @@ pub async fn create_blue_green_deployment(
 pub async fn list_blue_green_deployments(
     State(state): State<Arc<BlueGreenState>>,
 ) -> Json<Vec<BlueGreenDeployment>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut deployments: Vec<BlueGreenDeployment> = store.values().cloned().collect();
     deployments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Json(deployments)
@@ -316,7 +320,7 @@ pub async fn get_blue_green_deployment(
     State(state): State<Arc<BlueGreenState>>,
     Path(id): Path<String>,
 ) -> Result<Json<BlueGreenDeployment>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -327,7 +331,7 @@ pub async fn switch_traffic(
     Path(id): Path<String>,
     Json(body): Json<SwitchTrafficRequest>,
 ) -> Result<Json<BlueGreenDeployment>, (StatusCode, Json<serde_json::Value>)> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store
         .get_mut(&id)
         .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))))?;
@@ -388,7 +392,7 @@ pub async fn rollback_blue_green(
     Path(id): Path<String>,
     Json(body): Json<RollbackBlueGreenRequest>,
 ) -> Result<Json<BlueGreenDeployment>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     let current_active = deployment.active_slot;
@@ -429,7 +433,7 @@ pub async fn report_health(
     Path(id): Path<String>,
     Json(body): Json<ReportHealthRequest>,
 ) -> Result<Json<BlueGreenDeployment>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
     let now = Utc::now();
 

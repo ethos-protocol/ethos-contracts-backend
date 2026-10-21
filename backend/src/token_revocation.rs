@@ -13,13 +13,17 @@
 //! * [`RevocationList::is_revoked`] is the check every authenticated request
 //!   runs; [`validate_ws_token_with_revocation`] wires it onto the existing
 //!   [`crate::websocket::validate_ws_token`] verification.
-//! * `POST /auth/revoke` ([`revoke_token`]) adds a token (or a bare `jti`) to
-//!   the list.
+//! * Admin-only `POST /auth/revoke` ([`revoke_token`]) adds a token (or a bare
+//!   `jti`) to the list.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -45,7 +49,7 @@ impl RevocationList {
     pub fn revoke(&self, jti: &str, expires_at: i64) {
         self.inner
             .write()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(jti.to_string(), expires_at);
     }
 
@@ -54,21 +58,21 @@ impl RevocationList {
     pub fn is_revoked(&self, jti: &str) -> bool {
         let now = Utc::now().timestamp();
         {
-            let map = self.inner.read().unwrap();
+            let map = self.inner.read().unwrap_or_else(|p| p.into_inner());
             match map.get(jti) {
                 None => return false,
                 Some(&exp) if exp > now => return true,
                 Some(_) => {} // expired — fall through to remove
             }
         }
-        self.inner.write().unwrap().remove(jti);
+        self.inner.write().unwrap_or_else(|p| p.into_inner()).remove(jti);
         false
     }
 
     /// Drop every entry whose expiry is at or before `now` (Unix seconds).
     /// Returns the number of entries removed.
     pub fn purge_expired(&self, now: i64) -> usize {
-        let mut map = self.inner.write().unwrap();
+        let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let before = map.len();
         map.retain(|_, &mut exp| exp > now);
         before - map.len()
@@ -76,7 +80,7 @@ impl RevocationList {
 
     /// Current number of (possibly not-yet-purged) entries.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -123,6 +127,7 @@ pub fn validate_ws_token_with_revocation(
 /// Request body for `POST /auth/revoke`. Supply either a full `token` (its
 /// `jti`/`exp` are extracted) or a bare `jti`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevokeRequest {
     pub token: Option<String>,
     pub jti: Option<String>,
@@ -144,11 +149,19 @@ fn bad_request(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// `POST /auth/revoke` — add a token to the revocation list.
+/// Admin-only `POST /auth/revoke` — add a token to the revocation list.
 pub async fn revoke_token(
     State(list): State<Arc<RevocationList>>,
+    headers: HeaderMap,
     Json(body): Json<RevokeRequest>,
 ) -> Result<Json<RevokeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = crate::audit::authorize_admin(&headers) {
+        return Err((
+            error.status(),
+            Json(serde_json::json!({ "error": error.message })),
+        ));
+    }
+
     let now = Utc::now().timestamp();
 
     let (jti, token_exp) = match (body.jti.clone(), body.token.as_deref()) {
@@ -269,6 +282,7 @@ mod tests {
         // By bare jti.
         let resp = revoke_token(
             State(list.clone()),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: None,
                 jti: Some("direct-jti".to_string()),
@@ -284,6 +298,7 @@ mod tests {
         let token = mint(b"whatever", "token-jti", exp);
         let resp = revoke_token(
             State(list.clone()),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: Some(token),
                 jti: None,
@@ -302,6 +317,7 @@ mod tests {
         let list = RevocationList::new();
         let err = revoke_token(
             State(list),
+            HeaderMap::new(),
             Json(RevokeRequest {
                 token: None,
                 jti: None,

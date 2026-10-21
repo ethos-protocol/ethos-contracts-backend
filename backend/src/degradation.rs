@@ -65,6 +65,7 @@ pub struct CapabilityStatus {
 
 /// Request body for `POST /admin/capabilities`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetCapabilityRequest {
     pub name: String,
     pub level: DegradationLevel,
@@ -75,6 +76,7 @@ pub struct SetCapabilityRequest {
 
 /// Request body for `POST /capabilities/negotiate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NegotiateRequest {
     pub requested: Vec<String>,
 }

@@ -66,6 +66,7 @@ pub struct ReminderPreferences {
 
 /// Request body for setting reminder preferences.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SetPreferencesRequest {
     pub channels: Vec<Channel>,
     pub hours_before_expiry: u32,
@@ -314,6 +315,7 @@ pub enum EventType {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchQuery {
     pub owner: Option<String>,
     pub beneficiary: Option<String>,
@@ -370,6 +372,60 @@ pub struct ComplianceReport {
     pub total_deposits: i128,
     pub total_withdrawals: i128,
     pub current_balance: i128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStatus {
+    Pass,
+    Fail,
+    Warning,
+    NotApplicable,
+}
+
+impl std::fmt::Display for ComplianceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Warning => "warning",
+            Self::NotApplicable => "not_applicable",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceCheck {
+    pub id: String,
+    pub name: String,
+    pub framework: String,
+    pub status: ComplianceStatus,
+    pub description: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompliancePdf {
+    pub format: String,
+    pub content_type: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceAuditReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_checks: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warnings: usize,
+    pub not_applicable: usize,
+    pub checks: Vec<ComplianceCheck>,
+    pub pdf: CompliancePdf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceReportResponse {
+    pub report: ComplianceAuditReport,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -496,6 +552,7 @@ pub struct RestoreRequest {
 /// Request body for `POST /admin/validate-backup` (#81): validate the
 /// integrity of a base64-encoded backup payload.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupValidateRequest {
     pub backup_id: String,
     pub data_base64: String,
@@ -613,6 +670,7 @@ pub struct Subscription {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SetSubscriptionRequest {
     pub owner: String,
     pub channels: Vec<SubscriptionChannel>,
@@ -655,6 +713,7 @@ impl std::fmt::Display for ScenarioType {
 
 /// Query parameters for the simulate-release endpoint.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimulateReleaseQuery {
     /// Comma-separated list of scenarios to run.
     /// e.g. `scenarios=no_check_ins,consistent_check_ins`
@@ -784,6 +843,7 @@ pub struct TwoFactorConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Enable2FARequest {
     pub method: TwoFactorMethod,
     pub phone: Option<String>,
@@ -791,6 +851,7 @@ pub struct Enable2FARequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verify2FARequest {
     pub otp: String,
 }
@@ -829,6 +890,7 @@ pub struct Tenant {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTenantRequest {
     pub name: String,
     pub owner: String,
@@ -853,6 +915,7 @@ pub struct TenantContext {
 // ── #70: Real-Time Collaboration Features ───────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialUpdate {
     pub id: String,
     pub vault_id: String,
@@ -865,6 +928,7 @@ pub struct CredentialUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationalTransform {
     pub id: String,
     pub vault_id: String,
@@ -963,6 +1027,7 @@ pub struct DataRetentionPolicy {
 
 /// Request body for creating or updating a retention policy.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertRetentionPolicyRequest {
     pub retention_days: u32,
     pub enabled: Option<bool>,
@@ -999,6 +1064,7 @@ pub struct RetentionException {
 
 /// Request body for registering a retention exception.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRetentionExceptionRequest {
     pub record_id: String,
     pub reason: String,
@@ -1094,6 +1160,7 @@ pub struct SecretRotationPolicy {
 
 /// Request body for upserting a secret rotation policy.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertSecretRotationPolicyRequest {
     pub rotation_interval_days: u32,
     pub grace_period_hours: Option<u32>,
@@ -1145,6 +1212,7 @@ pub struct CaptchaChallenge {
 
 /// Request body for `POST /captcha/verify`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptchaVerifyRequest {
     /// The `CaptchaChallenge.id` issued by `/captcha/challenge`.
     pub challenge_id: String,
@@ -1180,6 +1248,7 @@ pub struct TrustedUser {
 
 /// Request body for `POST /admin/captcha/trusted-users`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddTrustedUserRequest {
     pub user_id: String,
     pub ip: String,
@@ -1237,6 +1306,7 @@ pub struct IpBlockRule {
 
 /// Request body for `POST /admin/ip-reputation/block`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpBlockRequest {
     /// Exact IP or `/24` prefix to block.
     pub ip_pattern: String,
@@ -1289,8 +1359,11 @@ impl Default for IpReputationConfig {
 
 /// Request body for `POST /ip-reputation/check`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpReputationCheckRequest {
     /// Optional explicit IP to check. Falls back to `X-Forwarded-For` /
     /// `X-Real-IP` headers when absent.
     pub ip: Option<String>,
 }
+
+// ── Compliance Audit Report models (#99) ─────────────────────────────────────

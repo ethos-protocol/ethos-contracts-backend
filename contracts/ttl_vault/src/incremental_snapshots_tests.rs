@@ -1,7 +1,7 @@
-/// Issue #559 — Incremental state snapshots tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #559 — Incremental state snapshots tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;
@@ -177,11 +177,15 @@ fn test_reconstruct_at_timestamp() {
     client.create_incremental_snapshot(&vault_id);
 
     assert_eq!(
-        client.reconstruct_vault_snapshot_at(&vault_id, &1_500).balance,
+        client
+            .reconstruct_vault_snapshot_at(&vault_id, &1_500)
+            .balance,
         100
     );
     assert_eq!(
-        client.reconstruct_vault_snapshot_at(&vault_id, &5_000).balance,
+        client
+            .reconstruct_vault_snapshot_at(&vault_id, &5_000)
+            .balance,
         200
     );
     assert!(client

@@ -106,7 +106,7 @@ pub enum AmlSource {
     Chainalysis,
     /// Cached Chainalysis result.
     Cache,
-    /// Provider screening is not configured; only the manual list applied.
+    /// Provider screening is not configured; only the manual list was checked.
     ManualListOnly,
     /// Provider call failed; verdict follows the fail-open/closed policy.
     ProviderUnavailable,
@@ -197,7 +197,7 @@ impl AmlScreener {
         if let Some(flag) = self
             .flags
             .read()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(&address)
         {
             return Ok(AmlScreeningResult {
@@ -216,7 +216,10 @@ impl AmlScreener {
                 compliant: true,
                 source: AmlSource::ManualListOnly,
                 identifications: Vec::new(),
-                reason: None,
+                reason: Some(
+                    "Provider screening is not configured; only the manual list was applied."
+                        .to_string(),
+                ),
                 checked_at: now,
             });
         };
@@ -224,7 +227,7 @@ impl AmlScreener {
         let cached = self
             .cache
             .read()
-            .expect("aml cache lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(&address)
             .filter(|c| c.fetched_at.elapsed() < self.config.cache_ttl)
             .map(|c| c.identifications.clone());
@@ -232,7 +235,7 @@ impl AmlScreener {
             Some(ids) => (ids, AmlSource::Cache),
             None => match self.query_chainalysis(api_key, &address).await {
                 Ok(ids) => {
-                    self.cache.write().expect("aml cache lock poisoned").insert(
+                    self.cache.write().unwrap_or_else(|p| p.into_inner()).insert(
                         address.clone(),
                         CachedScreening {
                             identifications: ids.clone(),
@@ -324,7 +327,7 @@ impl AmlScreener {
         );
         self.flags
             .write()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .insert(address, flag.clone());
         Ok(flag)
     }
@@ -334,7 +337,7 @@ impl AmlScreener {
         let removed = self
             .flags
             .write()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .remove(&address)
             .is_some();
         if removed {
@@ -346,7 +349,7 @@ impl AmlScreener {
     pub fn flags(&self) -> Vec<AmlFlag> {
         self.flags
             .read()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .cloned()
             .collect()
@@ -356,6 +359,7 @@ impl AmlScreener {
 // ── HTTP handlers ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlagRequest {
     pub address: String,
     pub reason: String,
@@ -421,4 +425,29 @@ pub async fn list_flags(
         return e.into_response();
     }
     Json(screener.flags()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn manual_list_only_result_discloses_missing_provider_screening() {
+        let screener = AmlScreener::new(AmlConfig {
+            api_key: None,
+            api_url: DEFAULT_CHAINALYSIS_URL.to_string(),
+            cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+            fail_open: false,
+        });
+
+        let result = screener.screen("GABC123").await.unwrap();
+
+        assert!(result.compliant);
+        assert_eq!(result.source, AmlSource::ManualListOnly);
+        assert!(result
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("Provider screening is not configured"));
+    }
 }

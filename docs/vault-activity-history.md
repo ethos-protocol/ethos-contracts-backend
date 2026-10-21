@@ -67,20 +67,20 @@ a new page.
 
 ## Reading the log
 
-### Full log (all entries)
+### Full log (deprecated)
 
 ```rust
 // Returns all entries, oldest-first.
-// Transparently reads legacy flat entries first, then paginated entries.
+// Deprecated: use get_vault_audit_log_page for bounded reads.
 get_vault_audit_log(vault_id: u64) -> Vec<AuditEntry>
 
-// Alias for get_vault_audit_log.
+// Returns the first 50 entries.
 get_vault_activity_log(vault_id: u64) -> Vec<AuditEntry>
 ```
 
-Both functions are migration-aware: if a vault still has entries under the
-legacy `VaultAuditLog` key those are prepended before any pages from the new
-layout, so old vaults continue to work transparently without a migration step.
+The full-log method is retained for compatibility but may consume increasing
+read resources as history grows. The activity-log alias is bounded to the first
+page; use the paginated method below to retrieve the rest.
 
 ### Single page
 
@@ -91,7 +91,8 @@ get_vault_audit_log_page(vault_id: u64, page: u32, page_size: u32) -> Vec<AuditE
 ```
 
 Use this for paginated UI display or when you need only a recent slice of the
-log without deserialising the entire history.
+log without deserialising the entire new-layout history. Legacy flat entries
+are still decoded from their original vector.
 
 ## Migration / backward compatibility
 
@@ -99,9 +100,8 @@ Vaults created before the v2 paginated layout was deployed have all their
 history stored under the legacy `VaultAuditLog(vault_id)` key.  **No on-chain
 migration transaction is required.**
 
-- All read functions (`get_vault_audit_log`, `get_vault_activity_log`,
-  `get_vault_audit_log_page`) check the legacy key first and prepend any
-  legacy entries before returning new-layout pages.
+- All read functions remain migration-aware. Paginated reads include legacy
+  entries before entries from the new layout.
 - Subsequent writes to a legacy vault automatically create new-layout page
   keys; the legacy entries remain readable in place.
 - The legacy flat key is never written again after the upgrade; it is purely

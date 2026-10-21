@@ -40,21 +40,45 @@ fn setup() -> (
     (env, owner, beneficiary, admin, token_address, client)
 }
 
+fn backup_code_hashes(env: &Env, codes: [&str; 10]) -> Vec<BytesN<32>> {
+    let mut hashes = Vec::new(env);
+    for code in codes {
+        hashes.push_back(
+            env.crypto()
+                .sha256(&Bytes::from_slice(env, code.as_bytes()))
+                .into(),
+        );
+    }
+    hashes
+}
+
 // ---- existing tests ----
 
 #[test]
 fn test_regenerating_backup_codes_invalidates_previous_generation() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let first_codes = backup_code_hashes(
+        &env,
+        [
+            "first-0", "first-1", "first-2", "first-3", "first-4", "first-5", "first-6",
+            "first-7", "first-8", "first-9",
+        ],
+    );
+    let second_codes = backup_code_hashes(
+        &env,
+        [
+            "second-0", "second-1", "second-2", "second-3", "second-4", "second-5", "second-6",
+            "second-7", "second-8", "second-9",
+        ],
+    );
 
-    let first_generation = client.generate_backup_codes(&vault_id, &owner);
-    let old_code = first_generation.get(0).unwrap();
+    client.generate_backup_codes(&vault_id, &owner, &first_codes);
+    client.generate_backup_codes(&vault_id, &owner, &second_codes);
 
-    let second_generation = client.generate_backup_codes(&vault_id, &owner);
-    assert_ne!(old_code, second_generation.get(0).unwrap());
-
+    let old_code_hash = first_codes.get(0).unwrap();
     let error = client
-        .try_use_backup_code(&vault_id, &old_code)
+        .try_use_backup_code(&vault_id, &old_code_hash)
         .unwrap_err()
         .unwrap();
     assert_eq!(
@@ -62,10 +86,118 @@ fn test_regenerating_backup_codes_invalidates_previous_generation() {
         soroban_sdk::Error::from_contract_error(ContractError::InvalidBackupCode as u32)
     );
 
-    client.use_backup_code(&vault_id, &second_generation.get(0).unwrap());
+    let current_code_hash = second_codes.get(0).unwrap();
+    client.use_backup_code(&vault_id, &current_code_hash);
+    let error = client
+        .try_use_backup_code(&vault_id, &current_code_hash)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::BackupCodeAlreadyUsed as u32)
+    );
 
     // Keep `env` live for the generated Soroban values in this test.
     let _ = env;
+}
+
+#[test]
+fn test_registered_backup_codes_are_stored_as_hashes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let submitted_codes = backup_code_hashes(
+        &env,
+        [
+            "code-0", "code-1", "code-2", "code-3", "code-4", "code-5", "code-6", "code-7",
+            "code-8", "code-9",
+        ],
+    );
+
+    client.generate_backup_codes(&vault_id, &owner, &submitted_codes);
+    let (stored_codes, legacy_codes_exist) = env.as_contract(&client.address, || {
+        let stored: Vec<HashedBackupCode> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedBackupCodes(vault_id))
+            .unwrap();
+        let legacy_exists = env
+            .storage()
+            .persistent()
+            .has(&DataKey::BackupCodes(vault_id));
+        (stored, legacy_exists)
+    });
+
+    assert_eq!(stored_codes.len(), 10);
+    assert_eq!(
+        stored_codes.get(0).unwrap().code_hash,
+        submitted_codes.get(0).unwrap()
+    );
+    assert!(!legacy_codes_exist);
+}
+
+#[test]
+fn test_backup_code_hash_registration_rejects_duplicates() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let duplicate_codes = backup_code_hashes(&env, ["same-code"; 10]);
+
+    let error = client
+        .try_generate_backup_codes(&vault_id, &owner, &duplicate_codes)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidBackupCode as u32)
+    );
+}
+
+#[test]
+fn test_legacy_backup_codes_migrate_to_hashes_when_used() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let legacy_code = String::from_str(&env, "legacy-code");
+    let legacy_code_hash = hash_backup_code(&env, &legacy_code);
+    let mut legacy_codes = Vec::new(&env);
+    legacy_codes.push_back(BackupCode {
+        code: legacy_code.clone(),
+        used: false,
+    });
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::BackupCodes(vault_id), &legacy_codes);
+    });
+
+    client.use_backup_code(&vault_id, &legacy_code_hash);
+
+    let (stored_codes, legacy_codes_exist) = env.as_contract(&client.address, || {
+        let stored: Vec<HashedBackupCode> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedBackupCodes(vault_id))
+            .unwrap();
+        let legacy_exists = env
+            .storage()
+            .persistent()
+            .has(&DataKey::BackupCodes(vault_id));
+        (stored, legacy_exists)
+    });
+    assert_eq!(stored_codes.len(), 1);
+    assert_eq!(stored_codes.get(0).unwrap().code_hash, legacy_code_hash);
+    assert!(stored_codes.get(0).unwrap().used);
+    assert!(!legacy_codes_exist);
+}
+
+#[test]
+fn test_apply_ttl_decay_requires_vault_owner_auth() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    assert!(client.try_apply_ttl_decay(&vault_id).is_err());
+
+    env.mock_all_auths();
+    client.apply_ttl_decay(&vault_id).unwrap();
 }
 
 #[test]
@@ -86,6 +218,21 @@ fn test_initialize_guard_against_double_init() {
 
     assert_eq!(client.get_admin(), original_admin);
     assert_eq!(client.get_contract_token(), original_token);
+}
+
+#[test]
+fn test_initialize_rejects_address_without_token_interface() {
+    let (env, _, _, admin, _, client) = setup();
+    let not_a_token = Address::generate(&env);
+
+    let err = client
+        .try_initialize(&not_a_token, &admin)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidToken as u32)
+    );
 }
 
 #[test]
@@ -3325,6 +3472,23 @@ fn test_security_token_whitelist_enforcement() {
 }
 
 #[test]
+fn test_whitelist_token_emits_event() {
+    let (env, _, _, _, token_address, client) = setup();
+
+    client.whitelist_token(&token_address);
+
+    let event = env.events().all().iter().find(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val(&env).ok())
+            .map(|topic: soroban_sdk::Symbol| topic == types::TOKEN_WHITELISTED_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(event.is_some(), "token whitelist event not emitted");
+}
+
+#[test]
 fn test_cross_chain_wrapped_token_support() {
     let (env, owner, beneficiary, _, xlm_token, client) = setup();
 
@@ -3713,6 +3877,7 @@ fn test_non_primary_beneficiary_cannot_veto() {
 // ---- Issue #398: Beneficiary Notification System Tests ----
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3728,6 +3893,7 @@ fn test_get_vaults_as_beneficiary() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary_empty() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3739,6 +3905,27 @@ fn test_get_vaults_as_beneficiary_empty() {
     // Get vaults for non-beneficiary
     let vaults = client.get_vaults_as_beneficiary(&other_beneficiary);
     assert_eq!(vaults.len(), 0);
+}
+
+#[test]
+fn test_get_vaults_as_beneficiary_pagination() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let ids: alloc::vec::Vec<u64> = (0..5)
+        .map(|_| client.create_vault(&owner, &beneficiary, &100u64, &None))
+        .collect();
+
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &0u32, &2u32),
+        vec![&env, ids[0], ids[1]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &1u32, &2u32),
+        vec![&env, ids[2], ids[3]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &2u32, &2u32),
+        vec![&env, ids[4]]
+    );
 }
 
 #[test]
@@ -4582,9 +4769,8 @@ fn test_audit_log_page_size_stays_bounded() {
         client.withdraw(&vault_id, &owner, &1i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
-    // We expect exactly 125 entries (1 create + 124 deposit/withdraw).
-    assert_eq!(all.len(), 125, "expected 125 total audit entries");
+    // The compatibility alias is now bounded to a single page.
+    assert_eq!(client.get_vault_activity_log(&vault_id).len(), 50);
 
     // Verify that each paginated storage key holds at most PAGE_SIZE entries by
     // reading pages 0..2 through the public paged accessor.
@@ -4597,11 +4783,13 @@ fn test_audit_log_page_size_stays_bounded() {
     assert_eq!(page1.len(), 50, "page 1 must contain exactly 50 entries");
     assert_eq!(page2.len(), 25, "page 2 (tail) must contain the remaining 25 entries");
     assert!(page3.is_empty(), "page 3 does not exist and should be empty");
+    assert_eq!(page0.len() + page1.len() + page2.len(), 125);
 }
 
 /// Verify that all historical entries remain retrievable via the paged accessor
 /// after the storage layout change — no entries should be dropped or reordered.
 #[test]
+#[allow(deprecated)]
 fn test_audit_log_historical_entries_readable_via_pagination() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
@@ -4612,7 +4800,7 @@ fn test_audit_log_historical_entries_readable_via_pagination() {
         client.withdraw(&vault_id, &owner, &1_000i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
+    let all = client.get_vault_audit_log(&vault_id);
     assert_eq!(all.len(), 55);
 
     // First entry is create_vault (written before the loop).
@@ -4796,6 +4984,30 @@ fn test_manual_archive_vault() {
     // Owner can also manually archive (auto-archive already ran, but calling again is idempotent)
     client.archive_vault(&vault_id, &owner).unwrap();
     assert!(client.get_archived_vault_info(&vault_id).is_some());
+}
+
+#[test]
+fn restore_vault_requires_owner_or_admin() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    client.trigger_release(&vault_id);
+    assert!(client.get_archived_vault_info(&vault_id).is_some());
+
+    let outsider = Address::generate(&env);
+    let err = client
+        .try_restore_vault(&vault_id, &outsider)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::NotOwner as u32)
+    );
+    assert!(client.get_archived_vault_info(&vault_id).is_some());
+
+    client.restore_vault(&vault_id, &owner);
+    assert!(client.get_archived_vault_info(&vault_id).is_none());
 }
 
 #[test]
@@ -6561,6 +6773,18 @@ fn test_accept_admin_emits_completed_event() {
 // ---- Issue #814: Pause Reason Tracking ----
 
 #[test]
+fn test_pause_rejects_oversized_reason() {
+    let (env, _, _, _, _, client) = setup();
+    let reason = Bytes::from_array(&env, &[0u8; (MAX_PAUSE_REASON_LEN + 1) as usize]);
+
+    let error = client.try_pause(&reason).unwrap_err();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidPauseReason as u32)
+    );
+}
+
+#[test]
 fn test_pause_stores_pause_record() {
     let (env, _, _, admin, _, client) = setup();
     let reason = bytes!(&env, 0xdeadbeef);
@@ -6998,7 +7222,7 @@ fn test_check_in_with_geo_basic() {
 }
 
 #[test]
-fn test_check_in_with_geo_records_location() {
+fn test_check_in_with_geo_does_not_store_location() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
     let passkey_hash = BytesN::<32>::random(&env);
@@ -7014,7 +7238,79 @@ fn test_check_in_with_geo_records_location() {
     ).unwrap();
 
     let geo_log = client.get_geo_checkin_log(&vault_id);
-    assert!(geo_log.len() > 0);
+    assert!(geo_log.is_empty());
+
+    let has_geo_event = env.events().all().iter().any(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val::<soroban_sdk::Symbol>(&env).ok())
+            .is_some_and(|topic| topic == symbol_short!("ci_geo"))
+    });
+    assert!(!has_geo_event);
+}
+
+#[test]
+#[should_panic]
+fn test_distribute_yield_requires_owner_authorization() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    client.distribute_yield(&vault_id);
+}
+
+#[test]
+fn test_distribute_yield_only_accounts_for_undistributed_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract_address);
+    client.initialize(&token_address, &admin);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    client.enable_token_staking(
+        &vault_id,
+        &owner,
+        &Address::generate(&env),
+        &10_000u32,
+    );
+    client.set_yield_distribution(&vault_id, &YieldDistributionMode::Reinvest);
+
+    env.as_contract(&contract_address, || {
+        let key = DataKey::TokenStaking(vault_id);
+        let mut staking = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenStaking>(&key)
+            .unwrap();
+        staking.staked_amount = 10_000;
+        env.storage().persistent().set(&key, &staking);
+    });
+
+    let year_seconds = 365 * 24 * 60 * 60;
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + year_seconds);
+    client.distribute_yield(&vault_id);
+    let distributed_once = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    client.distribute_yield(&vault_id);
+    let distributed_twice = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    assert_eq!(distributed_once, 10_000);
+    assert_eq!(distributed_twice, distributed_once);
 }
 
 #[test]
@@ -7233,3 +7529,42 @@ fn test_beneficiary_delegation_chain_order_preserved() {
     }
 }
 
+#[test]
+fn test_get_vault_batch_status_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..20 {
+        vault_ids.push_back(vault_id);
+    }
+
+    assert!(client.get_vault_batch_status(&vault_ids).is_empty());
+    vault_ids.push_back(20);
+    let err = client
+        .try_get_vault_batch_status(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
+}
+
+#[test]
+fn test_emit_expiry_warnings_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..50 {
+        vault_ids.push_back(vault_id);
+    }
+
+    client.emit_expiry_warnings(&vault_ids);
+    vault_ids.push_back(50);
+    let err = client
+        .try_emit_expiry_warnings(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
+}

@@ -16,7 +16,8 @@ use std::sync::{Arc, RwLock};
 use axum::{
     extract::{Query, State},
     response::IntoResponse,
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -141,11 +142,13 @@ pub fn matches_pattern(text: &str, pattern: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     pub lines: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchQuery {
     pub level: Option<String>,
     pub query: Option<String>,
@@ -178,14 +181,14 @@ impl LogStore {
         let entry = parse_log_line(line);
         self.inner
             .write()
-            .expect("log store lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .entries
             .push(entry.clone());
         entry
     }
 
     pub fn search(&self, q: &SearchQuery) -> Vec<LogEntry> {
-        let inner = self.inner.read().expect("log store lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner
             .entries
             .iter()
@@ -234,9 +237,21 @@ pub async fn search_logs(
     Json(store.search(&q))
 }
 
+pub fn log_analysis_router() -> Router {
+    Router::new()
+        .route("/logs/ingest", post(ingest_logs))
+        .route("/logs/search", get(search_logs))
+        .with_state(LogStore::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
 
     #[test]
     fn parses_timestamp_level_target_and_fields() {
@@ -306,5 +321,42 @@ mod tests {
         });
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message, "second");
+    }
+
+    #[tokio::test]
+    async fn log_routes_ingest_and_search_entries() {
+        let app = log_analysis_router();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logs/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"lines":["2026-10-17T10:00:00Z ERROR api: vault restore failed id=42"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/logs/search?level=ERROR&query=restore")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let entries: Vec<LogEntry> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fields.get("id"), Some(&"42".to_string()));
     }
 }

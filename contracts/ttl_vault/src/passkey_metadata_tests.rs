@@ -18,7 +18,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
     token::StellarAssetClient,
-    Address, BytesN, Env, String, IntoVal, TryIntoVal,
+    Address, BytesN, Env, IntoVal, String, TryIntoVal,
 };
 
 fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
@@ -73,7 +73,10 @@ fn test_rename_passkey_updates_nickname() {
 
     // Verify passkey exists for rename operation
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "passkey should exist for renaming");
+    assert!(
+        vault.passkeys.len() > 0,
+        "passkey should exist for renaming"
+    );
 }
 
 /// Requirement 505, AC3: Last used timestamp is updated on each check-in.
@@ -111,7 +114,11 @@ fn test_passkey_list_with_multiple_nicknames() {
     client.add_passkey(&vault_id, &owner, &hash_3);
 
     let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.passkeys.len(), 3, "vault should contain three passkeys");
+    assert_eq!(
+        vault.passkeys.len(),
+        3,
+        "vault should contain three passkeys"
+    );
 }
 
 /// Requirement 505, AC5: Nickname length is validated and bounded.
@@ -125,7 +132,10 @@ fn test_nickname_length_validation() {
 
     // Test with reasonable nickname length
     let reasonable_name = String::from_str(&env, "iPhone 15 Pro");
-    assert!(reasonable_name.len() < 256, "nickname should fit in reasonable bounds");
+    assert!(
+        reasonable_name.len() < 256,
+        "nickname should fit in reasonable bounds"
+    );
 }
 
 /// Requirement 505, AC6: Passkey usage history tracks frequency and timestamp
@@ -149,7 +159,10 @@ fn test_passkey_usage_history_tracks_frequency() {
 
     let usage = client.get_passkey_usage(&vault_id);
     // Should have at least 3 usage entries for the 3 check-ins
-    assert!(usage.len() >= 3, "usage history should track multiple check-ins");
+    assert!(
+        usage.len() >= 3,
+        "usage history should track multiple check-ins"
+    );
 }
 
 /// Requirement 505, AC7: Passkey metadata can be retrieved including
@@ -165,7 +178,10 @@ fn test_retrieve_passkey_metadata() {
     // Retrieve vault and verify passkey exists
     let vault = client.get_vault(&vault_id);
     assert!(
-        vault.passkeys.iter().any(|pk| pk.hash == Bytes::from_array(&env, &passkey_hash.to_array())),
+        vault
+            .passkeys
+            .iter()
+            .any(|pk| pk.hash == Bytes::from_array(&env, &passkey_hash.to_array())),
         "passkey should be retrievable"
     );
 }

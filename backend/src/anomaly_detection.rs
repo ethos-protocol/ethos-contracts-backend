@@ -58,6 +58,10 @@ const DEFAULT_Z_THRESHOLD: f64 = 3.0;
 /// Minimum time between two alerts for the same metric, to suppress
 /// duplicate/false-positive alert storms from a single sustained anomaly.
 const ALERT_COOLDOWN_SECONDS: i64 = 60;
+/// Service label for observations that do not name one.
+pub const DEFAULT_SERVICE: &str = "default";
+/// Alerts closer than this (in seconds) to an existing group join it (#545).
+const CORRELATION_GAP_SECONDS: i64 = 300;
 
 /// Suppression entry for pattern-based allowlisting.
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +183,7 @@ pub struct Alert {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObserveRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -419,6 +424,7 @@ pub struct InvestigationEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvestigationRequest {
     pub investigator: String,
     pub action: InvestigationAction,
@@ -461,6 +467,10 @@ struct Inner {
     correlations: HashMap<String, AnomalyCorrelation>,
     stream_events: Vec<StreamEvent>,
     feedback_entries: Vec<Feedback>,
+    /// Correlation groups; those spanning two or more services are system anomalies.
+    groups: Vec<SystemAnomaly>,
+    root_causes: HashMap<RootCause, RootCauseStat>,
+    investigations: HashMap<String, Vec<InvestigationEntry>>,
 }
 
 /// Shared anomaly-detection state: one baseline per metric plus the
@@ -499,7 +509,7 @@ impl AnomalyStore {
         let service = service_label(service);
         let key = metric_key(&service, metric);
 
-        let mut guard = self.inner.write().expect("anomaly lock poisoned");
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let inner = &mut *guard;
 
         let baseline = inner.baselines.entry(key.clone()).or_default();
@@ -574,7 +584,7 @@ impl AnomalyStore {
     pub fn alerts(&self) -> Vec<Alert> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .alerts
             .clone()
     }
@@ -582,14 +592,14 @@ impl AnomalyStore {
     pub fn baseline(&self, metric: &str) -> Option<Baseline> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .baselines
             .get(metric)
             .cloned()
     }
 
     pub fn suppress_anomaly(&self, pattern: &str, expires_at: Option<DateTime<Utc>>) -> u64 {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.suppression_counter += 1;
         let id = inner.suppression_counter;
 
@@ -605,12 +615,12 @@ impl AnomalyStore {
     }
 
     pub fn get_suppressions(&self) -> Vec<Suppression> {
-        let inner = self.inner.read().expect("anomaly lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let now = Utc::now();
         inner
             .suppressions
             .values()
-            .filter(|s| s.expires_at.is_none() || s.expires_at.unwrap() > now)
+            .filter(|s| s.expires_at.is_none_or(|expires_at| expires_at > now))
             .cloned()
             .collect()
     }
@@ -618,7 +628,7 @@ impl AnomalyStore {
     pub fn remove_suppression(&self, id: u64) -> bool {
         self.inner
             .write()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .suppressions
             .remove(&id)
             .is_some()
@@ -627,7 +637,7 @@ impl AnomalyStore {
     pub fn get_correlated_anomalies(&self, anomaly_id: &str) -> Vec<String> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .correlations
             .get(anomaly_id)
             .map(|c| c.correlated_ids.clone())
@@ -635,7 +645,7 @@ impl AnomalyStore {
     }
 
     pub fn add_correlation(&self, anomaly_id: &str, correlated_id: &str, strength: f64) {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let correlation = inner
             .correlations
             .entry(anomaly_id.to_string())
@@ -653,7 +663,7 @@ impl AnomalyStore {
 
     pub fn process_stream_event(&self, metric: &str, value: f64) -> (Option<Alert>, StreamEvent) {
         let event_id = {
-            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
             inner.stream_events.len() as u64 + 1
         };
 
@@ -665,7 +675,7 @@ impl AnomalyStore {
         };
 
         {
-            let mut inner = self.inner.write().expect("anomaly lock poisoned");
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
             inner.stream_events.push(event.clone());
         }
 
@@ -676,13 +686,13 @@ impl AnomalyStore {
     pub fn get_stream_events(&self) -> Vec<StreamEvent> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .stream_events
             .clone()
     }
 
     pub fn submit_feedback(&self, anomaly_id: &str, is_true_positive: bool) -> String {
-        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let feedback_id = Uuid::new_v4().to_string();
 
         let feedback = Feedback {
@@ -699,7 +709,7 @@ impl AnomalyStore {
     pub fn get_feedback(&self) -> Vec<Feedback> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .feedback_entries
             .clone()
     }
@@ -707,12 +717,272 @@ impl AnomalyStore {
     pub fn get_feedback_for_anomaly(&self, anomaly_id: &str) -> Vec<Feedback> {
         self.inner
             .read()
-            .expect("anomaly lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .feedback_entries
             .iter()
             .filter(|f| f.anomaly_id == anomaly_id)
             .cloned()
             .collect()
+    }
+}
+
+impl Inner {
+    /// Join `alert` to a nearby correlation group, or start a new one. A group
+    /// that first spans two services is counted once against its root cause.
+    fn correlate(&mut self, alert: &Alert) {
+        let gap = Duration::seconds(CORRELATION_GAP_SECONDS);
+        let position = self.groups.iter().position(|g| {
+            alert.timestamp >= g.started_at - gap && alert.timestamp <= g.last_seen_at + gap
+        });
+
+        let idx = match position {
+            Some(idx) => {
+                self.groups[idx].absorb(alert);
+                idx
+            }
+            None => {
+                self.groups.push(SystemAnomaly {
+                    id: Uuid::new_v4().to_string(),
+                    services: vec![alert.service.clone()],
+                    alert_ids: vec![alert.id.clone()],
+                    shared_metrics: Vec::new(),
+                    root_cause: RootCause {
+                        service: alert.service.clone(),
+                        metric: alert.metric.clone(),
+                    },
+                    max_severity: alert.severity,
+                    started_at: alert.timestamp,
+                    last_seen_at: alert.timestamp,
+                    metrics_by_service: vec![(alert.service.clone(), alert.metric.clone())],
+                    counted: false,
+                });
+                self.groups.len() - 1
+            }
+        };
+
+        let group = &mut self.groups[idx];
+        if group.is_systemic() && !group.counted {
+            group.counted = true;
+            let root_cause = group.root_cause.clone();
+            let stat = self
+                .root_causes
+                .entry(root_cause.clone())
+                .or_insert_with(|| RootCauseStat {
+                    root_cause,
+                    occurrences: 0,
+                    last_seen_at: group.last_seen_at,
+                    system_anomaly_ids: Vec::new(),
+                });
+            stat.occurrences += 1;
+            stat.last_seen_at = stat.last_seen_at.max(group.last_seen_at);
+            stat.system_anomaly_ids.push(group.id.clone());
+        }
+    }
+
+    fn knows_anomaly(&self, anomaly_id: &str) -> bool {
+        self.alerts.iter().any(|a| a.id == anomaly_id)
+            || self.groups.iter().any(|g| g.id == anomaly_id)
+    }
+}
+
+// ── Seasonal, correlation and investigation API (#544-#546) ──────────────────
+
+impl AnomalyStore {
+    /// Enable seasonal handling for a metric. Re-configuring with the same
+    /// seasonality keeps the learned buckets and thresholds; a different one
+    /// starts fresh.
+    pub fn configure_seasonality(
+        &self,
+        service: Option<&str>,
+        metric: &str,
+        seasonality: Seasonality,
+    ) {
+        let key = metric_key(&service_label(service), metric);
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        match inner.seasonal.get(&key) {
+            Some(profile) if profile.seasonality == seasonality => {}
+            _ => {
+                inner
+                    .seasonal
+                    .insert(key, SeasonalProfile::new(seasonality));
+            }
+        }
+    }
+
+    /// Set the threshold multiplier for one season bucket of a seasonal metric.
+    pub fn set_seasonal_threshold(
+        &self,
+        service: Option<&str>,
+        metric: &str,
+        bucket: u32,
+        multiplier: f64,
+    ) -> Result<(), SeasonalError> {
+        let key = metric_key(&service_label(service), metric);
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        let profile = inner
+            .seasonal
+            .get_mut(&key)
+            .ok_or(SeasonalError::NotConfigured)?;
+        let slot = profile
+            .threshold_multipliers
+            .get_mut(bucket as usize)
+            .ok_or(SeasonalError::BucketOutOfRange)?;
+        if !(multiplier.is_finite() && multiplier > 0.0) {
+            return Err(SeasonalError::InvalidMultiplier);
+        }
+        *slot = multiplier;
+        Ok(())
+    }
+
+    /// The learned seasonal decomposition for a metric, if seasonality is enabled.
+    pub fn seasonal_pattern(&self, service: Option<&str>, metric: &str) -> Option<SeasonalPattern> {
+        let service = service_label(service);
+        let key = metric_key(&service, metric);
+        let inner = self.inner.read().expect("anomaly lock poisoned");
+        let profile = inner.seasonal.get(&key)?;
+        let global = inner.baselines.get(&key).cloned().unwrap_or_default();
+
+        let components = profile
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, bucket)| {
+                let multiplier = profile.threshold_multipliers[i];
+                SeasonalComponent {
+                    bucket: i as u32,
+                    count: bucket.count,
+                    mean: bucket.mean,
+                    std_dev: bucket.std_dev(),
+                    seasonal_offset: bucket.mean - global.mean,
+                    threshold_multiplier: multiplier,
+                    effective_threshold: DEFAULT_Z_THRESHOLD * multiplier,
+                    trained: bucket.count >= MIN_SAMPLES_FOR_DETECTION,
+                }
+            })
+            .collect();
+
+        Some(SeasonalPattern {
+            service,
+            metric: metric.to_string(),
+            seasonality: profile.seasonality,
+            global_mean: global.mean,
+            global_std_dev: global.std_dev(),
+            components,
+        })
+    }
+
+    /// Correlated cross-service anomalies whose latest alert falls within `window`.
+    pub fn get_system_anomalies(&self, window: Duration) -> Vec<SystemAnomaly> {
+        let cutoff = Utc::now() - window;
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .groups
+            .iter()
+            .filter(|g| g.is_systemic() && g.last_seen_at >= cutoff)
+            .cloned()
+            .collect()
+    }
+
+    /// Root causes of system anomalies, most frequent first.
+    pub fn root_cause_stats(&self) -> Vec<RootCauseStat> {
+        let mut stats: Vec<RootCauseStat> = self
+            .inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .root_causes
+            .values()
+            .cloned()
+            .collect();
+        stats.sort_by(|a, b| {
+            b.occurrences
+                .cmp(&a.occurrences)
+                .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
+        });
+        stats
+    }
+
+    /// Append an action to an anomaly's investigation trail. The trail must
+    /// start with `opened`; a closed investigation only accepts `reopened`.
+    pub fn record_investigation(
+        &self,
+        anomaly_id: &str,
+        req: InvestigationRequest,
+    ) -> Result<InvestigationEntry, InvestigationError> {
+        let investigator = req.investigator.trim().to_string();
+        if investigator.is_empty() {
+            return Err(InvestigationError::MissingInvestigator);
+        }
+
+        let mut inner = self.inner.write().expect("anomaly lock poisoned");
+        if !inner.knows_anomaly(anomaly_id) {
+            return Err(InvestigationError::AnomalyNotFound);
+        }
+
+        let history = inner
+            .investigations
+            .entry(anomaly_id.to_string())
+            .or_default();
+        let current = history.last().map(|e| e.status);
+
+        match (current, req.action) {
+            (None, InvestigationAction::Opened) => {}
+            (None, _) => return Err(InvestigationError::NotOpened),
+            (Some(InvestigationStatus::Open), InvestigationAction::Opened | InvestigationAction::Reopened) => {
+                return Err(InvestigationError::AlreadyOpen)
+            }
+            (Some(InvestigationStatus::Open), _) => {}
+            (Some(InvestigationStatus::Closed), InvestigationAction::Reopened) => {}
+            (Some(InvestigationStatus::Closed), _) => return Err(InvestigationError::Closed),
+        }
+
+        let needs_decision = matches!(
+            req.action,
+            InvestigationAction::DecisionRecorded | InvestigationAction::Closed
+        );
+        if needs_decision && req.decision.is_none() {
+            return Err(InvestigationError::MissingDecision);
+        }
+        let assignee = req.assignee.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        if req.action == InvestigationAction::Assigned && assignee.is_none() {
+            return Err(InvestigationError::MissingAssignee);
+        }
+
+        let status = match req.action {
+            InvestigationAction::Closed => InvestigationStatus::Closed,
+            _ => InvestigationStatus::Open,
+        };
+        let entry = InvestigationEntry {
+            id: Uuid::new_v4().to_string(),
+            anomaly_id: anomaly_id.to_string(),
+            sequence: history.len() as u64 + 1,
+            investigator: investigator.clone(),
+            action: req.action,
+            decision: if needs_decision { req.decision } else { None },
+            assignee,
+            notes: req.notes,
+            status,
+            timestamp: Utc::now(),
+        };
+        history.push(entry.clone());
+        tracing::info!(
+            anomaly_id,
+            investigator = %investigator,
+            action = ?entry.action,
+            "anomaly investigation action recorded"
+        );
+        Ok(entry)
+    }
+
+    /// The ordered, immutable investigation trail for one anomaly.
+    pub fn get_investigation_history(&self, anomaly_id: &str) -> Vec<InvestigationEntry> {
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .investigations
+            .get(anomaly_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -747,6 +1017,7 @@ pub async fn get_baseline(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeasonalityRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -755,6 +1026,7 @@ pub struct SeasonalityRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeasonalThresholdRequest {
     #[serde(default)]
     pub service: Option<String>,
@@ -764,6 +1036,7 @@ pub struct SeasonalThresholdRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricQuery {
     #[serde(default)]
     pub service: Option<String>,
@@ -824,6 +1097,7 @@ pub async fn get_seasonal_pattern(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemAnomalyQuery {
     /// Look-back window in seconds (default one hour).
     #[serde(default)]
@@ -882,6 +1156,17 @@ pub async fn get_investigation_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anomaly_store_recovers_poisoned_lock() {
+        let store = AnomalyStore::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.write().unwrap_or_else(|p| p.into_inner());
+            panic!("poison anomaly store lock");
+        }));
+
+        assert!(store.alerts().is_empty());
+    }
 
     #[test]
     fn no_alert_while_learning_baseline() {
@@ -1189,8 +1474,8 @@ mod tests {
         store.submit_feedback(anomaly2, false);
         store.submit_feedback(anomaly3, true);
 
-        let feedback_v1: Vec<_> = store
-            .get_feedback()
+        let all_feedback = store.get_feedback();
+        let feedback_v1: Vec<_> = all_feedback
             .iter()
             .filter(|f| f.anomaly_id.starts_with("alert_v1"))
             .collect();

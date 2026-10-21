@@ -192,7 +192,7 @@ impl QueryPlanCache {
 
     /// Return the cached plan for `key`, or `None` if absent/expired.
     pub fn get(&self, key: &str) -> Option<QueryPlan> {
-        let mut guard = self.entries.lock().unwrap();
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = guard.get(key) {
             if entry.inserted_at.elapsed() < self.ttl {
                 self.hits
@@ -208,7 +208,7 @@ impl QueryPlanCache {
 
     /// Store a plan under `key`.
     pub fn insert(&self, key: String, plan: QueryPlan) {
-        self.entries.lock().unwrap().insert(
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).insert(
             key,
             PlanCacheEntry {
                 plan,
@@ -219,7 +219,7 @@ impl QueryPlanCache {
 
     /// Invalidate all cached plans (e.g. after a schema change).
     pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Return (hits, misses) counters.
@@ -232,7 +232,7 @@ impl QueryPlanCache {
 
     /// Number of entries currently in the cache.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// `true` when the cache has no entries.

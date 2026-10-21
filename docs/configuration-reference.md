@@ -82,6 +82,7 @@ STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
 | `CONTRACT_TTL_VAULT` | `string` | — | Deployed `ttl_vault` contract ID (Strkey format) |
 | `CONTRACT_SBT` | `string` | — | Deployed `sbt` contract ID |
 | `CONTRACT_ZK_VERIFIER` | `string` | — | Deployed `zk_verifier` contract ID |
+| `RESTORE_VAULT_CALLER` | `string` | — | Owner/admin address used by disaster-recovery automation; must match `DEPLOYER_IDENTITY` |
 
 **Impact**: If these are missing or incorrect, all vault operations will fail.
 
@@ -152,8 +153,8 @@ REMINDER_SECOND_LEAD_TIME_HOURS=24
 | `DB_MIN_CONNECTIONS` | `integer` | `1` | Minimum idle connections |
 | `DB_CONNECT_TIMEOUT_SECONDS` | `integer` | `30` | Connection timeout |
 | `DB_IDLE_TIMEOUT_SECONDS` | `integer` | `600` | Idle connection timeout |
-| `DB_POOL_MIN` | `integer` | `2` | Minimum live connections (adaptive pool, `pool_optimizer.rs`) |
-| `DB_POOL_MAX` | `integer` | `10` | Maximum live connections (adaptive pool, `pool_optimizer.rs`) |
+| `DB_POOL_MIN` | `integer` | `2` | Read connections opened at startup (`db_read_pool.rs`); capped at `DB_POOL_MAX` |
+| `DB_POOL_MAX` | `integer` | `10` | Maximum read connections (`db_read_pool.rs`). In-memory databases use 1 regardless. See [architecture](architecture.md#database-concurrency-model) |
 | `DB_POOL_MAX_CHECKOUT_SECS` | `integer` | `60` | How long a connection may stay checked out before being flagged as a suspected leak |
 
 **Recommended**:

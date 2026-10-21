@@ -31,6 +31,7 @@ pub struct EndpointStats {
 
 /// Query parameters for filtering analytics data.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyticsQuery {
     pub endpoint: Option<String>,
     pub method: Option<String>,
@@ -71,7 +72,7 @@ impl AnalyticsStore {
         success: bool,
     ) {
         let key = format!("{} {}", method, endpoint);
-        let mut inner = self.inner.write().expect("analytics lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let metrics = inner.metrics.entry(key).or_default();
 
         metrics.total_requests += 1;
@@ -92,7 +93,7 @@ impl AnalyticsStore {
 
     /// Get statistics for all endpoints, optionally filtered.
     pub fn get_stats(&self, endpoint: Option<&str>, method: Option<&str>) -> Vec<EndpointStats> {
-        let inner = self.inner.read().expect("analytics lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner
             .metrics
             .iter()
@@ -140,7 +141,7 @@ impl AnalyticsStore {
     /// Get error rate for an endpoint as a percentage.
     pub fn error_rate(&self, endpoint: &str, method: &str) -> Option<f64> {
         let key = format!("{} {}", method, endpoint);
-        let inner = self.inner.read().expect("analytics lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner.metrics.get(&key).and_then(|m| {
             if m.total_requests == 0 {
                 return None;

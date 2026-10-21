@@ -35,7 +35,9 @@ curl -X POST $BACKEND_URL/admin/dr/actions/<confirmation_token>/confirm
 
 Supported `step` values: `pause_contract`, `unpause_contract`,
 `restore_vault` (also requires `"vault_id": <VAULT_ID>` in the phase-1
-request body). Each executes the same `stellar contract invoke` command
+request body). The backend also requires `RESTORE_VAULT_CALLER` to be set to
+the authorized owner/admin address matching `$DEPLOYER_IDENTITY`. Each step
+executes the same `stellar contract invoke` command
 shown in the corresponding manual section below, using
 `$CONTRACT_TTL_VAULT` / `$STELLAR_NETWORK` / `$DEPLOYER_IDENTITY` from the
 backend's environment. A confirmation token is single-use and expires after
@@ -127,12 +129,16 @@ stellar contract invoke \
 stellar contract invoke \
   --id $CONTRACT_TTL_VAULT \
   --network $STELLAR_NETWORK \
-  --source <any-identity> \
+  --source <owner-or-admin-identity> \
   -- restore_vault \
-  --vault_id <VAULT_ID>
+  --vault_id <VAULT_ID> \
+  --caller <owner-or-admin-address>
 ```
 
-`restore_vault` re-extends the persistent entry TTL so the vault becomes accessible again. `trigger_release` automatically attempts restoration before transferring funds.
+`restore_vault` requires the vault owner or contract admin to authorize the
+call. It re-extends the persistent entry TTL so the vault becomes accessible
+again. `trigger_release` automatically attempts restoration before
+transferring funds.
 
 **Step 3 — Verify restoration:**
 

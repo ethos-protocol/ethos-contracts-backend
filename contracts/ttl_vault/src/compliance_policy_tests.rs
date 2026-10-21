@@ -1,7 +1,7 @@
-/// Issue #556 — Compliance policy versioning tests
-///
-/// ⚠️ WARNING: These tests are implementation-only and have **not** been run
-/// as part of this change. Do not add integration/end-to-end assertions here.
+//! Issue #556 — Compliance policy versioning tests
+//!
+//! ⚠️ WARNING: These tests are implementation-only and have **not** been run
+//! as part of this change. Do not add integration/end-to-end assertions here.
 #![cfg(test)]
 
 extern crate alloc;
@@ -73,9 +73,18 @@ fn test_get_policy_version_by_timestamp() {
     client.set_kyc_high_value_threshold(&300);
 
     assert_eq!(client.get_policy_version(&1_000).version, 1);
-    assert_eq!(client.get_policy_version(&1_999).kyc_high_value_threshold, 100);
-    assert_eq!(client.get_policy_version(&2_500).kyc_high_value_threshold, 200);
-    assert_eq!(client.get_policy_version(&9_999).kyc_high_value_threshold, 300);
+    assert_eq!(
+        client.get_policy_version(&1_999).kyc_high_value_threshold,
+        100
+    );
+    assert_eq!(
+        client.get_policy_version(&2_500).kyc_high_value_threshold,
+        200
+    );
+    assert_eq!(
+        client.get_policy_version(&9_999).kyc_high_value_threshold,
+        300
+    );
     assert!(client.try_get_policy_version(&999).is_err());
 }
 

@@ -124,6 +124,7 @@ impl CanaryDeployment {
 
 /// Request body for `POST /deployments/canary`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartCanaryRequest {
     pub service: String,
     pub version: String,
@@ -135,6 +136,7 @@ pub struct StartCanaryRequest {
 
 /// Request body for `POST /deployments/canary/:id/evaluate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateCanaryRequest {
     pub metrics: CanaryMetrics,
     /// Current error rate observed in the baseline (non-canary) cohort, for
@@ -146,6 +148,7 @@ pub struct EvaluateCanaryRequest {
 
 /// Request body for `POST /deployments/canary/:id/rollback`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackCanaryRequest {
     pub reason: String,
 }
@@ -218,7 +221,7 @@ pub async fn start_canary_deployment(
         deployment.current_traffic_percent()
     ));
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.insert(deployment.id.clone(), deployment.clone());
 
     Ok((StatusCode::CREATED, Json(deployment)))
@@ -229,7 +232,7 @@ pub async fn get_canary_deployment(
     State(state): State<Arc<CanaryState>>,
     Path(id): Path<String>,
 ) -> Result<Json<CanaryDeployment>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -242,7 +245,7 @@ pub async fn evaluate_canary(
     Path(id): Path<String>,
     Json(body): Json<EvaluateCanaryRequest>,
 ) -> Result<Json<CanaryDeployment>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     if deployment.status != CanaryStatus::InProgress {
@@ -319,7 +322,7 @@ pub async fn rollback_canary(
     Path(id): Path<String>,
     Json(body): Json<RollbackCanaryRequest>,
 ) -> Result<Json<CanaryDeployment>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     deployment.status = CanaryStatus::RolledBack;
@@ -357,7 +360,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -379,7 +382,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -401,7 +404,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -423,7 +426,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {

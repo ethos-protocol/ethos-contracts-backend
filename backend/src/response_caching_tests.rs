@@ -6,6 +6,7 @@ mod tests {
     use crate::cache::{VaultCache, CacheConfig};
     use crate::cache_invalidation::CacheInvalidationStrategy;
     use crate::query_cache::QueryCache;
+    use serde_json::json;
 
     #[test]
     fn test_response_level_caching_with_ttl() {
@@ -17,7 +18,7 @@ mod tests {
         let _cache = VaultCache::with_config(config);
 
         let metrics = cache.metrics();
-        assert!(metrics.total_entries == 0);
+        assert_eq!(metrics.evictions, 0);
     }
 
     #[test]
@@ -43,7 +44,7 @@ mod tests {
         invalidation.register_dependencies(key, dependencies.clone());
         assert_eq!(
             invalidation.get_dependencies(key),
-            Some(dependencies)
+            Some(vec!["list_resources".to_string(), "user_profile".to_string()])
         );
     }
 
@@ -67,14 +68,14 @@ mod tests {
 
         assert_eq!(metrics.hits, 0);
         assert_eq!(metrics.misses, 0);
-        assert!(metrics.total_entries == 0);
+        assert_eq!(metrics.evictions, 0);
     }
 
     #[test]
     fn test_query_cache_with_ttl() {
         let cache = QueryCache::new();
-        cache.set("test_key", "value");
-        assert_eq!(cache.get("test_key"), Some("value".to_string()));
+        cache.set("test_key", json!("value"));
+        assert_eq!(cache.get("test_key"), Some(json!("value")));
     }
 
     #[test]
@@ -111,7 +112,7 @@ mod tests {
         let mut handles = vec![];
 
         for _i in 0..10 {
-            let _cache_clone = Arc::clone(&cache);
+            let cache = Arc::clone(&cache);
             let handle = tokio::spawn(async move {
                 let _metrics = cache.metrics();
                 true
@@ -165,8 +166,8 @@ mod tests {
     #[test]
     fn test_query_cache_invalidation_all() {
         let cache = QueryCache::new();
-        cache.set("key1", "value1");
-        cache.set("key2", "value2");
+        cache.set("key1", json!("value1"));
+        cache.set("key2", json!("value2"));
 
         cache.invalidate_all();
 
@@ -188,6 +189,6 @@ mod tests {
     fn test_cache_with_default_config() {
         let cache = VaultCache::new();
         let metrics = cache.metrics();
-        assert!(metrics.total_entries >= 0);
+        assert_eq!(metrics.evictions, 0);
     }
 }

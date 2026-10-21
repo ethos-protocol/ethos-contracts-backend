@@ -53,7 +53,9 @@ pub struct Policy {
     /// Amount at or above which operations require KYC (0 = disabled).
     pub kyc_high_value_threshold: i128,
     pub allowlist_enforced: bool,
-    pub reporting_thresholds: Option<ThresholdConfig>,
+    /// Zero or one element: a `Vec` keeps the contracttype encoding simple
+    /// (an `Option` of a contracttype struct does not convert to `ScVal`).
+    pub reporting_thresholds: Vec<ThresholdConfig>,
 }
 
 #[contracttype]
@@ -125,7 +127,7 @@ pub fn record_live_change(env: &Env, actor: &Address, reason: Symbol) -> u32 {
             reason,
             kyc_high_value_threshold: compliance::get_kyc_high_value_threshold(env),
             allowlist_enforced: compliance::is_allowlist_enforced(env),
-            reporting_thresholds: compliance::get_threshold_config(env),
+            reporting_thresholds: option_to_vec(env, compliance::get_threshold_config(env)),
         },
     );
     persist(env, &PolicyKey::Applied, &version);
@@ -170,11 +172,19 @@ pub fn publish_policy(
             reason: symbol_short!("publish"),
             kyc_high_value_threshold,
             allowlist_enforced,
-            reporting_thresholds,
+            reporting_thresholds: option_to_vec(env, reporting_thresholds),
         },
     );
     sync_active_policy(env)?;
     Ok(version)
+}
+
+fn option_to_vec(env: &Env, cfg: Option<ThresholdConfig>) -> Vec<ThresholdConfig> {
+    let mut out = Vec::new(env);
+    if let Some(cfg) = cfg {
+        out.push_back(cfg);
+    }
+    out
 }
 
 /// Returns the policy that was in force at `timestamp`.
@@ -188,7 +198,7 @@ pub fn get_policy_version(env: &Env, timestamp: u64) -> Result<Policy, ContractE
         // Later versions win ties because the index is in version order.
         if best
             .as_ref()
-            .map_or(true, |b| entry.effective_from >= b.effective_from)
+            .is_none_or(|b| entry.effective_from >= b.effective_from)
         {
             best = Some(entry);
         }
@@ -214,13 +224,15 @@ pub fn sync_active_policy(env: &Env) -> Result<Option<u32>, ContractError> {
     if compliance::is_allowlist_enforced(env) != active.allowlist_enforced {
         compliance::set_allowlist_enforced(env, active.allowlist_enforced);
     }
-    match &active.reporting_thresholds {
-        Some(cfg) => compliance::set_threshold_config(env, cfg)?,
+    match active.reporting_thresholds.get(0) {
+        Some(cfg) => compliance::set_threshold_config(env, &cfg)?,
         None => compliance::clear_threshold_config(env),
     }
 
     persist(env, &PolicyKey::Applied, &active.version);
-    env.events()
-        .publish((POLICY_APPLIED_TOPIC, active.version), active.effective_from);
+    env.events().publish(
+        (POLICY_APPLIED_TOPIC, active.version),
+        active.effective_from,
+    );
     Ok(Some(active.version))
 }
