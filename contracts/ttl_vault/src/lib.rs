@@ -69,7 +69,7 @@ mod vault_nft_tests;
 use types::VaultSortField;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
-    BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
+    BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig, HashedBackupCode,
     CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, DataKey, DisputeStatus,
     GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry, MilestoneEntry,
     MilestoneVestingSchedule, MultiSigConfig, MultiSigOperation, MultiSigProposal, OwnershipProof,
@@ -366,11 +366,21 @@ const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 /// Time-lock delay for admin transfers in seconds (24 hours) — Issue #813.
 const ADMIN_TRANSFER_TIMELOCK: u64 = 86_400;
 
+/// Maximum number of bytes retained in a pause record's reason.
+pub const MAX_PAUSE_REASON_LEN: u32 = 256;
+
 /// Time-lock delay before a proposed protocol config takes effect (24 hours) — Issue #809.
 const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
 
 /// Time-lock delay before a proposed contract upgrade can be executed.
 const UPGRADE_TIMELOCK: u64 = 86_400;
+fn hash_backup_code(env: &Env, code: &String) -> BytesN<32> {
+    let mut code_bytes = alloc::vec![0u8; code.len() as usize];
+    code.copy_into_slice(&mut code_bytes);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &code_bytes))
+        .into()
+}
 
 /// Maximum number of beneficiaries allowed per vault — Issue #872.
 /// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
@@ -627,6 +637,7 @@ pub enum ContractError {
     NoPendingUpgrade = 167,
     UpgradeTimeLocked = 168,
     BatchSizeExceeded = 169,
+    InvalidPauseReason = 170,
 }
 
 #[contract]
@@ -686,6 +697,9 @@ impl TtlVaultContract {
     /// Panics if the caller is not the admin
     pub fn pause(env: Env, reason: Bytes) {
         Self::require_admin(&env);
+        if reason.len() > MAX_PAUSE_REASON_LEN {
+            panic_with_error!(&env, ContractError::InvalidPauseReason);
+        }
         let paused_by = Self::load_admin(&env);
         let record = PauseRecord {
             paused_by: paused_by.clone(),
@@ -907,6 +921,8 @@ impl TtlVaultContract {
         Self::require_admin(&env);
         let key = DataKey::TokenWhitelist(token_address.clone());
         env.storage().persistent().set(&key, &true);
+        env.events()
+            .publish((types::TOKEN_WHITELISTED_TOPIC,), token_address);
         env.storage()
             .persistent()
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
@@ -3825,8 +3841,8 @@ impl TtlVaultContract {
 
     /// Applies TTL decay to a vault if no check-in for 30 days.
     ///
-    /// Anyone can call this function. If the vault hasn't been checked in for 30 days,
-    /// the TTL is reduced by the configured decay rate. This encourages regular engagement.
+    /// Only the vault owner can call this function. If the vault hasn't been checked in
+    /// for 30 days, the TTL is reduced by the configured decay rate.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -3844,6 +3860,7 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
+        vault.owner.require_auth();
 
         let decay_rate = Self::get_ttl_decay_rate(env.clone());
         if decay_rate == 0 {
@@ -10354,6 +10371,7 @@ impl TtlVaultContract {
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault
     /// * `caller` - The vault owner (must authorize)
+    /// * `code_hashes` - SHA-256 hashes of 10 client-generated backup codes
     /// * `old_passkey_hash` - Hash of the old passkey (for verification)
     /// * `new_passkey_hash` - Hash of the new passkey
     ///
@@ -10408,9 +10426,10 @@ impl TtlVaultContract {
 
     // --- Issue #393: Passkey Backup Codes ---
 
-    /// Generates 10 one-time backup codes for a vault.
+    /// Registers 10 one-time backup-code hashes for a vault.
     ///
-    /// Only the vault owner can call this. Codes are generated deterministically from vault_id and timestamp.
+    /// The owner must generate and retain the plaintext codes off-chain and submit only
+    /// their SHA-256 hashes. This keeps the codes out of transaction inputs and results.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -10418,16 +10437,18 @@ impl TtlVaultContract {
     /// * `caller` - The vault owner (must authorize)
     ///
     /// # Returns
-    /// Vector of 10 backup codes
+    /// `Ok(())` when all 10 unique hashes are registered
     ///
     /// # Errors
     /// * `ContractError::NotOwner` - If caller is not the vault owner
     /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    /// * `ContractError::InvalidBackupCode` - If the hashes are not exactly 10 unique values
     pub fn generate_backup_codes(
         env: Env,
         vault_id: u64,
         caller: Address,
-    ) -> Result<Vec<String>, ContractError> {
+        code_hashes: Vec<BytesN<32>>,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
@@ -10436,48 +10457,30 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-
-        let mut codes: Vec<BackupCode> = Vec::new(&env);
-        let mut result: Vec<String> = Vec::new(&env);
-        let timestamp = env.ledger().timestamp();
-
-        for i in 0..10 {
-            // Include the generation timestamp and index so every issued code is
-            // distinct. Replacing the stored vector below then makes the prior
-            // generation unambiguously invalid, even when codes are regenerated
-            // in the same ledger timestamp.
-            let code_number = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
-            // Render "code" followed by the decimal digits of `code_number`
-            // into a fixed buffer (u64 has at most 20 decimal digits).
-            let mut buf = [0u8; 24];
-            buf[..4].copy_from_slice(b"code");
-            let mut len = 4usize;
-            let mut digits = [0u8; 20];
-            let mut digit_count = 0usize;
-            let mut remaining = code_number;
-            loop {
-                digits[digit_count] = b'0' + (remaining % 10) as u8;
-                digit_count += 1;
-                remaining /= 10;
-                if remaining == 0 {
-                    break;
+        if code_hashes.len() != 10 {
+            return Err(ContractError::InvalidBackupCode);
+        }
+        for i in 0..code_hashes.len() {
+            for j in (i + 1)..code_hashes.len() {
+                if code_hashes.get(i) == code_hashes.get(j) {
+                    return Err(ContractError::InvalidBackupCode);
                 }
             }
-            while digit_count > 0 {
-                digit_count -= 1;
-                buf[len] = digits[digit_count];
-                len += 1;
-            }
-            let code_str = String::from_bytes(&env, &buf[..len]);
-            codes.push_back(BackupCode {
-                code: code_str.clone(),
-                used: false,
-            });
-            result.push_back(code_str);
         }
 
-        let key = DataKey::BackupCodes(vault_id);
+        let mut codes: Vec<HashedBackupCode> = Vec::new(&env);
+        for i in 0..code_hashes.len() {
+            codes.push_back(HashedBackupCode {
+                code_hash: code_hashes.get(i).unwrap(),
+                used: false,
+            });
+        }
+
+        let key = DataKey::EncryptedBackupCodes(vault_id);
         env.storage().persistent().set(&key, &codes);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BackupCodes(vault_id));
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage()
             .persistent()
@@ -10487,7 +10490,7 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((BACKUP_CODES_GENERATED_TOPIC, vault_id), 10u32);
-        Ok(result)
+        Ok(())
     }
 
     /// Uses a backup code to extend the vault TTL by 30 days.
@@ -10497,7 +10500,7 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault
-    /// * `code` - The backup code to use
+    /// * `code_hash` - SHA-256 hash of the backup code
     ///
     /// # Returns
     /// `Ok(())` on success, `Err` on failure
@@ -10506,23 +10509,47 @@ impl TtlVaultContract {
     /// * `ContractError::InvalidBackupCode` - If code is invalid or not found
     /// * `ContractError::BackupCodeAlreadyUsed` - If code has already been used
     /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
-    pub fn use_backup_code(env: Env, vault_id: u64, code: String) -> Result<(), ContractError> {
+    pub fn use_backup_code(
+        env: Env,
+        vault_id: u64,
+        code_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
         let mut vault = Self::load_vault(&env, vault_id);
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
 
-        let key = DataKey::BackupCodes(vault_id);
-        let mut codes: Vec<BackupCode> = env
+        let encrypted_key = DataKey::EncryptedBackupCodes(vault_id);
+        let legacy_key = DataKey::BackupCodes(vault_id);
+        let (mut codes, migrate_legacy) = match env
             .storage()
             .persistent()
-            .get(&key)
-            .ok_or(ContractError::InvalidBackupCode)?;
-
+            .get::<DataKey, Vec<HashedBackupCode>>(&encrypted_key)
+        {
+            Some(codes) => (codes, false),
+            None => {
+                let legacy: Vec<BackupCode> = env
+                    .storage()
+                    .persistent()
+                    .get(&legacy_key)
+                    .ok_or(ContractError::InvalidBackupCode)?;
+                let mut hashed_codes = Vec::new(&env);
+                for i in 0..legacy.len() {
+                    if let Some(legacy_code) = legacy.get(i) {
+                        let code_hash = hash_backup_code(&env, &legacy_code.code);
+                        hashed_codes.push_back(HashedBackupCode {
+                            code_hash,
+                            used: legacy_code.used,
+                        });
+                    }
+                }
+                (hashed_codes, true)
+            }
+        };
         let mut found = false;
         for i in 0..codes.len() {
             if let Some(mut backup_code) = codes.get(i) {
-                if backup_code.code == code {
+                if backup_code.code_hash == code_hash {
                     if backup_code.used {
                         return Err(ContractError::BackupCodeAlreadyUsed);
                     }
@@ -10541,16 +10568,21 @@ impl TtlVaultContract {
         // Extend TTL by 30 days
         vault.last_check_in = env.ledger().timestamp();
         Self::save_vault(&env, vault_id, &vault);
-        env.storage().persistent().set(&key, &codes);
+        env.storage()
+            .persistent()
+            .set(&encrypted_key, &codes);
+        if migrate_legacy {
+            env.storage().persistent().remove(&legacy_key);
+        }
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage()
             .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+            .extend_ttl(&encrypted_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
-            .publish((BACKUP_CODE_USED_TOPIC, vault_id), code);
+            .publish((BACKUP_CODE_USED_TOPIC, vault_id), code_hash);
         Ok(())
     }
 

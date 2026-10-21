@@ -40,21 +40,45 @@ fn setup() -> (
     (env, owner, beneficiary, admin, token_address, client)
 }
 
+fn backup_code_hashes(env: &Env, codes: [&str; 10]) -> Vec<BytesN<32>> {
+    let mut hashes = Vec::new(env);
+    for code in codes {
+        hashes.push_back(
+            env.crypto()
+                .sha256(&Bytes::from_slice(env, code.as_bytes()))
+                .into(),
+        );
+    }
+    hashes
+}
+
 // ---- existing tests ----
 
 #[test]
 fn test_regenerating_backup_codes_invalidates_previous_generation() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let first_codes = backup_code_hashes(
+        &env,
+        [
+            "first-0", "first-1", "first-2", "first-3", "first-4", "first-5", "first-6",
+            "first-7", "first-8", "first-9",
+        ],
+    );
+    let second_codes = backup_code_hashes(
+        &env,
+        [
+            "second-0", "second-1", "second-2", "second-3", "second-4", "second-5", "second-6",
+            "second-7", "second-8", "second-9",
+        ],
+    );
 
-    let first_generation = client.generate_backup_codes(&vault_id, &owner);
-    let old_code = first_generation.get(0).unwrap();
+    client.generate_backup_codes(&vault_id, &owner, &first_codes);
+    client.generate_backup_codes(&vault_id, &owner, &second_codes);
 
-    let second_generation = client.generate_backup_codes(&vault_id, &owner);
-    assert_ne!(old_code, second_generation.get(0).unwrap());
-
+    let old_code_hash = first_codes.get(0).unwrap();
     let error = client
-        .try_use_backup_code(&vault_id, &old_code)
+        .try_use_backup_code(&vault_id, &old_code_hash)
         .unwrap_err()
         .unwrap();
     assert_eq!(
@@ -62,10 +86,118 @@ fn test_regenerating_backup_codes_invalidates_previous_generation() {
         soroban_sdk::Error::from_contract_error(ContractError::InvalidBackupCode as u32)
     );
 
-    client.use_backup_code(&vault_id, &second_generation.get(0).unwrap());
+    let current_code_hash = second_codes.get(0).unwrap();
+    client.use_backup_code(&vault_id, &current_code_hash);
+    let error = client
+        .try_use_backup_code(&vault_id, &current_code_hash)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::BackupCodeAlreadyUsed as u32)
+    );
 
     // Keep `env` live for the generated Soroban values in this test.
     let _ = env;
+}
+
+#[test]
+fn test_registered_backup_codes_are_stored_as_hashes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let submitted_codes = backup_code_hashes(
+        &env,
+        [
+            "code-0", "code-1", "code-2", "code-3", "code-4", "code-5", "code-6", "code-7",
+            "code-8", "code-9",
+        ],
+    );
+
+    client.generate_backup_codes(&vault_id, &owner, &submitted_codes);
+    let (stored_codes, legacy_codes_exist) = env.as_contract(&client.address, || {
+        let stored: Vec<HashedBackupCode> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedBackupCodes(vault_id))
+            .unwrap();
+        let legacy_exists = env
+            .storage()
+            .persistent()
+            .has(&DataKey::BackupCodes(vault_id));
+        (stored, legacy_exists)
+    });
+
+    assert_eq!(stored_codes.len(), 10);
+    assert_eq!(
+        stored_codes.get(0).unwrap().code_hash,
+        submitted_codes.get(0).unwrap()
+    );
+    assert!(!legacy_codes_exist);
+}
+
+#[test]
+fn test_backup_code_hash_registration_rejects_duplicates() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let duplicate_codes = backup_code_hashes(&env, ["same-code"; 10]);
+
+    let error = client
+        .try_generate_backup_codes(&vault_id, &owner, &duplicate_codes)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidBackupCode as u32)
+    );
+}
+
+#[test]
+fn test_legacy_backup_codes_migrate_to_hashes_when_used() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    let legacy_code = String::from_str(&env, "legacy-code");
+    let legacy_code_hash = hash_backup_code(&env, &legacy_code);
+    let mut legacy_codes = Vec::new(&env);
+    legacy_codes.push_back(BackupCode {
+        code: legacy_code.clone(),
+        used: false,
+    });
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::BackupCodes(vault_id), &legacy_codes);
+    });
+
+    client.use_backup_code(&vault_id, &legacy_code_hash);
+
+    let (stored_codes, legacy_codes_exist) = env.as_contract(&client.address, || {
+        let stored: Vec<HashedBackupCode> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedBackupCodes(vault_id))
+            .unwrap();
+        let legacy_exists = env
+            .storage()
+            .persistent()
+            .has(&DataKey::BackupCodes(vault_id));
+        (stored, legacy_exists)
+    });
+    assert_eq!(stored_codes.len(), 1);
+    assert_eq!(stored_codes.get(0).unwrap().code_hash, legacy_code_hash);
+    assert!(stored_codes.get(0).unwrap().used);
+    assert!(!legacy_codes_exist);
+}
+
+#[test]
+fn test_apply_ttl_decay_requires_vault_owner_auth() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    assert!(client.try_apply_ttl_decay(&vault_id).is_err());
+
+    env.mock_all_auths();
+    client.apply_ttl_decay(&vault_id).unwrap();
 }
 
 #[test]
@@ -3337,6 +3469,23 @@ fn test_security_token_whitelist_enforcement() {
     // Now vault creation should succeed
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &Some(unauthorized_token.clone()));
     assert!(vault_id > 0);
+}
+
+#[test]
+fn test_whitelist_token_emits_event() {
+    let (env, _, _, _, token_address, client) = setup();
+
+    client.whitelist_token(&token_address);
+
+    let event = env.events().all().iter().find(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val(&env).ok())
+            .map(|topic: soroban_sdk::Symbol| topic == types::TOKEN_WHITELISTED_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(event.is_some(), "token whitelist event not emitted");
 }
 
 #[test]
@@ -6622,6 +6771,18 @@ fn test_accept_admin_emits_completed_event() {
 }
 
 // ---- Issue #814: Pause Reason Tracking ----
+
+#[test]
+fn test_pause_rejects_oversized_reason() {
+    let (env, _, _, _, _, client) = setup();
+    let reason = Bytes::from_array(&env, &[0u8; (MAX_PAUSE_REASON_LEN + 1) as usize]);
+
+    let error = client.try_pause(&reason).unwrap_err();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidPauseReason as u32)
+    );
+}
 
 #[test]
 fn test_pause_stores_pause_record() {
