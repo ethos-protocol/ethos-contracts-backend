@@ -92,7 +92,7 @@ const SOROBAN_CPU_LIMIT: u64 = 100_000_000;
 #[test]
 fn bench_trigger_release_1_beneficiary() {
     let (cpu, mem) = measure_trigger_release(1);
-    println!("trigger_release(n=1 ) → cpu={cpu:>12} mem={mem:>10}");
+    let _ = (cpu, mem);
     assert!(
         cpu < SOROBAN_CPU_LIMIT,
         "n=1: cpu {cpu} exceeds on-chain limit {SOROBAN_CPU_LIMIT}"
@@ -102,7 +102,7 @@ fn bench_trigger_release_1_beneficiary() {
 #[test]
 fn bench_trigger_release_5_beneficiaries() {
     let (cpu, mem) = measure_trigger_release(5);
-    println!("trigger_release(n=5 ) → cpu={cpu:>12} mem={mem:>10}");
+    let _ = (cpu, mem);
     assert!(
         cpu < SOROBAN_CPU_LIMIT,
         "n=5: cpu {cpu} exceeds on-chain limit {SOROBAN_CPU_LIMIT}"
@@ -112,7 +112,7 @@ fn bench_trigger_release_5_beneficiaries() {
 #[test]
 fn bench_trigger_release_10_beneficiaries() {
     let (cpu, mem) = measure_trigger_release(10);
-    println!("trigger_release(n=10) → cpu={cpu:>12} mem={mem:>10}");
+    let _ = (cpu, mem);
     assert!(
         cpu < SOROBAN_CPU_LIMIT,
         "n=10: cpu {cpu} exceeds on-chain limit {SOROBAN_CPU_LIMIT}"
@@ -122,7 +122,7 @@ fn bench_trigger_release_10_beneficiaries() {
 #[test]
 fn bench_trigger_release_20_beneficiaries() {
     let (cpu, mem) = measure_trigger_release(20);
-    println!("trigger_release(n=20) → cpu={cpu:>12} mem={mem:>10}");
+    let _ = (cpu, mem);
     // n=20 is MAX_BENEFICIARIES — must be comfortably under the limit
     assert!(
         cpu < SOROBAN_CPU_LIMIT,
@@ -161,7 +161,7 @@ fn bench_trigger_release_50_beneficiaries() {
 
     let cpu = env.budget().cpu_instruction_cost();
     let mem = env.budget().memory_bytes_cost();
-    println!("trigger_release(n=50) → cpu={cpu:>12} mem={mem:>10}  ← why guard is needed");
+    let _ = (cpu, mem);
     // This test documents cost without asserting a pass/fail on the limit,
     // since n=50 is explicitly blocked by the runtime guard. Its purpose is
     // to show the instruction curve and justify MAX_BENEFICIARIES = 20.

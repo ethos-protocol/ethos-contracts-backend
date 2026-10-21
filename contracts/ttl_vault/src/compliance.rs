@@ -160,7 +160,7 @@ pub struct TransactionRecord {
 
 /// Reporting thresholds. A threshold of `0` disables that check.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThresholdConfig {
     /// Any single transaction at or above this amount is flagged.
     pub single_tx_threshold: i128,

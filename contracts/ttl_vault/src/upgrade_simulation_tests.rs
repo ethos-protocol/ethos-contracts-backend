@@ -2,6 +2,7 @@
 //! this ignored test explicitly with `TTL_VAULT_WASM_PATH` set.
 
 #![cfg(test)]
+extern crate std;
 
 use super::*;
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
