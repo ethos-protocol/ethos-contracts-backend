@@ -87,7 +87,7 @@ use types::{
     BENEFICIARY_CAP_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC,
     BENEFICIARY_REBALANCED_TOPIC, BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC,
     BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC,
-    CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
+    CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     DELEGATE_BENEFICIARY_TOPIC, DELEGATE_CHECKIN_TOPIC, DEPOSIT_TOPIC, DISPUTE_FILED_TOPIC,
     DISPUTE_RESOLVED_TOPIC, DUPLICATE_VAULT_TOPIC, EXPIRY_WARNING_THRESHOLD,
@@ -617,6 +617,7 @@ pub enum ContractError {
     NftNotFound = 161,
     NftMetadataTooLong = 162,
     CannotBuyOwnNft = 163,
+    InvalidToken = 164,
 }
 
 #[contract]
@@ -648,6 +649,12 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidAdmin);
         }
         admin.require_auth();
+        if token::Client::new(&env, &xlm_token)
+            .try_balance(&env.current_contract_address())
+            .is_err()
+        {
+            panic_with_error!(&env, ContractError::InvalidToken);
+        }
         env.storage()
             .instance()
             .set(&DataKey::TokenAddress, &xlm_token);
@@ -1518,8 +1525,10 @@ impl TtlVaultContract {
     ///
     /// # Panics
     /// * Panics if vault has no staking or yield distribution configured
+    /// * Panics if the vault owner has not authorized distribution
     pub fn distribute_yield(env: Env, vault_id: u64) {
         let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
 
         let staking_key = DataKey::TokenStaking(vault_id);
         let staking = env
@@ -1539,9 +1548,11 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
 
-        // Calculate yield: (staked_amount * annual_yield_bps * time_elapsed) / (10000 * 365 * 86400)
+        // Calculate only yield accrued since the last distribution, or staking
+        // activation if that happened more recently.
         let now = env.ledger().timestamp();
-        let time_elapsed = now.saturating_sub(staking.staking_start);
+        let accrual_start = yield_config.last_distribution.max(staking.staking_start);
+        let time_elapsed = now.saturating_sub(accrual_start);
         let yield_amount = (staking.staked_amount as i128)
             .checked_mul(staking.annual_yield_bps as i128)
             .and_then(|v| v.checked_mul(time_elapsed as i128))
@@ -8670,19 +8681,17 @@ impl TtlVaultContract {
 
     // ── Issue: Geographic Check-in Tracking ───────────────────────────────────
 
-    /// Records a check-in with geographic location metadata for security and anomaly detection.
+    /// Legacy API for check-ins that previously accepted geographic metadata.
     ///
-    /// Delegates to the standard `check_in` for all vault validations (owner auth,
-    /// rate limiting, passkey expiry, TTL cap). On success, appends a `GeoCheckInEntry`
-    /// to the vault's persistent geo log and emits a `ci_geo` event.
+    /// Delegates to `check_in` for vault validation. Geographic arguments are
+    /// retained for compatibility but ignored because on-chain storage and
+    /// events are public.
     ///
     /// # Arguments
     /// * `vault_id`        - The vault to check in
     /// * `caller`          - Must be the vault owner
     /// * `passkey_hash`    - Passkey used for this check-in
-    /// * `latitude_micro`  - Latitude in microdegrees (e.g. 37_422_000 = 37.422°)
-    /// * `longitude_micro` - Longitude in microdegrees
-    /// * `country_code`    - ISO 3166-1 alpha-2 country code (e.g. "US")
+    /// * Geographic arguments are ignored and are not stored or emitted.
     ///
     /// # Errors
     /// Same as `check_in`.
@@ -8691,44 +8700,21 @@ impl TtlVaultContract {
         vault_id: u64,
         caller: Address,
         passkey_hash: BytesN<32>,
-        latitude_micro: i64,
-        longitude_micro: i64,
-        country_code: String,
+        _latitude_micro: i64,
+        _longitude_micro: i64,
+        _country_code: String,
     ) -> Result<(), ContractError> {
-        // Delegate to standard check_in for all validations (owner call; nonce unused)
         Self::check_in(env.clone(), vault_id, caller, passkey_hash, 0)?;
-
-        let now = env.ledger().timestamp();
-        let entry = GeoCheckInEntry {
-            latitude_micro,
-            longitude_micro,
-            country_code: country_code.clone(),
-            timestamp: now,
-        };
-
-        let key = DataKey::CheckInGeoLog(vault_id);
-        let mut log: Vec<GeoCheckInEntry> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        log.push_back(entry);
-
-        let vault = Self::load_vault(&env, vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &log);
         env.storage()
             .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-
-        env.events().publish(
-            (CHECKIN_GEO_TOPIC, vault_id),
-            (latitude_micro, longitude_micro, country_code, now),
-        );
+            .remove(&DataKey::CheckInGeoLog(vault_id));
         Ok(())
     }
 
-    /// Returns the full geographic check-in history for a vault.
+    /// Returns any legacy geographic history still present in contract storage.
+    ///
+    /// New check-ins do not store geographic data. Historical ledger state and
+    /// events emitted before this change may remain publicly observable.
     pub fn get_geo_checkin_log(env: Env, vault_id: u64) -> Vec<GeoCheckInEntry> {
         env.storage()
             .persistent()

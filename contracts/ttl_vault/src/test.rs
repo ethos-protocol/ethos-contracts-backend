@@ -89,6 +89,21 @@ fn test_initialize_guard_against_double_init() {
 }
 
 #[test]
+fn test_initialize_rejects_address_without_token_interface() {
+    let (env, _, _, admin, _, client) = setup();
+    let not_a_token = Address::generate(&env);
+
+    let err = client
+        .try_initialize(&not_a_token, &admin)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::InvalidToken as u32)
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #20)")]
 fn test_initialize_rejects_same_xlm_token_and_admin() {
     let env = Env::default();
@@ -6998,7 +7013,7 @@ fn test_check_in_with_geo_basic() {
 }
 
 #[test]
-fn test_check_in_with_geo_records_location() {
+fn test_check_in_with_geo_does_not_store_location() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
     let passkey_hash = BytesN::<32>::random(&env);
@@ -7014,7 +7029,79 @@ fn test_check_in_with_geo_records_location() {
     ).unwrap();
 
     let geo_log = client.get_geo_checkin_log(&vault_id);
-    assert!(geo_log.len() > 0);
+    assert!(geo_log.is_empty());
+
+    let has_geo_event = env.events().all().iter().any(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|value| value.try_into_val::<soroban_sdk::Symbol>(&env).ok())
+            .is_some_and(|topic| topic == symbol_short!("ci_geo"))
+    });
+    assert!(!has_geo_event);
+}
+
+#[test]
+#[should_panic]
+fn test_distribute_yield_requires_owner_authorization() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    env.set_auths(&[]);
+    client.distribute_yield(&vault_id);
+}
+
+#[test]
+fn test_distribute_yield_only_accounts_for_undistributed_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract_address);
+    client.initialize(&token_address, &admin);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    client.enable_token_staking(
+        &vault_id,
+        &owner,
+        &Address::generate(&env),
+        &10_000u32,
+    );
+    client.set_yield_distribution(&vault_id, &YieldDistributionMode::Reinvest);
+
+    env.as_contract(&contract_address, || {
+        let key = DataKey::TokenStaking(vault_id);
+        let mut staking = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenStaking>(&key)
+            .unwrap();
+        staking.staked_amount = 10_000;
+        env.storage().persistent().set(&key, &staking);
+    });
+
+    let year_seconds = 365 * 24 * 60 * 60;
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + year_seconds);
+    client.distribute_yield(&vault_id);
+    let distributed_once = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    client.distribute_yield(&vault_id);
+    let distributed_twice = client
+        .get_yield_distribution(&vault_id)
+        .unwrap()
+        .total_reinvested;
+
+    assert_eq!(distributed_once, 10_000);
+    assert_eq!(distributed_twice, distributed_once);
 }
 
 #[test]
@@ -7232,4 +7319,3 @@ fn test_beneficiary_delegation_chain_order_preserved() {
         assert_eq!(addr, delegates[i]);
     }
 }
-

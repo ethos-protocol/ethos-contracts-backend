@@ -286,7 +286,9 @@ mod contract_wiring_tests {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let xlm_token = Address::generate(&env);
+        let xlm_token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
         let contract_address = env.register_contract(None, TtlVaultContract);
         let client = TtlVaultContractClient::new(&env, &contract_address);
         client.initialize(&xlm_token, &admin);
