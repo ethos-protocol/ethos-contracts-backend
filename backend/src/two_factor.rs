@@ -1,7 +1,5 @@
-// These handlers use axum extractors (State/Path/Json) but are not yet
-// registered on any Router (see main.rs::build_router) or documented in
-// docs/openapi.yaml — 2FA is scaffolded but not a live endpoint today. Kept
-// async so the signatures need no rework once/if they're wired up.
+// These handlers are registered by main.rs::build_router and documented in
+// docs/openapi.yaml.
 #![allow(clippy::unused_async)]
 
 use std::collections::HashMap;

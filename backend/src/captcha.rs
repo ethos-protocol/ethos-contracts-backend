@@ -577,7 +577,7 @@ mod tests {
             audit_store: create_audit_store(),
             share_store: create_share_store(),
             share_token_store: create_share_token_store(),
-            consensus: NodeCache::from_env(),
+            consensus: NodeCache::from_env().expect("valid CONSENSUS_STRATEGY"),
             webhook_state: Arc::new(WebhookState::new()),
             graphql_schema,
             metrics: Metrics::new(),
@@ -596,6 +596,10 @@ mod tests {
             event_sourcing: Arc::new(EventSourcingState::with_db(Arc::clone(&db))),
             message_queue: Arc::new(
                 MessageQueueState::new().expect("failed to initialize message queue"),
+            ),
+            rpc_pool: Arc::new(
+                crate::rpc_pool::RpcPool::new(&crate::rpc_pool::RpcPoolConfig::default())
+                    .expect("failed to build RPC pool"),
             ),
             degradation_state,
             flag_state,

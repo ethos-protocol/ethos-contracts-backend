@@ -870,7 +870,7 @@ fn test_ping_expiry_emits_event_when_near_expiry() {
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     env.ledger().with_mut(|l| l.timestamp += 50);
 
-    let ttl = client.ping_expiry(&vault_id);
+    let ttl = client.ping_expiry(&vault_id).unwrap();
     assert_eq!(ttl, 50u64);
 }
 
@@ -881,7 +881,7 @@ fn test_ping_expiry_no_event_when_far_from_expiry() {
     let vault_id = client.create_vault(&owner, &beneficiary, &200_000u64, &None);
     env.ledger().with_mut(|l| l.timestamp += 0);
 
-    let ttl = client.ping_expiry(&vault_id);
+    let ttl = client.ping_expiry(&vault_id).unwrap();
     assert_eq!(ttl, 200_000u64);
 }
 
@@ -891,15 +891,20 @@ fn test_ping_expiry_returns_zero_when_expired() {
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     env.ledger().with_mut(|l| l.timestamp += 200);
 
-    let ttl = client.ping_expiry(&vault_id);
+    let ttl = client.ping_expiry(&vault_id).unwrap();
     assert_eq!(ttl, 0u64);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_ping_expiry_panics_for_nonexistent_vault() {
+fn test_ping_expiry_returns_error_for_nonexistent_vault() {
     let (_, _, _, _, _, client) = setup();
-    client.ping_expiry(&9999u64);
+    let result = client.try_ping_expiry(&9999u64);
+    assert!(result.is_err());
+    let error = result.unwrap_err().unwrap();
+    assert_eq!(
+        error,
+        soroban_sdk::Error::from_contract_error(ContractError::VaultNotFound as u32)
+    );
 }
 
 #[test]

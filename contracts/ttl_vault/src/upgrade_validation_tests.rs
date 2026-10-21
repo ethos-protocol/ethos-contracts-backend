@@ -106,15 +106,15 @@ fn changing_function_signatures_is_rejected_even_when_export_count_is_unchanged(
     let storage_hash = schema_hash(&env, 1);
     let signature_hash = schema_hash(&env, 2);
     let changed_signature_hash = schema_hash(&env, 3);
-    client.set_upgrade_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
+    client.set_upgrade_manifest_signed(&10u32, &5u32, &storage_hash, &signature_hash);
 
-    client.validate_upgrade_compatibility_with_signatures(
+    client.validate_upgrade_signed(
         &10u32,
         &5u32,
         &storage_hash,
         &signature_hash,
     );
-    let result = client.try_validate_upgrade_compatibility_with_signatures(
+    let result = client.try_validate_upgrade_signed(
         &10u32,
         &5u32,
         &storage_hash,
@@ -130,7 +130,7 @@ fn signature_validation_requires_a_signature_baseline() {
     let signature_hash = schema_hash(&env, 2);
     client.set_upgrade_manifest(&10u32, &5u32, &storage_hash);
 
-    let result = client.try_validate_upgrade_compatibility_with_signatures(
+    let result = client.try_validate_upgrade_signed(
         &10u32,
         &5u32,
         &storage_hash,
@@ -145,10 +145,10 @@ fn signature_aware_upgrade_rejects_changed_signatures() {
     let storage_hash = schema_hash(&env, 1);
     let signature_hash = schema_hash(&env, 2);
     let changed_signature_hash = schema_hash(&env, 3);
-    client.set_upgrade_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
+    client.set_upgrade_manifest_signed(&10u32, &5u32, &storage_hash, &signature_hash);
     let wasm_hash = schema_hash(&env, 4);
 
-    let result = client.try_upgrade_with_manifest_and_signatures(
+    let result = client.try_upgrade_with_signed_manifest(
         &wasm_hash,
         &10u32,
         &5u32,

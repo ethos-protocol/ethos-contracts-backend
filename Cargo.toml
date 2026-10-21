@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["contracts/ttl_vault", "contracts/zk_verifier", "contracts/sbt", "backend"]
+members = [
+    "contracts/ttl_vault",
+    "contracts/zk_verifier",
+    "contracts/sbt",
+    "backend",
+    "contracts/insurance_pool",
+    "crates/metric-retention",
+    "crates/synthetic-monitor",
+    "crates/vault-yield",
+]
 
 [workspace.package]
 license = "MIT"

@@ -1,9 +1,24 @@
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::{db::Db, models::Frequency};
+
+/// Unix seconds of the scheduler's most recent tick; `0` until the first tick.
+/// `/ready` reads this to tell a live scheduler from a dead background task (#698).
+static LAST_TICK_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// Record that the scheduler loop is alive at `now`.
+pub fn record_heartbeat(now: DateTime<Utc>) {
+    LAST_TICK_UNIX.store(now.timestamp(), Ordering::Relaxed);
+}
+
+/// Unix seconds of the last recorded tick, or `0` if the scheduler has never ticked.
+pub fn last_heartbeat() -> i64 {
+    LAST_TICK_UNIX.load(Ordering::Relaxed)
+}
 
 /// Polls preferences every minute and fires reminders for vaults whose TTL
 /// is within the user-configured window.
@@ -23,6 +38,7 @@ pub async fn run(db: Arc<Db>) {
     loop {
         interval.tick().await;
         let now = Utc::now();
+        record_heartbeat(now);
 
         // 1) Existing reminder preferences scheduler.
         match db.all() {

@@ -96,7 +96,18 @@ fn test_state(db: Arc<Db>) -> AppState {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        rpc_pool: test_rpc_pool(),
     }
+}
+
+fn test_rpc_pool() -> Arc<ethos_protocol_backend::rpc_pool::RpcPool> {
+    // No RPC_ENDPOINT configured, so the pool's health check reports healthy.
+    Arc::new(
+        ethos_protocol_backend::rpc_pool::RpcPool::new(
+            &ethos_protocol_backend::rpc_pool::RpcPoolConfig::default(),
+        )
+        .expect("failed to build RPC pool"),
+    )
 }
 
 fn test_app() -> Router {
@@ -141,17 +152,9 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn ready_handler(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "database": "connected",
-        }))),
-        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
+/// GET /ready — 200 when every required subsystem passes, else 503 (#698).
+async fn ready_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    ethos_protocol_backend::readiness::ready_response(&state).await
 }
 
 async fn consensus_health_handler(
@@ -191,6 +194,46 @@ async fn get_req(app: Router, uri: &str) -> axum::response::Response {
     app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn documented_operational_routes_are_mounted() {
+    let app = crate::build_operational_router();
+
+    let response = post_json(
+        app.clone(),
+        "/timeseries/ingest",
+        json!({"series": "test.metric", "value": 42.0}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = post_json(
+        app.clone(),
+        "/timeseries/query",
+        json!({"series": "test.metric"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/jobs",
+        json!({"operation": "custom", "items": ["one"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(get_req(app.clone(), "/jobs").await.status(), StatusCode::OK);
+    assert_eq!(
+        get_req(app.clone(), "/replay/logs").await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn estimate_cost_route_is_mounted() {
+    let response = post_json(test_app(), "/estimate-cost", json!({"operation": "check_in"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -313,6 +356,8 @@ async fn test_health_endpoint() {
 
 #[tokio::test]
 async fn test_ready_endpoint() {
+    // The scheduler loop does not run in tests, so record a tick to mark it live.
+    crate::scheduler::record_heartbeat(chrono::Utc::now());
     let app = test_app();
     let res = get_req(app, "/ready").await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -322,6 +367,18 @@ async fn test_ready_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["database"], "connected");
+    for check in [
+        "database",
+        "consensus_cache",
+        "notification_scheduler",
+        "webhook_queue",
+        "rpc_pool",
+    ] {
+        assert_eq!(json["checks"][check]["status"], "ok", "check {check} failed");
+        assert!(json["checks"][check]["latency_ms"].is_u64());
+    }
+    assert_eq!(json["checks"]["rpc_pool"]["required"], false);
+    assert_eq!(json["checks"]["database"]["required"], true);
 }
 
 // ── #962: Multi-node consensus health check tests ────────────────────────────
@@ -387,6 +444,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
+        rpc_pool: test_rpc_pool(),
     };
     db.migrate().unwrap();
 
