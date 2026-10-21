@@ -1343,3 +1343,61 @@ fn test_verify_credentials_consistent_oversized_batch_panics() {
 
     client.verify_credentials_consistent(&proofs, &claims);
 }
+
+// ── reschedule_consistency_check authorization ────────────────────────────────
+
+/// The attesting oracle (the one recorded in the AttestationRecord) may
+/// reschedule a credential's consistency check.
+#[test]
+fn test_reschedule_consistency_check_attesting_oracle_succeeds() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    // Should not panic.
+    client.reschedule_consistency_check(&oracle, &credential_id);
+}
+
+/// The admin may reschedule a credential's consistency check.
+#[test]
+fn test_reschedule_consistency_check_admin_succeeds() {
+    let (env, admin, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    // Should not panic.
+    client.reschedule_consistency_check(&admin, &credential_id);
+}
+
+/// An unrelated account that is neither the admin nor the attesting oracle
+/// must be rejected with AccessDenied (#21).
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reschedule_consistency_check_unrelated_account_rejected() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let credential_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+
+    let unrelated = Address::generate(&env);
+    client.reschedule_consistency_check(&unrelated, &credential_id);
+}
+
+/// A registered oracle that did NOT attest the credential is also rejected —
+/// only the specific attesting oracle is permitted.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reschedule_consistency_check_different_oracle_rejected() {
+    let (env, _, client) = setup();
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    // oracle_a attests; oracle_b is registered but did not attest.
+    let credential_id = client.attest(&oracle_a, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    client.reschedule_consistency_check(&oracle_b, &credential_id);
+}

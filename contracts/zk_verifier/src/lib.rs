@@ -1287,10 +1287,18 @@ impl ZkVerifierContract {
     ///
     /// Off-chain workers call this after performing the re-verification the
     /// `cons_due` event signalled, which is what makes the check *periodic*
-    /// rather than due-once-and-forever. It has no privileged inputs — it
-    /// only moves a timer forward — so anyone may call it. Panics with
-    /// `CredentialNotFound` if `credential_id` was never attested.
-    pub fn reschedule_consistency_check(env: Env, credential_id: u64) {
+    /// rather than due-once-and-forever.
+    ///
+    /// **Authorization**: `caller` must be either the contract admin or the
+    /// oracle that originally attested the credential (i.e. the oracle
+    /// recorded in the credential's [`AttestationRecord`]). Any other
+    /// address is rejected with [`VerifierError::AccessDenied`]. This
+    /// prevents third parties from arbitrarily moving a credential's check
+    /// window.
+    ///
+    /// Panics with `CredentialNotFound` if `credential_id` was never
+    /// attested.
+    pub fn reschedule_consistency_check(env: Env, caller: Address, credential_id: u64) {
         let Some((proof_hash, claim_hash)) = env
             .storage()
             .instance()
@@ -1307,6 +1315,15 @@ impl ZkVerifierContract {
                 claim_hash.clone(),
             ))
             .unwrap_or_else(|| panic_with_error!(&env, VerifierError::CredentialNotFound));
+
+        // Only the admin or the oracle that attested this credential may
+        // reschedule its consistency check.
+        let is_attesting_oracle = caller == record.oracle;
+        if !Self::is_admin(&env, &caller) && !is_attesting_oracle {
+            panic_with_error!(&env, VerifierError::AccessDenied);
+        }
+        caller.require_auth();
+
         record.next_check_due = env
             .ledger()
             .timestamp()
