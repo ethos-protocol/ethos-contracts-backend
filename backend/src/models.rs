@@ -374,6 +374,60 @@ pub struct ComplianceReport {
     pub current_balance: i128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStatus {
+    Pass,
+    Fail,
+    Warning,
+    NotApplicable,
+}
+
+impl std::fmt::Display for ComplianceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Warning => "warning",
+            Self::NotApplicable => "not_applicable",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceCheck {
+    pub id: String,
+    pub name: String,
+    pub framework: String,
+    pub status: ComplianceStatus,
+    pub description: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompliancePdf {
+    pub format: String,
+    pub content_type: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceAuditReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_checks: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warnings: usize,
+    pub not_applicable: usize,
+    pub checks: Vec<ComplianceCheck>,
+    pub pdf: CompliancePdf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceReportResponse {
+    pub report: ComplianceAuditReport,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FundMovement {
     pub timestamp: DateTime<Utc>,
@@ -1313,70 +1367,3 @@ pub struct IpReputationCheckRequest {
 }
 
 // ── Compliance Audit Report models (#99) ─────────────────────────────────────
-
-/// Pass/fail/warning status for a single compliance check.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ComplianceStatus {
-    Pass,
-    Fail,
-    Warning,
-    NotApplicable,
-}
-
-impl std::fmt::Display for ComplianceStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComplianceStatus::Pass => write!(f, "pass"),
-            ComplianceStatus::Fail => write!(f, "fail"),
-            ComplianceStatus::Warning => write!(f, "warning"),
-            ComplianceStatus::NotApplicable => write!(f, "not_applicable"),
-        }
-    }
-}
-
-/// A single evaluated compliance control.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceCheck {
-    /// Dot-separated identifier, e.g. `"gdpr.data_minimisation"`.
-    pub id: String,
-    /// Human-readable control name.
-    pub name: String,
-    /// Compliance framework this check belongs to (`"GDPR"`, `"SOC2"`,
-    /// `"ISO27001"`).
-    pub framework: String,
-    /// Evaluation result.
-    pub status: ComplianceStatus,
-    /// Explanation of what was checked and what was found.
-    pub description: String,
-    /// Actionable guidance when `status` is `Fail` or `Warning`; empty when
-    /// `Pass` or `NotApplicable`.
-    pub remediation: String,
-}
-
-/// A complete compliance audit report for the current deployment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceAuditReport {
-    /// ISO-8601 timestamp of report generation.
-    pub generated_at: DateTime<Utc>,
-    /// Total number of checks evaluated.
-    pub total_checks: usize,
-    /// Number of checks that passed.
-    pub passed: usize,
-    /// Number of checks that failed.
-    pub failed: usize,
-    /// Number of checks with warnings.
-    pub warnings: usize,
-    /// Number of checks marked not applicable.
-    pub not_applicable: usize,
-    /// Individual check results.
-    pub checks: Vec<ComplianceCheck>,
-    /// Placeholder for a PDF export (see `generate_pdf_stub`).
-    pub pdf_stub: serde_json::Value,
-}
-
-/// Outer wrapper returned by `GET /admin/compliance-report`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceReportResponse {
-    pub report: ComplianceAuditReport,
-}
