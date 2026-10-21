@@ -304,7 +304,7 @@ cp .env.example .env
 docker-compose up -d
 ```
 
-This starts PostgreSQL (port 5432), the backend (port 3000), and a local Stellar Quickstart node (port 8000). See [docs/deployment-guide.md](deployment-guide.md).
+This starts the backend (port 3000), Redis (port 6379), and a local Stellar Quickstart node (port 8000). The backend's SQLite database is stored on a Docker volume. See [docs/deployment-guide.md](deployment-guide.md).
 
 ### Where are network configurations defined?
 
@@ -432,11 +432,11 @@ docker-compose down -v
 docker-compose up -d --build
 ```
 
-Ensure ports 5432, 3000, and 8000 are not already in use.
+Ensure ports 3000, 6379, and 8000 are not already in use.
 
-### PostgreSQL connection refused
+### Backend exits with "DB_PATH is :memory:"
 
-Check that the `DATABASE_URL` in your `.env` matches the Docker Compose configuration. The health check in `docker-compose.yml` ensures the database is ready before the backend starts.
+The backend refuses to run against an in-memory database, because data would be lost on restart. Set `DB_PATH` to a file on a writable, persistent path. Set `ALLOW_EPHEMERAL_DB=true` only if you explicitly accept that data loss (for example, in a throwaway test run).
 
 ### How do I reset local state for a fresh start?
 

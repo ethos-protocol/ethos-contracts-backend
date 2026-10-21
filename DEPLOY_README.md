@@ -331,11 +331,12 @@ SELECT COUNT(*) FROM capability_statuses;
 # Check database connectivity
 curl http://localhost:3000/health
 
-# Check migrations applied
-sqlite3 :memory: "SELECT * FROM schema_migrations WHERE version = '12';"
+# Check migrations applied (DB_PATH is the SQLite file; default
+# /var/lib/ethos-protocol/ethos-protocol.db inside the backend container)
+sqlite3 "$DB_PATH" "SELECT * FROM schema_migrations WHERE version = '12';"
 
-# Restart database service
-docker-compose restart db
+# Restart the backend (the database is a file, so there is no separate service)
+docker-compose restart backend
 ```
 
 ### Issue: Status doesn't persist across restarts
@@ -367,11 +368,12 @@ select version from schema_migrations;
 
 **Resolution:**
 ```bash
-# Verify all instances use same database
-# Check DATABASE_URL environment variable on both
+# Verify all instances point at the same SQLite file
+# Check DB_PATH on both. Instances must share one file (see ADR-0006).
+echo "$DB_PATH"
 
 # Verify database connectivity
-curl $(DATABASE_URL) --ping
+sqlite3 "$DB_PATH" "SELECT 1;"
 
 # Check network access
 ssh instance_b ping database_server
