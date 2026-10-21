@@ -90,6 +90,10 @@ pub struct AppState {
     pub query_cache: Arc<crate::query_cache::QueryCache>,
     /// Distributed-lock deadlock detector stats (#82).
     pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
+    /// Push notification token, schedule, and delivery state.
+    pub notification_service: Arc<crate::notifications::NotificationService>,
+    /// Continuous HTTP request profiling and regression tracking.
+    pub profiler_state: Arc<crate::profiler::ProfilerState>,
     /// Incident tracking: shared by the incident HTTP API and the scheduled
     /// consensus reconciliation job (#373), so a conflict opens the same
     /// kind of record a manually-filed incident would.
@@ -163,6 +167,18 @@ impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::incidents::IncidentState> {
     fn from_ref(state: &AppState) -> Arc<crate::incidents::IncidentState> {
         Arc::clone(&state.incident_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::notifications::NotificationService> {
+    fn from_ref(state: &AppState) -> Arc<crate::notifications::NotificationService> {
+        Arc::clone(&state.notification_service)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
     }
 }
 

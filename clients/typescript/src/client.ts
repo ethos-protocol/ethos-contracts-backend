@@ -57,9 +57,44 @@ export class EthosApiClient {
     return this.request(`${this.baseUrl}/api/notifications/register`, "POST", body, init);
   }
 
+  /** DELETE /api/notifications/register */
+  unregisterDeviceToken(init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/notifications/register`, "DELETE", undefined, init);
+  }
+
+  /** GET /api/notifications/preferences */
+  getNotificationPreferences(init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/notifications/preferences`, "GET", undefined, init);
+  }
+
   /** PUT /api/notifications/preferences */
   updateNotificationPreferences(body?: unknown, init?: RequestInit): Promise<Response> {
     return this.request(`${this.baseUrl}/api/notifications/preferences`, "PUT", body, init);
+  }
+
+  /** GET /api/notifications/delivery */
+  getNotificationDeliveryLog(init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/notifications/delivery`, "GET", undefined, init);
+  }
+
+  /** POST /api/tenants */
+  createTenant(body?: unknown, init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/tenants`, "POST", body, init);
+  }
+
+  /** GET /api/tenants/billing */
+  getTenantBilling(init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/tenants/billing`, "GET", undefined, init);
+  }
+
+  /** GET /api/tenants/{tenant_id}/vaults */
+  getTenantVaults(tenantId: string, init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/tenants/${encodeURIComponent(tenantId)}/vaults`, "GET", undefined, init);
+  }
+
+  /** POST /api/tenants/{tenant_id}/vaults/{vault_id} */
+  addVaultToTenant(tenantId: string, vaultId: string, body?: unknown, init?: RequestInit): Promise<Response> {
+    return this.request(`${this.baseUrl}/api/tenants/${encodeURIComponent(tenantId)}/vaults/${encodeURIComponent(vaultId)}`, "POST", body, init);
   }
 
   /** GET /api/notifications/unsubscribe */
