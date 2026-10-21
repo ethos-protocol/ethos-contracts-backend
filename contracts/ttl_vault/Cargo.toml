@@ -13,6 +13,10 @@ crate-type = ["cdylib"]
 [dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
 
+[features]
+default = []
+experimental-tests = []
+
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 proptest = { version = "1.4", default-features = false, features = ["std"] }

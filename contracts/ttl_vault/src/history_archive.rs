@@ -78,7 +78,7 @@ pub struct ArchivePageDigest {
 
 /// An archived page of history returned by `get_archived_history`.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ArchivedHistoryPage {
     pub vault_id: u64,
     pub page: u32,
