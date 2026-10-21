@@ -139,6 +139,8 @@ pub enum VerifierError {
     /// The batch passed to `verify_credentials_consistent` exceeds
     /// `MAX_CREDENTIAL_BATCH_SIZE`.
     BatchTooLarge = 22,
+    /// The contract is paused.
+    Paused = 23,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -233,6 +235,9 @@ mod keys {
         /// proof_sha256 -> ledger timestamp of the most recent
         /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
         LastVerificationTime(BytesN<32>),
+        /// Global pause flag. When `true`, all state-changing entry
+        /// points revert with `VerifierError::Paused`.
+        Paused,
     }
 
     /// A single entry in a proof's verification audit trail. See
