@@ -202,7 +202,10 @@ pub async fn trigger_purge(
 pub async fn get_deletion_log(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DeletionLogQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<RetentionDeletionLog>>, AppError> {
+    authorize_admin(&headers)?;
+
     let limit = params.limit.unwrap_or(100).min(1000);
     let logs = state
         .db

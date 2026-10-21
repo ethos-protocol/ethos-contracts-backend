@@ -301,17 +301,20 @@ pub struct BatchReplayResponse {
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 
-use crate::error::AppError;
+use crate::{audit::authorize_admin, error::AppError};
 
 /// POST /replay — replay a single logged request (admin endpoint).
 pub async fn replay_handler(
     State(log_store): State<RequestLogStore>,
+    headers: HeaderMap,
     Json(body): Json<ReplayRequest>,
 ) -> Result<(StatusCode, Json<ReplayResult>), AppError> {
+    authorize_admin(&headers)?;
+
     let log = get_log(&log_store, &body.log_id).ok_or(AppError::NotFound)?;
 
     let conditions = body
@@ -326,8 +329,11 @@ pub async fn replay_handler(
 /// POST /replay/batch — replay multiple logged requests at once.
 pub async fn batch_replay_handler(
     State(log_store): State<RequestLogStore>,
+    headers: HeaderMap,
     Json(body): Json<BatchReplayRequest>,
 ) -> Result<(StatusCode, Json<BatchReplayResponse>), AppError> {
+    authorize_admin(&headers)?;
+
     if body.log_ids.is_empty() {
         return Err(AppError::InvalidInput("log_ids must not be empty".into()));
     }
@@ -393,7 +399,10 @@ pub async fn batch_replay_handler(
 pub async fn list_logs_handler(
     State(log_store): State<RequestLogStore>,
     Query(query): Query<ListLogsQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<RequestLog>>, AppError> {
+    authorize_admin(&headers)?;
+
     let limit = query.limit.unwrap_or(50).min(200);
     let logs = list_logs(&log_store, query.path.as_deref(), limit);
     Ok(Json(logs))
@@ -403,7 +412,10 @@ pub async fn list_logs_handler(
 pub async fn get_log_handler(
     State(log_store): State<RequestLogStore>,
     Path(log_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<RequestLog>, AppError> {
+    authorize_admin(&headers)?;
+
     let log = get_log(&log_store, &log_id).ok_or(AppError::NotFound)?;
     Ok(Json(log))
 }

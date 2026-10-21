@@ -572,6 +572,8 @@ mod tests {
             incident_state: Arc::new(crate::incidents::IncidentState::new()),
             consensus: NodeCache::from_env().expect("valid CONSENSUS_STRATEGY"),
             webhook_state: Arc::new(WebhookState::new()),
+            vault_broadcaster: Arc::new(crate::websocket::VaultBroadcaster::new(16)),
+            request_log_store: crate::replay::create_request_log_store(),
             graphql_schema,
             metrics: Metrics::new(),
             priority_enforcer: Arc::new(PriorityEnforcer::new(PriorityConfig::default())),

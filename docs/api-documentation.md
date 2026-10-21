@@ -39,6 +39,7 @@ the backend source.
 13. [WebAuthn / passkeys](#13-webauthn--passkeys)
 14. [Error codes](#14-error-codes)
 15. [Usage patterns](#15-usage-patterns)
+16. [Operator, replay, and WebSocket routes](#16-operator-replay-and-websocket-routes)
 
 ---
 
@@ -100,6 +101,19 @@ OpenAPI method validation (`405`) → load shedding / priority admission
 | GET | `/capabilities/:name/fallback` | [8](#8-capabilities--graceful-degradation) |
 | GET | `/stream/vaults` | [9](#9-streaming) |
 | GET | `/stream/events` | [9](#9-streaming) |
+| GET | `/ws/vaults` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/ws/vaults/:vault_id` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/ws/vaults/:vault_id/heartbeat` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/admin/dlq` | [16](#16-operator-replay-and-websocket-routes) |
+| POST | `/admin/dlq/replay` | [16](#16-operator-replay-and-websocket-routes) |
+| PUT | `/api/retention/policies/:data_type` | [16](#16-operator-replay-and-websocket-routes) |
+| POST | `/api/retention/purge/:data_type` | [16](#16-operator-replay-and-websocket-routes) |
+| POST | `/api/retention/exceptions/:data_type` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/api/retention/deletion-log` | [16](#16-operator-replay-and-websocket-routes) |
+| POST | `/replay` | [16](#16-operator-replay-and-websocket-routes) |
+| POST | `/replay/batch` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/replay/logs` | [16](#16-operator-replay-and-websocket-routes) |
+| GET | `/replay/logs/:log_id` | [16](#16-operator-replay-and-websocket-routes) |
 | POST | `/graphql` | [10](#10-graphql) |
 | GET | `/graphql/playground` | [10](#10-graphql) |
 | POST | `/anomaly/observe` | [11](#11-anomaly-detection) |
@@ -838,3 +852,30 @@ echo "backend healthy"
 
 See [deployment-runbook.md](deployment-runbook.md) for the full post-deploy
 verification sequence.
+
+---
+
+## 16. Operator, replay, and WebSocket routes
+
+The dead-letter queue and request replay endpoints are operator-only. They use
+`Authorization: Bearer $ADMIN_API_KEY` when `ADMIN_API_KEY` is configured.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/dlq` | Inspect failed deliveries; supports `status`, `source`, and `limit` query parameters. |
+| POST | `/admin/dlq/replay` | Replay one entry (`{"id":"…"}`) or all pending entries (`{"replay_all":true}`). |
+| PUT | `/api/retention/policies/:data_type` | Create or update a retention policy. |
+| POST | `/api/retention/purge/:data_type` | Trigger an enabled policy immediately. |
+| POST | `/api/retention/exceptions/:data_type` | Add a record exception to a retention policy. |
+| GET | `/api/retention/deletion-log` | Read the retention deletion audit log; supports `data_type` and `limit`. |
+| POST | `/replay` | Replay one recorded request log. |
+| POST | `/replay/batch` | Replay up to 50 recorded request logs. |
+| GET | `/replay/logs` | List recorded logs; supports `path` and `limit`. |
+| GET | `/replay/logs/:log_id` | Retrieve one recorded request log. |
+
+Vault WebSocket streams require an `Authorization: Bearer <JWT>` header. The
+JWT must be signed with `JWT_SECRET` and include `exp`, `sub`, and a
+`vault_ids` claim. `/ws/vaults` subscribes to all vault IDs in the token;
+`/ws/vaults/:vault_id` and its `/heartbeat` variant require that vault ID to
+be present in the token. The heartbeat variant also enforces WebSocket
+heartbeat and client-message rate limits.
