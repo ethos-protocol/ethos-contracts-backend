@@ -1,11 +1,10 @@
 # Upgrade Safety
 
-`contracts/ttl_vault/src/lib.rs` exposes `upgrade(env, new_wasm_hash)`,
-which lets the admin replace the deployed WASM with arbitrary new code.
-Historically this only checked that the hash was non-zero — it did not
-verify the new code was interface-compatible, storage-compatible, or
-error-code-compatible with the running contract. This document describes
-the compatibility checks that were added and how to use them.
+The hash-only `upgrade(env, new_wasm_hash)` entry point is disabled and
+returns `UpgradeManifestRequired`. All upgrades must use a manifest-aware
+entry point so the candidate is checked against the recorded interface,
+storage, and error-code baseline. This document describes those checks and
+how to use them.
 
 ## What is checked
 
@@ -68,10 +67,10 @@ been recorded.
    This can be simulated read-only before submitting the real upgrade
    transaction, to fail fast without spending an upgrade attempt.
 
-3. **Perform the upgrade** with the same manifest values via:
+3. **Propose the upgrade** with the same manifest values via:
 
    ```
-   upgrade_with_signed_manifest(
+   propose_signed_upgrade(
        new_wasm_hash,
        new_exported_fn_count,
        new_error_code_count,
@@ -80,19 +79,24 @@ been recorded.
    )
    ```
 
-   This validates the hash (`validate_upgrade`), validates compatibility
-   (`validate_upgrade_signed`), performs the WASM swap,
-   and then records the new values as the baseline for the *next* upgrade
-   (incrementing `UpgradeManifest.version`).
+   This validates the hash and compatibility and records the candidate as a
+   pending upgrade. The legacy `propose_legacy_signed_upgrade` entry
+   point does the same for existing clients; neither entry point performs the
+   WASM swap immediately.
+
+4. **Wait 24 hours**, then call `execute_upgrade()`. It revalidates the
+   proposal against the current baseline, performs the WASM swap, and records
+   the candidate values as the baseline for the next upgrade (incrementing
+   `UpgradeManifest.version`). The hash-only `upgrade(new_wasm_hash)` entry
+   point is disabled and cannot bypass the compatibility checks or timelock.
 
 The legacy `set_upgrade_manifest`, `validate_upgrade_compatibility`,
-`upgrade_with_manifest`, and `upgrade(new_wasm_hash)` entry points remain
-available for compatibility with existing tooling. The first three do not
-check exact function signatures; new deployments and operational tooling
-should prefer their `*_with_signatures` counterparts. A successful legacy
-upgrade clears any stored signature fingerprint, so a strict upgrade cannot
-reuse a stale baseline; record it again with
-`set_upgrade_manifest_signed`.
+`upgrade_with_manifest`, and `propose_legacy_signed_upgrade` entry
+points remain available for compatibility with existing tooling. The
+manifest-aware legacy path does not check exact function signatures; new
+deployments and operational tooling should prefer its `*_with_signatures`
+counterpart. Both manifest-aware upgrade variants now only create a proposal;
+`execute_upgrade()` is the only path that installs the new WASM.
 
 ## Automated simulation
 
@@ -117,10 +121,11 @@ when running the ignored `upgrade_simulation_tests` test.
   change the hash. Removing or renaming a variant, however, should.
 - If an admin key is compromised, these checks do not prevent a malicious
   upgrade — an attacker with admin authority can compute a manifest for
-  their own malicious contract and pass it in. Admin key security (e.g.
-  the timelocked admin transfer flow already in this contract) remains the
-  primary control. See `docs/runbook-alerts.md#ethoscontractupgradeinprogress`
-  for the operational response when an unexpected upgrade is observed.
+  their own malicious contract and pass it in. The 24-hour upgrade timelock
+  provides a window to detect and respond to a malicious proposal, but admin
+  key security remains essential. See
+  `docs/runbook-alerts.md#ethoscontractupgradeinprogress` for the operational
+  response when an unexpected upgrade is observed.
 
 ## Tests
 

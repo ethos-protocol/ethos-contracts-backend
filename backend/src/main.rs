@@ -79,6 +79,7 @@ use ethos_protocol_backend::{
     },
     health::health_handler,
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    log_analysis::log_analysis_router,
     message_queue::MessageQueueState,
     metrics::Metrics,
     predictive_scaling::{
@@ -785,12 +786,7 @@ async fn main() {
         .with_state(aml_screener);
 
     // ── Structured log parsing / search routes ───────────────────────────
-    // NOTE: Log parsing/search is pending implementation.
-    // let log_store = LogStore::new();
-    // let log_router = Router::new()
-    //     .route("/logs/ingest", post(ingest_logs))
-    //     .route("/logs/search", get(search_logs))
-    //     .with_state(log_store);
+    let log_router = log_analysis_router();
 
     // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
     // Fail startup on a missing or inconsistent relying-party config (#695).
@@ -924,7 +920,6 @@ async fn main() {
     // Stateless: the posted lines are analysed and discarded. The in-memory
     // LogStore (ingest/search) is still not mounted because it has no size
     // cap and would grow without bound.
-    let log_analysis_router = Router::new().route("/logs/analyze", post(analyze_logs));
 
     // ── Uptime monitoring (#601) ─────────────────────────────────────────
     let uptime_monitor = UptimeMonitor::new();
@@ -950,7 +945,7 @@ async fn main() {
         .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
-        .merge(log_analysis_router)
+        .merge(log_router)
         .merge(webauthn_router)
         .merge(cost_router)
         .merge(dr_router)

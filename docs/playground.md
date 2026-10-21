@@ -251,7 +251,7 @@ stellar contract invoke \
 
 1. The Playground simulates an archived vault state.
 2. Call `get_archived_vault_info(vault_id)` — observe the archived snapshot.
-3. Call `restore_vault(vault_id)` — TTL is re-extended.
+3. Call `restore_vault(vault_id, caller)` as the vault owner or contract admin — TTL is re-extended.
 4. Call `get_vault(vault_id)` — confirm the vault is accessible again.
 
 ---
