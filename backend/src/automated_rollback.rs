@@ -294,6 +294,7 @@ pub fn run_test(test: &PostDeploymentTest, metrics: &DeploymentMetrics) -> TestR
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRollbackPlanRequest {
     pub deployment_id: String,
     pub service: String,
@@ -304,6 +305,7 @@ pub struct CreateRollbackPlanRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunTestsRequest {
     pub metrics: DeploymentMetrics,
 }
@@ -320,6 +322,7 @@ pub struct RunTestsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManualRollbackRequest {
     pub reason_detail: String,
 }

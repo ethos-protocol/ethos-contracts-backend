@@ -6,9 +6,9 @@
  * router in `backend/src/main.rs`. Wired into CI by
  * `.github/workflows/openapi.yml`.
  *
- *   - FAIL: a public `/api/...` route is served by the router but absent from
- *     the spec (clients would have no contract for it).
- *   - WARN: the spec declares a public operation the router does not serve yet
+ *   - FAIL: a route is served by the router but absent from the spec (clients
+ *     would have no contract for it).
+ *   - WARN: the spec declares an operation the router does not serve yet
  *     (spec is ahead of the implementation — tracked, not blocking).
  *
  * Surface check only (path + method), matching the runtime `schema_validation`
@@ -78,6 +78,11 @@ function balancedSlice(src, start) {
 /** Pull `.route("/path", get(..).post(..))` declarations out of Rust source. */
 function parseRouterOperations(src) {
   const ops = new Set();
+  // Ignore routes in disabled/commented-out router blocks.
+  src = src
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
   const head = /\.route\(\s*"([^"]+)"\s*,/g;
   let m;
   while ((m = head.exec(src)) !== null) {
@@ -100,10 +105,8 @@ const router = parseRouterOperations(
 );
 
 const isPublic = (op) => op.split(" ")[1].startsWith("/api/");
-
 const specAhead = [...spec].filter(isPublic).filter((op) => !router.has(op));
 const undocumented = [...router]
-  .filter(isPublic)
   .filter((op) => !spec.has(op) && !LEGACY.includes(op));
 
 if (specAhead.length) {
@@ -120,6 +123,6 @@ if (undocumented.length) {
 
 console.log(
   `OpenAPI surface in sync: ${
-    [...router].filter(isPublic).length
+    [...router].length
   } router operations, 0 undocumented.`,
 );

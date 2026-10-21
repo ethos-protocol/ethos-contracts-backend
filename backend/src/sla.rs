@@ -180,6 +180,7 @@ pub struct SlaReport {
 
 /// Request body for `POST /sla/policies`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSlaPolicyRequest {
     pub name: String,
     #[serde(default)]
@@ -208,6 +209,7 @@ fn default_enabled() -> bool {
 
 /// Request body for `PUT /sla/policies/:id`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSlaPolicyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -221,6 +223,7 @@ pub struct UpdateSlaPolicyRequest {
 
 /// Request body for `POST /sla/records`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordMeasurementRequest {
     pub policy_id: String,
     pub value: f64,
@@ -229,6 +232,7 @@ pub struct RecordMeasurementRequest {
 
 /// Query params for `GET /sla/report`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlaReportQuery {
     /// Only include policies for this service.
     pub service: Option<String>,
@@ -236,6 +240,7 @@ pub struct SlaReportQuery {
 
 /// Query params for `GET /sla/breaches`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlaBreachQuery {
     /// Filter by policy id.
     pub policy_id: Option<String>,

@@ -36,6 +36,7 @@ pub struct MetricPoint {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordMetricRequest {
     pub name: String,
     pub value: f64,
@@ -73,6 +74,7 @@ impl Aggregation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregateQuery {
     #[serde(default = "default_aggregation")]
     pub agg: Aggregation,
@@ -187,6 +189,7 @@ pub struct DashboardShare {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateShareRequest {
     pub dashboard: String,
     #[serde(default)]

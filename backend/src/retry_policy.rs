@@ -68,6 +68,7 @@ fn default_retry_statuses() -> Vec<u16> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRetryPolicyRequest {
     pub name: String,
     pub endpoint_pattern: String,

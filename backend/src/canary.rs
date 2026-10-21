@@ -124,6 +124,7 @@ impl CanaryDeployment {
 
 /// Request body for `POST /deployments/canary`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartCanaryRequest {
     pub service: String,
     pub version: String,
@@ -135,6 +136,7 @@ pub struct StartCanaryRequest {
 
 /// Request body for `POST /deployments/canary/:id/evaluate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateCanaryRequest {
     pub metrics: CanaryMetrics,
     /// Current error rate observed in the baseline (non-canary) cohort, for
@@ -146,6 +148,7 @@ pub struct EvaluateCanaryRequest {
 
 /// Request body for `POST /deployments/canary/:id/rollback`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackCanaryRequest {
     pub reason: String,
 }

@@ -109,6 +109,7 @@ pub struct Incident {
 
 /// Request body for `POST /incidents`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateIncidentRequest {
     pub title: String,
     pub description: String,
@@ -118,6 +119,7 @@ pub struct CreateIncidentRequest {
 
 /// Request body for `POST /incidents/:id/timeline`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddTimelineEntryRequest {
     pub actor: String,
     pub note: String,
@@ -125,6 +127,7 @@ pub struct AddTimelineEntryRequest {
 
 /// Request body for `POST /incidents/:id/status`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateStatusRequest {
     pub status: IncidentStatus,
     pub actor: String,
@@ -132,6 +135,7 @@ pub struct UpdateStatusRequest {
 
 /// Request body for `POST /incidents/:id/escalate`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EscalateIncidentRequest {
     pub reason: String,
     pub actor: String,
@@ -139,6 +143,7 @@ pub struct EscalateIncidentRequest {
 
 /// Request body for `POST /incidents/:id/acknowledge`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcknowledgeIncidentRequest {
     pub actor: String,
 }

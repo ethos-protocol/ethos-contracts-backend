@@ -25,6 +25,7 @@ use crate::{
 };
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemindersQuery {
     pub include_deleted: Option<bool>,
 }
@@ -115,6 +116,7 @@ pub async fn get_preferences(
 // ── Unsubscribe endpoint (#828) ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnsubscribeQuery {
     pub token: String,
 }
@@ -316,6 +318,7 @@ pub async fn get_vault_presence(
 // ── #71: Full-Text Search Endpoint ──────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FullTextSearchParams {
     pub q: String,
     pub limit: Option<u32>,

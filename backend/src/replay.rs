@@ -261,6 +261,7 @@ fn compare_responses(
 // ── HTTP request / response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRequest {
     /// ID of the log entry to replay. Required.
     pub log_id: String,
@@ -271,6 +272,7 @@ pub struct ReplayRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListLogsQuery {
     /// Filter by path prefix.
     pub path: Option<String>,
@@ -279,6 +281,7 @@ pub struct ListLogsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchReplayRequest {
     pub log_ids: Vec<String>,
     pub conditions: Option<Vec<ReplayCondition>>,

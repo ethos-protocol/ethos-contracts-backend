@@ -107,6 +107,7 @@ pub struct OnCallSchedule {
 
 /// Request body for `POST /admin/on-call-schedule`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateOnCallScheduleRequest {
     pub name: String,
     pub participants: Vec<OnCallParticipant>,

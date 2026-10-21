@@ -433,6 +433,7 @@ fn verify_assertion_signature(
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeginRegistrationRequest {
     pub user_id: String,
     pub user_name: String,
@@ -478,6 +479,7 @@ pub struct PubKeyCredParam {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteRegistrationRequest {
     pub session_id: String,
     /// Base64url-encoded credential ID from the authenticator response.
@@ -501,6 +503,7 @@ pub struct CompleteRegistrationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeginAuthenticationRequest {
     pub user_id: String,
 }
@@ -523,6 +526,7 @@ pub struct AllowCredential {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteAuthenticationRequest {
     pub session_id: String,
     pub credential_id: String,
@@ -543,6 +547,7 @@ pub struct CompleteAuthenticationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddBackupAuthenticatorRequest {
     pub user_id: String,
     pub label: Option<String>,

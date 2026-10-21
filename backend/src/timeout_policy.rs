@@ -33,6 +33,7 @@ pub struct TimeoutPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTimeoutPolicyRequest {
     pub endpoint_pattern: String,
     pub timeout_ms: u64,
