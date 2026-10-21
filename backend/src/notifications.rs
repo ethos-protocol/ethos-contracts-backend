@@ -4,6 +4,7 @@
 ///   FcmClient          — sends a single message via FCM HTTP v1 API
 ///   NotificationStore  — in-memory stores (tokens, prefs, schedule, delivery log)
 ///   NotificationService — orchestrates scheduling + delivery
+use crate::clock::{Clock, SystemClock};
 use crate::models::{
     ChannelDeliveryLog, DeliveryAttempt, DeliveryRecord, DeliveryStatus, DeviceToken,
     IdempotencyRecord, NotificationChannel, NotificationPreferences, NotificationType,
@@ -292,6 +293,7 @@ pub struct NotificationService {
     pub unsubscribe_tokens: UnsubscribeStore,
     pub channel_delivery_log: ChannelDeliveryStore,
     pub idempotency: IdempotencyStore,
+    clock: Arc<dyn Clock>,
 }
 
 impl NotificationService {
@@ -301,6 +303,24 @@ impl NotificationService {
         prefs: PrefsStore,
         schedule: ScheduleStore,
         delivery: DeliveryStore,
+    ) -> Self {
+        Self::with_clock(
+            fcm,
+            tokens,
+            prefs,
+            schedule,
+            delivery,
+            Arc::new(SystemClock),
+        )
+    }
+
+    pub fn with_clock(
+        fcm: Arc<FcmClient>,
+        tokens: TokenStore,
+        prefs: PrefsStore,
+        schedule: ScheduleStore,
+        delivery: DeliveryStore,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             fcm,
@@ -312,6 +332,7 @@ impl NotificationService {
             unsubscribe_tokens: create_unsubscribe_store(),
             channel_delivery_log: create_channel_delivery_store(),
             idempotency: create_idempotency_store(),
+            clock,
         }
     }
 
@@ -326,7 +347,7 @@ impl NotificationService {
                 owner: req.owner,
                 token: req.token,
                 platform: req.platform,
-                registered_at: Utc::now(),
+                registered_at: self.clock.now(),
             });
         }
     }
@@ -407,7 +428,8 @@ impl NotificationService {
             return;
         } // already past warning threshold
 
-        let fire_at = Utc::now() + chrono::Duration::seconds((ttl - warning_secs).cast_signed());
+        let fire_at =
+            self.clock.now() + chrono::Duration::seconds((ttl - warning_secs).cast_signed());
 
         // Avoid duplicate schedules for the same vault + type
         let mut store = self.schedule.lock().unwrap();
@@ -463,7 +485,7 @@ impl NotificationService {
             vault_id: vault_id.to_string(),
             owner: owner.to_string(),
             notification_type,
-            scheduled_at: Utc::now(),
+            scheduled_at: self.clock.now(),
             status: DeliveryStatus::Pending,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             sent_at: None,
@@ -482,7 +504,7 @@ impl NotificationService {
         passkey_hash: &str,
         expires_at: i64,
     ) {
-        let now = Utc::now().timestamp();
+        let now = self.clock.now().timestamp();
         let remaining_secs = expires_at - now;
 
         if remaining_secs <= 0 {
@@ -503,7 +525,7 @@ impl NotificationService {
                 vault_id: vault_id.to_string(),
                 owner: owner.to_string(),
                 notification_type: NotificationType::PasskeyExpired,
-                scheduled_at: Utc::now(),
+                scheduled_at: self.clock.now(),
                 status: DeliveryStatus::Pending,
                 max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
                 sent_at: None,
@@ -543,7 +565,7 @@ impl NotificationService {
             vault_id: vault_id.to_string(),
             owner: owner.to_string(),
             notification_type: NotificationType::PasskeyExpiringSoon,
-            scheduled_at: Utc::now(),
+            scheduled_at: self.clock.now(),
             status: DeliveryStatus::Pending,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             sent_at: None,
@@ -562,7 +584,7 @@ impl NotificationService {
     }
 
     pub fn get_pending_notifications(&self) -> Vec<ScheduledNotification> {
-        let now = Utc::now();
+        let now = self.clock.now();
         self.schedule
             .lock()
             .unwrap()
@@ -577,7 +599,7 @@ impl NotificationService {
     /// Returns true if a notification with the same vault_id, owner, and type
     /// was already sent within `DEDUP_WINDOW_SECONDS`.
     pub fn is_duplicate(&self, notif: &ScheduledNotification) -> bool {
-        let cutoff = Utc::now() - chrono::Duration::seconds(DEDUP_WINDOW_SECONDS);
+        let cutoff = self.clock.now() - chrono::Duration::seconds(DEDUP_WINDOW_SECONDS);
         let store = self.schedule.lock().unwrap();
         store.iter().any(|n| {
             n.id != notif.id
@@ -611,7 +633,7 @@ impl NotificationService {
 
     /// Retry any Retrying notifications whose next_retry_at has passed.
     pub async fn flush_retries(&self) {
-        let now = Utc::now();
+        let now = self.clock.now();
         let due: Vec<ReminderDeliveryLog> = self
             .retry_log
             .lock()
@@ -687,7 +709,8 @@ impl NotificationService {
             let max_attempts = notif.max_retry_attempts;
             if next_attempt < max_attempts && (next_attempt as usize) < RETRY_DELAYS_SECS.len() {
                 let delay = RETRY_DELAYS_SECS[next_attempt as usize];
-                let next_at = Utc::now() + chrono::Duration::seconds(delay.cast_signed());
+                let next_at =
+                    self.clock.now() + chrono::Duration::seconds(delay.cast_signed());
                 self.record(notif, DeliveryStatus::Retrying, &last_err);
                 self.mark_sent(&notif.id, DeliveryStatus::Retrying);
                 self.update_retry_log_with_next(
@@ -744,7 +767,7 @@ impl NotificationService {
             });
         entry.attempts.push(DeliveryAttempt {
             attempt,
-            attempted_at: Utc::now(),
+            attempted_at: self.clock.now(),
             error: error.to_string(),
         });
         entry.status = status;
@@ -769,7 +792,7 @@ impl NotificationService {
             owner: notif.owner.clone(),
             notification_type: notif.notification_type.clone(),
             status,
-            sent_at: Utc::now(),
+            sent_at: self.clock.now(),
             provider_response: response.to_string(),
         });
     }
@@ -778,7 +801,7 @@ impl NotificationService {
         let mut store = self.schedule.lock().unwrap();
         if let Some(n) = store.iter_mut().find(|n| n.id == id) {
             if status == DeliveryStatus::Sent {
-                n.sent_at = Some(Utc::now());
+                n.sent_at = Some(self.clock.now());
             }
             n.status = status;
         }
@@ -804,7 +827,7 @@ impl NotificationService {
             UnsubscribeToken {
                 token: token.clone(),
                 owner: owner.to_string(),
-                created_at: Utc::now(),
+                created_at: self.clock.now(),
             },
         );
         token
@@ -883,7 +906,7 @@ impl NotificationService {
                 notification_id: notification_id.to_string(),
                 channel: channel.clone(),
                 status,
-                attempted_at: Utc::now(),
+                attempted_at: self.clock.now(),
                 error,
             });
     }
@@ -1010,7 +1033,9 @@ impl NotificationService {
     pub fn check_idempotency(&self, key: &str) -> Option<IdempotencyRecord> {
         let store = self.idempotency.lock().unwrap();
         let record = store.get(key)?;
-        let age = Utc::now()
+        let age = self
+            .clock
+            .now()
             .signed_duration_since(record.created_at)
             .num_seconds();
         if age > IDEMPOTENCY_TTL_SECS {
@@ -1027,14 +1052,14 @@ impl NotificationService {
                 key,
                 response_body,
                 status_code,
-                created_at: Utc::now(),
+                created_at: self.clock.now(),
             },
         );
     }
 
     /// Purge expired idempotency keys (older than 24h).
     pub fn purge_expired_idempotency_keys(&self) {
-        let cutoff = Utc::now() - chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS);
+        let cutoff = self.clock.now() - chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS);
         self.idempotency
             .lock()
             .unwrap()
@@ -1061,18 +1086,27 @@ pub fn start_scheduler(service: Arc<NotificationService>, interval_secs: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
     use crate::models::{NotificationType, VaultStatus};
-    use chrono::Utc;
+
+    fn test_now() -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
 
     fn make_service() -> NotificationService {
         // Use a dummy FcmClient — tests that call deliver() are skipped
+        make_service_with_clock(Arc::new(ManualClock::new(test_now())))
+    }
+
+    fn make_service_with_clock(clock: Arc<dyn Clock>) -> NotificationService {
         let fcm = Arc::new(FcmClient::new("test-key".into(), "test-project".into()));
-        NotificationService::new(
+        NotificationService::with_clock(
             fcm,
             create_token_store(),
             create_prefs_store(),
             create_schedule_store(),
             create_delivery_store(),
+            clock,
         )
     }
 
@@ -1083,8 +1117,8 @@ mod tests {
             beneficiary: "ben1".into(),
             balance: 1_000_000,
             check_in_interval: 86_400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
+            last_check_in: test_now(),
+            created_at: test_now(),
             status: VaultStatus::Active,
             ttl_remaining: ttl,
         }
@@ -1281,7 +1315,7 @@ mod tests {
             owner: "owner1".into(),
             notification_type: NotificationType::CheckInReminder,
             status: DeliveryStatus::Sent,
-            sent_at: Utc::now(),
+            sent_at: test_now(),
             provider_response: "msg/123".into(),
         });
         svc.delivery.lock().unwrap().push(DeliveryRecord {
@@ -1290,7 +1324,7 @@ mod tests {
             owner: "owner2".into(),
             notification_type: NotificationType::VaultReleased,
             status: DeliveryStatus::Sent,
-            sent_at: Utc::now(),
+            sent_at: test_now(),
             provider_response: "msg/456".into(),
         });
         assert_eq!(svc.get_delivery_log("owner1").len(), 1);
@@ -1352,7 +1386,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_schedules_expiring_soon_within_threshold() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         // 1 hour remaining, well under the default 24h warning threshold.
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 3_600);
 
@@ -1368,7 +1402,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_does_not_schedule_when_far_from_expiry() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         // 48 hours remaining, well beyond the default 24h warning threshold.
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 48 * 3_600);
 
@@ -1378,7 +1412,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_schedules_expired_when_already_past() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now - 10);
 
         let pending = svc.get_pending_notifications();
@@ -1393,7 +1427,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_no_duplicate_when_pending() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 3_600);
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 3_600);
 
@@ -1403,7 +1437,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_distinguishes_different_passkeys() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 3_600);
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash2", now + 3_600);
 
@@ -1422,7 +1456,7 @@ mod tests {
             },
         );
 
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now + 3_600);
 
         assert!(svc.get_pending_notifications().is_empty());
@@ -1443,7 +1477,7 @@ mod tests {
             },
         );
 
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.schedule_passkey_expiry_check("v1", "owner1", "hash1", now - 10);
 
         let pending = svc.get_pending_notifications();
@@ -1457,7 +1491,7 @@ mod tests {
     #[test]
     fn check_passkey_expiry_schedules_for_every_passkey() {
         let svc = make_service();
-        let now = Utc::now().timestamp();
+        let now = test_now().timestamp();
         svc.check_passkey_expiry(
             "v1",
             "owner1",
@@ -1577,6 +1611,20 @@ mod tests {
         let all = svc.schedule.lock().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn idempotency_expiry_uses_injected_clock() {
+        let clock = Arc::new(ManualClock::new(test_now()));
+        let svc = make_service_with_clock(clock.clone());
+        svc.store_idempotency("key".into(), 200, "ok".into());
+
+        assert!(svc.check_idempotency("key").is_some());
+        clock.advance(chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS + 1));
+        assert!(svc.check_idempotency("key").is_none());
+
+        svc.purge_expired_idempotency_keys();
+        assert!(svc.idempotency.lock().unwrap().is_empty());
     }
 
     // ── Payload sanitization tests (Issue #401) ───────────────────────────────
@@ -1725,4 +1773,3 @@ mod tests {
         assert_eq!(data["vault_id"], "safe-vault-42");
     }
 }
-

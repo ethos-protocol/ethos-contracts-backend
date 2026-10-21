@@ -197,6 +197,46 @@ async fn get_req(app: Router, uri: &str) -> axum::response::Response {
 }
 
 #[tokio::test]
+async fn documented_operational_routes_are_mounted() {
+    let app = crate::build_operational_router();
+
+    let response = post_json(
+        app.clone(),
+        "/timeseries/ingest",
+        json!({"series": "test.metric", "value": 42.0}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = post_json(
+        app.clone(),
+        "/timeseries/query",
+        json!({"series": "test.metric"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/jobs",
+        json!({"operation": "custom", "items": ["one"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(get_req(app.clone(), "/jobs").await.status(), StatusCode::OK);
+    assert_eq!(
+        get_req(app.clone(), "/replay/logs").await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn estimate_cost_route_is_mounted() {
+    let response = post_json(test_app(), "/estimate-cost", json!({"operation": "check_in"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_set_and_get_preferences() {
     let app = test_app();
     let body = json!({

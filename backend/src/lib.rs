@@ -22,6 +22,7 @@ pub mod canary;
 pub mod cdc_lag;
 pub mod chaos;
 pub mod circuit_breaker;
+pub mod clock;
 pub mod consensus;
 pub mod consistency;
 pub mod contract_version_check;
