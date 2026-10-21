@@ -148,7 +148,7 @@ pub async fn request_dr_action(
     let token = Uuid::new_v4().to_string();
     let expires_at = Utc::now() + Duration::minutes(CONFIRMATION_TTL_MINUTES);
 
-    state.pending.lock().unwrap().insert(
+    state.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(
         token.clone(),
         PendingAction {
             step: body.step,
@@ -175,7 +175,7 @@ pub async fn confirm_dr_action(
     State(state): State<Arc<DrAutomationState>>,
     Path(token): Path<String>,
 ) -> Result<Json<DrActionResult>, (StatusCode, String)> {
-    let pending = state.pending.lock().unwrap().remove(&token);
+    let pending = state.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
 
     let pending = match pending {
         Some(p) if p.expires_at > Utc::now() => p,
@@ -905,7 +905,7 @@ mod tests {
         let state = Arc::new(DrAutomationState::new());
         // Manually insert an already-expired pending action
         let token = "expired-token".to_string();
-        state.pending.lock().unwrap().insert(
+        state.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(
             token.clone(),
             PendingAction {
                 step: DrStep::PauseContract,

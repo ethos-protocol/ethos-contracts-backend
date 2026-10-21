@@ -73,7 +73,7 @@ impl FailureTracker {
 
     /// Record a new failure event.
     pub fn record(&self, description: impl Into<String>) {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events.lock().unwrap_or_else(|p| p.into_inner());
         if events.len() == self.capacity {
             events.pop_front();
         }
@@ -82,17 +82,17 @@ impl FailureTracker {
 
     /// Return a snapshot of all recorded events.
     pub fn events(&self) -> Vec<CacheFailureEvent> {
-        self.events.lock().unwrap().iter().cloned().collect()
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect()
     }
 
     /// Number of failures currently stored.
     pub fn failure_count(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Remove all recorded events.
     pub fn clear(&self) {
-        self.events.lock().unwrap().clear();
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 }
 
@@ -144,7 +144,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     /// Simulate a cache backend becoming unavailable.  Sets the internal store
     /// to `None` and marks health as degraded.
     pub fn simulate_backend_failure(&self, reason: impl Into<String>) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         *store = None;
         drop(store);
         self.record_failure(reason);
@@ -157,7 +157,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     /// If the cache backend is unavailable, the failure is recorded and the
     /// write is silently dropped (best-effort).
     pub fn set(&self, key: &str, value: V) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         match store.as_mut() {
             Some(map) => {
                 map.insert(key.to_string(), value);
@@ -187,7 +187,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     {
         // Try cache first.
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             match store.as_mut() {
                 Some(map) => {
                     if let Some(v) = map.get(key) {
@@ -212,7 +212,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
 
         // Write-back if available.
         if let Some(ref v) = value {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(map) = store.as_mut() {
                 map.insert(key.to_string(), v.clone());
             }
@@ -223,7 +223,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
 
     /// Remove a key from the cache.
     pub fn remove(&self, key: &str) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(map) = store.as_mut() {
             map.remove(key);
         }
@@ -252,7 +252,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     {
         // Ensure the store is alive before rebuilding.
         {
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             if store.is_none() {
                 *store = Some(std::collections::HashMap::new());
             }
@@ -261,7 +261,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
         let mut loaded = 0;
         for &key in keys {
             if let Some(value) = source_fn(key)? {
-                let mut store = self.store.lock().unwrap();
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(map) = store.as_mut() {
                     map.insert(key.to_string(), value);
                     loaded += 1;
@@ -280,7 +280,7 @@ impl<V: Clone + Send + 'static> FaultTolerantCache<V> {
     pub fn entry_count(&self) -> usize {
         self.store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|m| m.len())
             .unwrap_or(0)

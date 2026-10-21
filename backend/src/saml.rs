@@ -309,7 +309,7 @@ pub fn validate_assertion(
     // Unsolicited (IdP-initiated) assertions carry no InResponseTo; SP-initiated
     // ones must match a request this SP actually issued.
     if let Some(request_id) = &assertion.in_response_to {
-        let mut pending = security.pending_requests.lock().unwrap();
+        let mut pending = security.pending_requests.lock().unwrap_or_else(|p| p.into_inner());
         if !pending.remove(request_id) {
             return Err(SamlError::UnknownRequest(Some(request_id.clone())));
         }
@@ -320,7 +320,7 @@ pub fn validate_assertion(
     // assertions that could plausibly still be replayed.
     let guard_expiry = assertion.not_on_or_after.unwrap_or(now) + skew;
 
-    let mut consumed = security.consumed_assertions.lock().unwrap();
+    let mut consumed = security.consumed_assertions.lock().unwrap_or_else(|p| p.into_inner());
     consumed.retain(|_, expiry| *expiry > now);
     if consumed.contains_key(&assertion.id) {
         return Err(SamlError::Replayed(assertion.id.clone()));
@@ -422,7 +422,7 @@ pub fn build_authn_request(state: &SamlState, request_id: &str) -> String {
         .security
         .pending_requests
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(request_id.to_string());
 
     format!(
@@ -472,7 +472,7 @@ pub async fn assertion_consumer_service(
     match outcome {
         Ok(user) => {
             tracing::info!(subject = %user.subject, "SAML assertion accepted");
-            state.sessions.lock().unwrap().push(user.clone());
+            state.sessions.lock().unwrap_or_else(|p| p.into_inner()).push(user.clone());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -660,7 +660,7 @@ mod tests {
         security
             .pending_requests
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(request_id.to_string());
         security
     }
@@ -821,7 +821,7 @@ mod tests {
         security
             .pending_requests
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert("_req-1".to_string());
         assert!(matches!(
             validate_assertion(&assertion, &config(), &security, now()),
@@ -840,7 +840,7 @@ mod tests {
         security
             .consumed_assertions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(assertion.id.clone(), now() - Duration::seconds(1));
         assert_eq!(
             validate_assertion(&assertion, &config(), &security, now()),
@@ -849,7 +849,7 @@ mod tests {
         assert!(security
             .consumed_assertions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .contains_key(&assertion.id));
     }
 
@@ -924,7 +924,7 @@ mod tests {
             .security
             .pending_requests
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .contains("_req-42"));
     }
 

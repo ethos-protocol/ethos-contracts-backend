@@ -328,7 +328,7 @@ impl RateLimiter {
     ) -> Result<QuotaStatus, RateLimitError> {
         let quota_key = format!("{user_id}:{endpoint}");
 
-        let mut quotas = self.quotas.lock().unwrap();
+        let mut quotas = self.quotas.lock().unwrap_or_else(|p| p.into_inner());
         let entry = quotas
             .entry(quota_key)
             .or_insert_with(|| QuotaEntry::new(limit.window));
@@ -369,7 +369,7 @@ impl RateLimiter {
         let limit = self.resolve_limit(endpoint, tier)?;
         let quota_key = format!("{user_id}:{endpoint}");
 
-        let mut quotas = self.quotas.lock().unwrap();
+        let mut quotas = self.quotas.lock().unwrap_or_else(|p| p.into_inner());
         match quotas.get_mut(&quota_key) {
             Some(entry) => {
                 entry.maybe_reset(limit.window);
@@ -388,17 +388,17 @@ impl RateLimiter {
     /// testing or administrative override.
     pub fn reset_quota(&self, user_id: &str, endpoint: &str) {
         let quota_key = format!("{user_id}:{endpoint}");
-        self.quotas.lock().unwrap().remove(&quota_key);
+        self.quotas.lock().unwrap_or_else(|p| p.into_inner()).remove(&quota_key);
     }
 
     /// Reset all quota state (all users, all endpoints).
     pub fn reset_all(&self) {
-        self.quotas.lock().unwrap().clear();
+        self.quotas.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Return the number of active quota entries.
     pub fn active_quota_count(&self) -> usize {
-        self.quotas.lock().unwrap().len()
+        self.quotas.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

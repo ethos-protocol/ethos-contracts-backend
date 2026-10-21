@@ -65,7 +65,7 @@ impl FraudDetector {
     /// Get a fraud score for a transaction (0.0-1.0).
     /// This simulates a trained ML model by computing features and scoring.
     pub fn get_fraud_score(&self, transaction: &Transaction) -> FraudScore {
-        let state = self.state.read().expect("fraud detector lock poisoned");
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
 
         if state.training_samples == 0 {
             return 0.25;
@@ -100,30 +100,30 @@ impl FraudDetector {
     /// Check if a transaction exceeds the fraud threshold.
     pub fn is_fraud(&self, transaction: &Transaction) -> bool {
         let score = self.get_fraud_score(transaction);
-        let state = self.state.read().expect("fraud detector lock poisoned");
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
         score > state.threshold
     }
 
     /// Train the model on historical data (simulated).
     pub fn train_on_history(&self, sample_count: u64) {
-        let mut state = self.state.write().expect("fraud detector lock poisoned");
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         state.training_samples = sample_count;
     }
 
     /// Set the fraud classification threshold (0.0-1.0).
     pub fn set_threshold(&self, threshold: FraudScore) {
-        let mut state = self.state.write().expect("fraud detector lock poisoned");
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         state.threshold = threshold.max(0.0).min(1.0);
     }
 
     /// Get the current fraud threshold.
     pub fn get_threshold(&self) -> FraudScore {
-        self.state.read().expect("fraud detector lock poisoned").threshold
+        self.state.read().unwrap_or_else(|p| p.into_inner()).threshold
     }
 
     /// Get model training status (number of samples seen).
     pub fn training_samples(&self) -> u64 {
-        self.state.read().expect("fraud detector lock poisoned").training_samples
+        self.state.read().unwrap_or_else(|p| p.into_inner()).training_samples
     }
 }
 

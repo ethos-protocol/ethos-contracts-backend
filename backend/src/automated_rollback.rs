@@ -367,7 +367,7 @@ pub async fn create_rollback_plan(
         plan.tests.len()
     ));
 
-    let mut guard = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let store = &mut *guard;
     store.plans.insert(plan.id.clone(), plan.clone());
 
@@ -378,7 +378,7 @@ pub async fn create_rollback_plan(
 pub async fn list_rollback_plans(
     State(state): State<Arc<RollbackState>>,
 ) -> Json<Vec<RollbackPlan>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut plans: Vec<RollbackPlan> = store.plans.values().cloned().collect();
     plans.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Json(plans)
@@ -389,7 +389,7 @@ pub async fn get_rollback_plan(
     State(state): State<Arc<RollbackState>>,
     Path(id): Path<String>,
 ) -> Result<Json<RollbackPlan>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.plans.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -400,7 +400,7 @@ pub async fn run_post_deployment_tests(
     Path(id): Path<String>,
     Json(body): Json<RunTestsRequest>,
 ) -> Result<Json<RunTestsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let mut guard = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let store = &mut *guard;
     let plan = store
         .plans
@@ -521,7 +521,7 @@ pub async fn trigger_rollback(
     Path(id): Path<String>,
     Json(body): Json<ManualRollbackRequest>,
 ) -> Result<Json<RollbackPlan>, StatusCode> {
-    let mut guard = state.store.lock().unwrap();
+    let mut guard = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let store = &mut *guard;
     let plan = store.plans.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
@@ -560,7 +560,7 @@ pub async fn trigger_rollback(
 pub async fn list_rollback_history(
     State(state): State<Arc<RollbackState>>,
 ) -> Json<Vec<RollbackRecord>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut history = store.history.clone();
     history.sort_by(|a, b| b.rolled_back_at.cmp(&a.rolled_back_at));
     Json(history)

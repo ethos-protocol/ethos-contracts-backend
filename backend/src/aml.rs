@@ -197,7 +197,7 @@ impl AmlScreener {
         if let Some(flag) = self
             .flags
             .read()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(&address)
         {
             return Ok(AmlScreeningResult {
@@ -227,7 +227,7 @@ impl AmlScreener {
         let cached = self
             .cache
             .read()
-            .expect("aml cache lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(&address)
             .filter(|c| c.fetched_at.elapsed() < self.config.cache_ttl)
             .map(|c| c.identifications.clone());
@@ -235,7 +235,7 @@ impl AmlScreener {
             Some(ids) => (ids, AmlSource::Cache),
             None => match self.query_chainalysis(api_key, &address).await {
                 Ok(ids) => {
-                    self.cache.write().expect("aml cache lock poisoned").insert(
+                    self.cache.write().unwrap_or_else(|p| p.into_inner()).insert(
                         address.clone(),
                         CachedScreening {
                             identifications: ids.clone(),
@@ -327,7 +327,7 @@ impl AmlScreener {
         );
         self.flags
             .write()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .insert(address, flag.clone());
         Ok(flag)
     }
@@ -337,7 +337,7 @@ impl AmlScreener {
         let removed = self
             .flags
             .write()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .remove(&address)
             .is_some();
         if removed {
@@ -349,7 +349,7 @@ impl AmlScreener {
     pub fn flags(&self) -> Vec<AmlFlag> {
         self.flags
             .read()
-            .expect("aml flag lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .cloned()
             .collect()

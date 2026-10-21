@@ -90,7 +90,7 @@ impl AclStore {
             created_by: req.actor.clone(),
         };
 
-        let mut inner = self.inner.write().expect("acl lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.rules.push(rule.clone());
         inner.audit_log.push(AclAuditEntry {
             id: Uuid::new_v4().to_string(),
@@ -107,7 +107,7 @@ impl AclStore {
     }
 
     pub fn remove_rule(&self, rule_id: &str, actor: Option<String>) -> bool {
-        let mut inner = self.inner.write().expect("acl lock poisoned");
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let before = inner.rules.len();
         inner.rules.retain(|r| r.id != rule_id);
         let removed = inner.rules.len() != before;
@@ -125,13 +125,13 @@ impl AclStore {
     }
 
     pub fn list_rules(&self) -> Vec<AclRule> {
-        self.inner.read().expect("acl lock poisoned").rules.clone()
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).rules.clone()
     }
 
     pub fn audit_trail(&self) -> Vec<AclAuditEntry> {
         self.inner
             .read()
-            .expect("acl lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .audit_log
             .clone()
     }
@@ -144,7 +144,7 @@ impl AclStore {
     /// previous (static, permissive) behavior for anything not explicitly
     /// governed.
     pub fn is_allowed(&self, subject: &str, resource: &str, action: &str) -> bool {
-        let inner = self.inner.read().expect("acl lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let matches = |rule: &&AclRule| {
             (rule.subject == "*" || rule.subject == subject)
                 && (rule.resource == "*" || resource.starts_with(rule.resource.as_str()))

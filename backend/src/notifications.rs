@@ -1095,7 +1095,7 @@ mod tests {
     fn poisoned_store_lock_is_recovered() {
         let tokens = create_token_store();
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = tokens.lock().unwrap();
+            let _guard = tokens.lock().unwrap_or_else(|p| p.into_inner());
             panic!("poison notification token store");
         }));
         assert!(poison_result.is_err());
@@ -1226,7 +1226,7 @@ mod tests {
         let svc = make_service();
         let vault = make_vault(Some(172_800)); // 48h TTL, warning at 24h → fires in 24h
 
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             vault.owner.clone(),
             crate::models::NotificationPreferences {
                 owner: vault.owner.clone(),
@@ -1247,7 +1247,7 @@ mod tests {
         // Not due yet (fires in 24h), so pending list is empty
         assert!(pending.is_empty());
         // But it IS in the schedule store
-        let all = svc.schedule.lock().unwrap();
+        let all = svc.schedule.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].notification_type, NotificationType::ExpiryWarning);
         assert_eq!(all[0].status, DeliveryStatus::Pending);
@@ -1258,7 +1258,7 @@ mod tests {
         let svc = make_service();
         let vault = make_vault(Some(172_800));
 
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             vault.owner.clone(),
             crate::models::NotificationPreferences {
                 owner: vault.owner.clone(),
@@ -1275,7 +1275,7 @@ mod tests {
 
         svc.schedule_expiry_warning(&vault);
 
-        assert!(svc.schedule.lock().unwrap().is_empty());
+        assert!(svc.schedule.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
     }
 
     #[test]
@@ -1284,13 +1284,13 @@ mod tests {
         let vault = make_vault(Some(172_800));
         svc.schedule_expiry_warning(&vault);
         svc.schedule_expiry_warning(&vault); // second call should be ignored
-        assert_eq!(svc.schedule.lock().unwrap().len(), 1);
+        assert_eq!(svc.schedule.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
     }
 
     #[test]
     fn schedule_immediate_creates_due_notification() {
         let svc = make_service();
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "owner1".to_string(),
             crate::models::NotificationPreferences {
                 owner: "owner1".to_string(),
@@ -1317,7 +1317,7 @@ mod tests {
     #[test]
     fn schedule_immediate_skips_when_disabled() {
         let svc = make_service();
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "owner1".to_string(),
             crate::models::NotificationPreferences {
                 owner: "owner1".to_string(),
@@ -1333,7 +1333,7 @@ mod tests {
         );
         svc.schedule_immediate("v1", "owner1", NotificationType::VaultReleased);
 
-        assert!(svc.schedule.lock().unwrap().is_empty());
+        assert!(svc.schedule.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
     }
 
     // Delivery tracking
@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn delivery_log_filters_by_owner() {
         let svc = make_service();
-        svc.delivery.lock().unwrap().push(DeliveryRecord {
+        svc.delivery.lock().unwrap_or_else(|p| p.into_inner()).push(DeliveryRecord {
             notification_id: "n1".into(),
             vault_id: "v1".into(),
             owner: "owner1".into(),
@@ -1362,7 +1362,7 @@ mod tests {
             sent_at: test_now(),
             provider_response: "msg/123".into(),
         });
-        svc.delivery.lock().unwrap().push(DeliveryRecord {
+        svc.delivery.lock().unwrap_or_else(|p| p.into_inner()).push(DeliveryRecord {
             notification_id: "n2".into(),
             vault_id: "v2".into(),
             owner: "owner2".into(),
@@ -1491,7 +1491,7 @@ mod tests {
     #[test]
     fn schedule_passkey_expiry_check_skips_when_expiry_warning_disabled() {
         let svc = make_service();
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "owner1".to_string(),
             crate::models::NotificationPreferences {
                 owner: "owner1".to_string(),
@@ -1512,7 +1512,7 @@ mod tests {
         // owner disabled expiry warnings — this is a past-tense fact, not a
         // configurable early warning.
         let svc = make_service();
-        svc.prefs.lock().unwrap().insert(
+        svc.prefs.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "owner1".to_string(),
             crate::models::NotificationPreferences {
                 owner: "owner1".to_string(),
@@ -1631,7 +1631,7 @@ mod tests {
     fn scheduled_notification_has_max_retry_attempts() {
         let svc = make_service();
         svc.schedule_immediate("v1", "owner1", NotificationType::CheckInReminder);
-        let all = svc.schedule.lock().unwrap();
+        let all = svc.schedule.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
     }
 
@@ -1652,7 +1652,7 @@ mod tests {
         let svc = make_service();
         let vault = make_vault(Some(172_800));
         svc.schedule_expiry_warning(&vault);
-        let all = svc.schedule.lock().unwrap();
+        let all = svc.schedule.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
     }
@@ -1668,7 +1668,7 @@ mod tests {
         assert!(svc.check_idempotency("key").is_none());
 
         svc.purge_expired_idempotency_keys();
-        assert!(svc.idempotency.lock().unwrap().is_empty());
+        assert!(svc.idempotency.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
     }
 
     // ── Payload sanitization tests (Issue #401) ───────────────────────────────

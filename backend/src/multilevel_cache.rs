@@ -793,7 +793,7 @@ mod tests {
     fn poisoned_cache_lock_is_recovered() {
         let cache = MultiLevelCache::new();
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = cache.l1.lock().unwrap();
+            let _guard = cache.l1.lock().unwrap_or_else(|p| p.into_inner());
             panic!("poison L1 cache lock");
         }));
         assert!(poison_result.is_err());
@@ -933,8 +933,8 @@ mod tests {
         vault_l2.balance = 2000;
 
         // Manually inject mismatched values into L1 and L2
-        cache.l1.lock().unwrap().set_vault("v1", vault_l1, Duration::from_secs(60));
-        cache.l2.lock().unwrap().set_vault("v1", vault_l2, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_l1, Duration::from_secs(60));
+        cache.l2.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_l2, Duration::from_secs(60));
 
         let report = cache.verify_consistency();
         assert_eq!(report.drift_count, 1);
@@ -952,9 +952,9 @@ mod tests {
         let vault2 = make_vault("v2");
 
         // v1 in L1 only
-        cache.l1.lock().unwrap().set_vault("v1", vault1, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault1, Duration::from_secs(60));
         // v2 in L2 only
-        cache.l2.lock().unwrap().set_vault("v2", vault2, Duration::from_secs(60));
+        cache.l2.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v2", vault2, Duration::from_secs(60));
 
         let report = cache.verify_consistency();
         assert_eq!(report.drift_count, 2);
@@ -971,7 +971,7 @@ mod tests {
         let cache = MultiLevelCache::new();
         let mut vault_stale = make_vault("v1");
         vault_stale.balance = 500;
-        cache.l1.lock().unwrap().set_vault("v1", vault_stale, Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", vault_stale, Duration::from_secs(60));
 
         // Source of truth has the authoritative state (balance 5000)
         let true_vault = {
@@ -993,8 +993,8 @@ mod tests {
         assert!(report.details[0].healed);
 
         // Verify both L1 and L2 now reflect authoritative source of truth
-        let l1_val = cache.l1.lock().unwrap().peek_vault("v1").unwrap();
-        let l2_val = cache.l2.lock().unwrap().peek_vault("v1").unwrap();
+        let l1_val = cache.l1.lock().unwrap_or_else(|p| p.into_inner()).peek_vault("v1").unwrap();
+        let l2_val = cache.l2.lock().unwrap_or_else(|p| p.into_inner()).peek_vault("v1").unwrap();
         assert_eq!(l1_val.balance, 5000);
         assert_eq!(l2_val.balance, 5000);
 
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn test_auto_heal_clears_deleted_vault_from_cache() {
         let cache = MultiLevelCache::new();
-        cache.l1.lock().unwrap().set_vault("v-deleted", make_vault("v-deleted"), Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v-deleted", make_vault("v-deleted"), Duration::from_secs(60));
 
         // Source of truth returns None (record was deleted in DB)
         let report = cache.verify_and_heal_consistency(|_| None);
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(metrics_initial.total_drifts_healed, 0);
 
         // Inject drift and run healing
-        cache.l1.lock().unwrap().set_vault("v1", make_vault("v1"), Duration::from_secs(60));
+        cache.l1.lock().unwrap_or_else(|p| p.into_inner()).set_vault("v1", make_vault("v1"), Duration::from_secs(60));
         let true_v = make_vault("v1");
         cache.verify_and_heal_consistency(|_| Some(true_v.clone()));
 

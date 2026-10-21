@@ -53,7 +53,7 @@ fn sample_vault(id: &str) -> Vault {
 /// allowed to trigger the fetch that produced it.
 #[test]
 fn test_auth_failure_does_not_populate_cache() {
-    let _lock = env_guard().lock().unwrap();
+    let _lock = env_guard().lock().unwrap_or_else(|p| p.into_inner());
     std::env::set_var("ADMIN_API_KEY", "expected-secret");
 
     let store = create_vault_store();
@@ -61,7 +61,7 @@ fn test_auth_failure_does_not_populate_cache() {
     let vault_id = "vault-auth-cache";
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(vault_id.to_string(), sample_vault(vault_id));
 
     // Simulated protected handler: only touch the cache if auth passes.
@@ -117,7 +117,7 @@ fn test_rate_limiter_enforces_budget_independent_of_auth_outcome() {
 /// distinguish legitimate access from rejected attempts after the fact.
 #[test]
 fn test_audit_log_distinguishes_authorized_and_unauthorized_attempts() {
-    let _lock = env_guard().lock().unwrap();
+    let _lock = env_guard().lock().unwrap_or_else(|p| p.into_inner());
     std::env::set_var("ADMIN_API_KEY", "expected-secret");
 
     let db = Arc::new(Db::open(":memory:").unwrap());
@@ -172,7 +172,7 @@ fn test_cache_ttl_and_rate_limiter_window_are_independent() {
     let vault_id = "vault-cache-ratelimit";
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(vault_id.to_string(), sample_vault(vault_id));
 
     let mut limiter = MessageRateLimiter::new();
@@ -212,7 +212,7 @@ fn test_cache_invalidation_on_state_change_is_reflected_and_audited() {
     let vault_id = "vault-cache-audit";
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(vault_id.to_string(), sample_vault(vault_id));
 
     // Warm the cache.
@@ -222,7 +222,7 @@ fn test_cache_invalidation_on_state_change_is_reflected_and_audited() {
 
     // Mutate the underlying store (simulating e.g. a release) and invalidate.
     {
-        let mut guard = store.lock().unwrap();
+        let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
         let vault = guard.get_mut(vault_id).unwrap();
         vault.status = VaultStatus::Released;
     }

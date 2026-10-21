@@ -277,7 +277,7 @@ impl CircuitBreaker {
                 let elapsed = self
                     .opened_at
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .map(|at| at.elapsed() >= self.config.open_duration)
                     .unwrap_or(true);
                 if elapsed {
@@ -298,7 +298,7 @@ impl CircuitBreaker {
                 let elapsed = self
                     .opened_at
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .map(|at| at.elapsed() >= self.config.open_duration)
                     .unwrap_or(true);
                 if elapsed {
@@ -376,13 +376,19 @@ impl CircuitBreaker {
         self.state_transitions_total.fetch_add(1, Ordering::Relaxed);
 
         if to == CircuitState::Open {
-            *self.opened_at.lock().unwrap() = Some(Instant::now());
-            *self.opened_at_wall.lock().unwrap() = Some(Utc::now());
+            *self.opened_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            *self
+                .opened_at_wall
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Utc::now());
             self.half_open_active.store(0, Ordering::Release);
         }
         if to == CircuitState::Closed {
-            *self.opened_at.lock().unwrap() = None;
-            *self.opened_at_wall.lock().unwrap() = None;
+            *self.opened_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *self
+                .opened_at_wall
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             self.consecutive_failures.store(0, Ordering::Relaxed);
             self.half_open_active.store(0, Ordering::Release);
         }
@@ -395,7 +401,7 @@ impl CircuitBreaker {
             reason: reason.to_string(),
         };
 
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.events.lock().unwrap_or_else(|p| p.into_inner());
         events.push(event);
         if events.len() > MAX_EVENT_HISTORY {
             let overflow = events.len() - MAX_EVENT_HISTORY;
@@ -405,7 +411,10 @@ impl CircuitBreaker {
 
     /// Recent state-change events, oldest first.
     pub fn events(&self) -> Vec<StateChangeEvent> {
-        self.events.lock().unwrap().clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn snapshot(&self) -> CircuitBreakerSnapshot {
@@ -419,7 +428,10 @@ impl CircuitBreaker {
             failures_total: self.failures_total.load(Ordering::Relaxed),
             successes_total: self.successes_total.load(Ordering::Relaxed),
             state_transitions_total: self.state_transitions_total.load(Ordering::Relaxed),
-            opened_at: *self.opened_at_wall.lock().unwrap(),
+            opened_at: *self
+                .opened_at_wall
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
         }
     }
 
@@ -540,7 +552,7 @@ impl CircuitBreaker {
             let open_secs = self
                 .opened_at
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .map(|at| at.elapsed().as_secs())
                 .unwrap_or(0);
             let severity = if open_secs > self.config.open_duration.as_secs() * 4 {
@@ -588,10 +600,15 @@ impl CircuitBreakerRegistry {
     }
 
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerConfig) -> Arc<CircuitBreaker> {
-        if let Some(existing) = self.breakers.read().unwrap().get(name) {
+        if let Some(existing) = self
+            .breakers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+        {
             return Arc::clone(existing);
         }
-        let mut breakers = self.breakers.write().unwrap();
+        let mut breakers = self.breakers.write().unwrap_or_else(|p| p.into_inner());
         Arc::clone(
             breakers
                 .entry(name.to_string())
@@ -602,7 +619,7 @@ impl CircuitBreakerRegistry {
     pub fn snapshots(&self) -> Vec<CircuitBreakerSnapshot> {
         self.breakers
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .map(|b| b.snapshot())
             .collect()
@@ -611,7 +628,7 @@ impl CircuitBreakerRegistry {
     pub fn render_metrics(&self) -> String {
         self.breakers
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .map(|b| b.render_metrics())
             .collect::<Vec<_>>()
@@ -621,7 +638,7 @@ impl CircuitBreakerRegistry {
     pub fn check_alerts(&self) -> Vec<CircuitAlert> {
         self.breakers
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .flat_map(|b| b.check_alerts())
             .collect()
@@ -631,6 +648,28 @@ impl CircuitBreakerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn circuit_breaker_recovers_poisoned_event_lock() {
+        let cb = CircuitBreaker::new(
+            "test",
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            },
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cb.events.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison circuit breaker event lock");
+        }));
+
+        assert!(matches!(
+            cb.call(err_call),
+            Err(CircuitBreakerError::Operation("boom"))
+        ));
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.events().len(), 1);
+    }
 
     fn ok_call() -> Result<(), &'static str> {
         Ok(())

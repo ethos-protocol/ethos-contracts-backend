@@ -181,7 +181,7 @@ pub fn raise_alert(
     message: &str,
 ) -> Option<AlertRecord> {
     let contacts = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         store
             .get(schedule_id)
             .and_then(|schedule| schedule.escalation_policy.levels.first())
@@ -319,7 +319,7 @@ pub async fn create_on_call_schedule(
         created_at: Utc::now(),
     };
 
-    state.store.lock().unwrap().insert(id, schedule.clone());
+    state.store.lock().unwrap_or_else(|p| p.into_inner()).insert(id, schedule.clone());
     Ok((StatusCode::CREATED, Json(schedule)))
 }
 

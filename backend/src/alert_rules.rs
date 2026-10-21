@@ -533,7 +533,7 @@ pub async fn create_alert_rule(
         created_at: Utc::now(),
     };
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.rules.insert(rule.id.clone(), rule.clone());
 
     Ok((StatusCode::CREATED, Json(rule)))
@@ -543,7 +543,7 @@ pub async fn create_alert_rule(
 pub async fn list_alert_rules(
     State(state): State<Arc<AlertRulesState>>,
 ) -> Json<Vec<AlertRule>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut rules: Vec<AlertRule> = store.rules.values().cloned().collect();
     rules.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Json(rules)
@@ -554,7 +554,7 @@ pub async fn get_alert_rule(
     State(state): State<Arc<AlertRulesState>>,
     Path(id): Path<String>,
 ) -> Result<Json<AlertRule>, StatusCode> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     store.rules.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -563,7 +563,7 @@ pub async fn delete_alert_rule(
     State(state): State<Arc<AlertRulesState>>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     if store.rules.remove(&id).is_some() {
         StatusCode::NO_CONTENT
     } else {
@@ -591,7 +591,7 @@ pub async fn evaluate_alerts(
     State(state): State<Arc<AlertRulesState>>,
     Json(body): Json<EvaluateAlertsRequest>,
 ) -> Json<EvaluateAlertsResponse> {
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
 
     let rules: Vec<AlertRule> = store.rules.values().cloned().collect();
     let evaluated_rules = rules.len();
@@ -616,7 +616,7 @@ pub async fn evaluate_alerts(
 pub async fn list_fired_alerts(
     State(state): State<Arc<AlertRulesState>>,
 ) -> Json<Vec<FiredAlert>> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let mut alerts = store.fired.clone();
     alerts.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
     Json(alerts)
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn default_state_seeds_eight_rules() {
         let state = AlertRulesState::new();
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(store.rules.len(), 8);
     }
 

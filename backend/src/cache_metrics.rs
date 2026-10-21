@@ -34,7 +34,7 @@ impl EvictionWindow {
     }
 
     fn record(&self) {
-        let mut ts = self.timestamps.lock().unwrap();
+        let mut ts = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         if ts.len() == self.capacity {
             ts.pop_front();
         }
@@ -43,7 +43,7 @@ impl EvictionWindow {
 
     /// Count evictions that occurred within the last `window` duration.
     fn count_within(&self, window: Duration) -> usize {
-        let ts = self.timestamps.lock().unwrap();
+        let ts = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         let cutoff = Instant::now()
             .checked_sub(window)
             .unwrap_or_else(|| Instant::now());
@@ -51,7 +51,7 @@ impl EvictionWindow {
     }
 
     fn total(&self) -> usize {
-        self.timestamps.lock().unwrap().len()
+        self.timestamps.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

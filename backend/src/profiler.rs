@@ -130,7 +130,7 @@ impl ProfilerState {
     /// operation it was profiling (`operation_ms`), and auto-throttle the
     /// sample rate if the accumulated overhead exceeds the threshold.
     fn note_overhead(&self, overhead_ms: f64, operation_ms: f64) {
-        let mut tracker = self.overhead.lock().unwrap();
+        let mut tracker = self.overhead.lock().unwrap_or_else(|p| p.into_inner());
         tracker.overhead_ms_sum += overhead_ms;
         tracker.operation_ms_sum += operation_ms;
 
@@ -152,7 +152,7 @@ impl ProfilerState {
     /// Current profiler recording overhead as a percentage of total profiled
     /// operation time, for exposure as a metric.
     pub fn current_overhead_pct(&self) -> f64 {
-        let tracker = self.overhead.lock().unwrap();
+        let tracker = self.overhead.lock().unwrap_or_else(|p| p.into_inner());
         if tracker.operation_ms_sum <= 0.0 {
             return 0.0;
         }
@@ -162,7 +162,7 @@ impl ProfilerState {
     /// Record a completed profiling sample, evicting the oldest sample if
     /// the ring buffer is full.
     pub fn record(&self, sample: ProfileSample) {
-        let mut samples = self.samples.lock().unwrap();
+        let mut samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
         if samples.len() >= MAX_SAMPLES {
             samples.remove(0);
         }
@@ -170,12 +170,12 @@ impl ProfilerState {
     }
 
     pub fn snapshot(&self) -> Vec<ProfileSample> {
-        self.samples.lock().unwrap().clone()
+        self.samples.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Compute the mean duration per operation across all retained samples.
     pub fn averages(&self) -> HashMap<String, f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
         let mut sums: HashMap<String, (f64, usize)> = HashMap::new();
         for s in samples.iter() {
             let entry = sums.entry(s.operation.clone()).or_insert((0.0, 0));
@@ -190,22 +190,22 @@ impl ProfilerState {
     /// Snapshot current per-operation averages as the new baseline.
     pub fn set_baseline_from_current(&self) -> HashMap<String, f64> {
         let averages = self.averages();
-        let mut baseline = self.baseline.lock().unwrap();
+        let mut baseline = self.baseline.lock().unwrap_or_else(|p| p.into_inner());
         *baseline = averages.clone();
         averages
     }
 
     pub fn baseline_snapshot(&self) -> HashMap<String, f64> {
-        self.baseline.lock().unwrap().clone()
+        self.baseline.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Compare current averages against the recorded baseline and return
     /// operations whose average duration regressed by more than
     /// `threshold_pct` percent.
     pub fn detect_regressions(&self, threshold_pct: f64) -> Vec<RegressionFinding> {
-        let baseline = self.baseline.lock().unwrap().clone();
+        let baseline = self.baseline.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let current = self.averages();
-        let samples = self.samples.lock().unwrap();
+        let samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut findings = Vec::new();
         for (operation, baseline_avg) in baseline.iter() {
@@ -235,7 +235,7 @@ impl ProfilerState {
     /// total accumulated milliseconds spent in that exact stack, rounded
     /// to the nearest integer (flamegraph tools treat this as weight).
     pub fn flamegraph_folded(&self) -> String {
-        let samples = self.samples.lock().unwrap();
+        let samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
         let mut folded: HashMap<String, f64> = HashMap::new();
         for s in samples.iter() {
             let key = s.stack.join(";");

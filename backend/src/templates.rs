@@ -62,7 +62,7 @@ pub fn create_vault_from_template(
 
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(vault.id.clone(), vault.clone());
     Ok(vault)
 }

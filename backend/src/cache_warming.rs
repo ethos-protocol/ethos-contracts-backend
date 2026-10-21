@@ -213,20 +213,20 @@ impl CacheWarmer {
 
     /// Record an access to a vault for pattern analysis.
     pub fn record_access(&self, vault_id: &str) {
-        let mut patterns = self.patterns.lock().unwrap();
+        let mut patterns = self.patterns.lock().unwrap_or_else(|p| p.into_inner());
         let pattern = patterns
             .entry(vault_id.to_string())
             .or_insert_with(VaultAccessPattern::new);
 
         pattern.record_access(Instant::now());
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         stats.total_accesses += 1;
     }
 
     /// Analyze patterns and return list of vault IDs that should be prefetched.
     pub fn predict_prefetch_targets(&self) -> Vec<String> {
-        let patterns = self.patterns.lock().unwrap();
+        let patterns = self.patterns.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
         let mut candidates: Vec<(String, f64)> = patterns
@@ -313,11 +313,11 @@ impl CacheWarmer {
         }
 
         let fetched = {
-            let store = vault_store.lock().unwrap();
+            let store = vault_store.lock().unwrap_or_else(|p| p.into_inner());
             store.get(vault_id).cloned()
         };
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         stats.total_prefetches += 1;
 
         if let Some(vault) = fetched {
@@ -325,7 +325,7 @@ impl CacheWarmer {
             cache.set_vault(vault_id, vault.clone());
             cache.set_ttl_remaining(vault_id, vault.ttl_remaining);
 
-            self.stats.lock().unwrap().successful_prefetches += 1;
+            self.stats.lock().unwrap_or_else(|p| p.into_inner()).successful_prefetches += 1;
             PrefetchOutcome::Warmed(vault_id.to_string())
         } else {
             stats.failed_prefetches += 1;
@@ -362,8 +362,8 @@ impl CacheWarmer {
 
     /// Get current prediction accuracy statistics.
     pub fn get_stats(&self) -> WarmerStats {
-        let stats = self.stats.lock().unwrap();
-        let patterns = self.patterns.lock().unwrap();
+        let stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
+        let patterns = self.patterns.lock().unwrap_or_else(|p| p.into_inner());
 
         let avg_confidence = if !patterns.is_empty() {
             patterns
@@ -386,10 +386,10 @@ impl CacheWarmer {
 
     /// Reset all tracking data (useful for testing).
     pub fn reset(&self) {
-        let mut patterns = self.patterns.lock().unwrap();
+        let mut patterns = self.patterns.lock().unwrap_or_else(|p| p.into_inner());
         patterns.clear();
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         *stats = WarmerStats::default();
     }
 }
@@ -504,7 +504,7 @@ mod tests {
 
         // Manually add to patterns to trigger prediction.
         {
-            let mut patterns = warmer.patterns.lock().unwrap();
+            let mut patterns = warmer.patterns.lock().unwrap_or_else(|p| p.into_inner());
             let mut pattern = VaultAccessPattern::new();
             let now = Instant::now();
             for i in 0..5 {

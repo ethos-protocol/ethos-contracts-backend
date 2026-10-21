@@ -1088,7 +1088,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, DeliveryOutcome::Poisoned { attempts: 1 });
 
-        let store = dlq_store.lock().unwrap();
+        let store = dlq_store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(store.len(), 1);
         let entry = store.values().next().unwrap();
         assert_eq!(entry.error, "downstream 500");

@@ -290,7 +290,7 @@ pub async fn get_ip_reputation_handler(
         return Err(AppError::InvalidInput("ip query parameter is required".into()));
     }
 
-    let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
+    let config = IP_REPUTATION_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let mut score = check_ip_reputation(&ip, &config).await;
 
     // When there's no authoritative upstream check (subsystem disabled, or no
@@ -298,7 +298,7 @@ pub async fn get_ip_reputation_handler(
     // flat 0.0 on every lookup — otherwise an IP locally penalized by #392
     // would never stay flagged between admin lookups. See #393.
     if score.source == "disabled" || score.source == "stub" {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = store.get_mut(&ip) {
             let now = Utc::now();
             let decayed = apply_score_decay(existing, &config, now);
@@ -317,13 +317,13 @@ pub async fn get_ip_reputation_handler(
 
     // Annotate with current block status.
     {
-        let rules = IP_BLOCK_RULES.lock().unwrap();
+        let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
         score.is_blocked |= is_ip_blocked(&ip, &rules);
     }
 
     // Cache the refreshed score.
     {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         store.insert(ip.clone(), score.clone());
     }
 
@@ -369,13 +369,13 @@ pub async fn post_block_ip_handler(
     };
 
     {
-        let mut rules = IP_BLOCK_RULES.lock().unwrap();
+        let mut rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
         rules.push(rule.clone());
     }
 
     // Invalidate cached score for the exact IP so it reflects the new block.
     {
-        let mut store = IP_REPUTATION_STORE.lock().unwrap();
+        let mut store = IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = store.get_mut(&rule.ip_pattern) {
             entry.is_blocked = true;
         }
@@ -393,7 +393,7 @@ pub async fn get_block_rules_handler(
 ) -> Result<Json<Vec<IpBlockRule>>, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let rules = IP_BLOCK_RULES.lock().unwrap().clone();
+    let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner()).clone();
     Ok(Json(rules))
 }
 
@@ -407,7 +407,7 @@ pub async fn delete_block_rule_handler(
 ) -> Result<StatusCode, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let mut rules = IP_BLOCK_RULES.lock().unwrap();
+    let mut rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
     let original_len = rules.len();
     rules.retain(|r| r.id != id);
 
@@ -427,7 +427,7 @@ pub async fn get_reputation_config_handler(
 ) -> Result<Json<IpReputationConfig>, AppError> {
     authorize_admin(&headers).map_err(|_| AppError::InvalidInput("unauthorized".into()))?;
 
-    let config = IP_REPUTATION_CONFIG.lock().unwrap().clone();
+    let config = IP_REPUTATION_CONFIG.lock().unwrap_or_else(|p| p.into_inner()).clone();
     Ok(Json(config))
 }
 
@@ -457,7 +457,7 @@ pub async fn post_check_handler(
 
     // Check against local block rules first (fast path).
     let is_blocked = {
-        let rules = IP_BLOCK_RULES.lock().unwrap();
+        let rules = IP_BLOCK_RULES.lock().unwrap_or_else(|p| p.into_inner());
         is_ip_blocked(&ip, &rules)
     };
 
@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn local_penalty_raises_and_caches_score() {
         let ip = "192.0.2.55";
-        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
 
         let first = apply_local_penalty(ip, 15.0, "test failure burst");
         assert!((first.score - 15.0).abs() < f64::EPSILON);
@@ -686,6 +686,6 @@ mod tests {
         assert!(second.score >= first.score);
         assert!(second.score <= 100.0);
 
-        IP_REPUTATION_STORE.lock().unwrap().remove(ip);
+        IP_REPUTATION_STORE.lock().unwrap_or_else(|p| p.into_inner()).remove(ip);
     }
 }

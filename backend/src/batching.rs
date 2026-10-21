@@ -149,7 +149,7 @@ impl AdaptiveBatcher {
             .fetch_add(items as u64, Ordering::Relaxed);
 
         let average = {
-            let mut window = self.latencies.lock().unwrap();
+            let mut window = self.latencies.lock().unwrap_or_else(|p| p.into_inner());
             window.push(elapsed);
             window.average().unwrap_or(elapsed)
         };
@@ -194,7 +194,7 @@ impl AdaptiveBatcher {
         let average_latency_ms = self
             .latencies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .average()
             .map(|d| d.as_millis());
         BatchingMetrics {

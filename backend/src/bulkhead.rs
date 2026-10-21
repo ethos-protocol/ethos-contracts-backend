@@ -130,7 +130,7 @@ impl BulkheadRegistry {
 
     /// Registers (or replaces) an explicit configuration for `endpoint`.
     pub fn configure(&self, endpoint: &str, config: BulkheadConfig) {
-        let mut guard = self.bulkheads.lock().unwrap();
+        let mut guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(endpoint.to_string(), Bulkhead::new(config));
     }
 
@@ -151,7 +151,7 @@ impl BulkheadRegistry {
         let endpoint = Self::key_for_path(path);
 
         let (semaphore, metrics, max_queue_size) = {
-            let mut guard = self.bulkheads.lock().unwrap();
+            let mut guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
             let bulkhead = guard
                 .entry(endpoint.clone())
                 .or_insert_with(|| Bulkhead::new(self.default_config.clone()));
@@ -197,7 +197,7 @@ impl BulkheadRegistry {
     }
 
     pub fn metrics_snapshot(&self) -> Vec<BulkheadMetricsSnapshot> {
-        let guard = self.bulkheads.lock().unwrap();
+        let guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
         let mut snapshots: Vec<_> = guard
             .iter()
             .map(|(endpoint, b)| BulkheadMetricsSnapshot {

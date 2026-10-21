@@ -10,7 +10,7 @@ pub fn search_vaults_handler(store: &VaultStore, query: SearchQuery) -> SearchRe
 }
 
 pub fn compare_vaults_handler(store: &VaultStore, vault_ids: Vec<String>) -> ComparisonResult {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let comparison_vaults: Vec<Vault> = vault_ids
         .iter()
         .filter_map(|id| vaults.get(id).cloned())
@@ -28,7 +28,7 @@ pub fn export_vaults_handler(
     vault_id: &str,
     format: &str,
 ) -> Result<String, String> {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let vault = vaults
         .get(vault_id)
         .cloned()
@@ -104,7 +104,7 @@ pub fn generate_compliance_report(
     event_store: &EventStore,
     vault_id: &str,
 ) -> Result<ComplianceReport, String> {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let vault = vaults
         .get(vault_id)
         .cloned()
@@ -243,7 +243,7 @@ pub fn get_vault_detail_analytics_handler(
     event_store: &EventStore,
     vault_id: &str,
 ) -> Result<VaultDetailAnalytics, String> {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let vault = vaults
         .get(vault_id)
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -369,7 +369,7 @@ pub fn backup_vault_handler(
 ) -> Result<VaultBackup, String> {
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -406,7 +406,7 @@ pub fn restore_vault_handler(
 
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(vault.id.clone(), vault.clone());
     Ok(vault)
 }
@@ -499,7 +499,7 @@ pub fn share_vault_handler(
     // Verify vault exists
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -558,7 +558,7 @@ pub fn generate_share_token_handler(
 ) -> Result<ShareTokenResponse, String> {
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -644,7 +644,7 @@ pub fn revoke_share_token_handler(
 ) -> Result<ShareToken, String> {
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -704,7 +704,7 @@ pub fn access_vault_via_share_handler(
 
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&share_token.vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -735,7 +735,7 @@ pub fn access_vault_export_via_share_handler(
 
     let vault = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&share_token.vault_id)
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
@@ -807,7 +807,7 @@ pub fn set_notification_preferences_handler(
     // Verify vault exists
     store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(vault_id)
         .ok_or_else(|| "Vault not found".to_string())?;
 
@@ -982,7 +982,7 @@ pub fn simulate_release_handler(
     scenario_types: Vec<ScenarioType>,
     missed_count: u32,
 ) -> Result<SimulateReleaseResponse, String> {
-    let vaults = store.lock().unwrap();
+    let vaults = store.lock().unwrap_or_else(|p| p.into_inner());
     let vault = vaults
         .get(vault_id)
         .cloned()
@@ -1046,7 +1046,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(100_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let query = SearchQuery {
             owner: Some("owner1".to_string()),
@@ -1060,6 +1060,23 @@ mod tests {
 
         let result = search_vaults_handler(&store, query);
         assert_eq!(result.vaults.len(), 1);
+    }
+
+    #[test]
+    fn vault_handler_recovers_poisoned_store_lock() {
+        let store = create_vault_store();
+        let backup_store = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison vault store lock");
+        }));
+
+        assert_eq!(
+            backup_vault_handler(&store, &backup_store, "missing").unwrap_err(),
+            "Vault not found"
+        );
     }
 
     #[test]
@@ -1087,8 +1104,8 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(200_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault1);
-        store.lock().unwrap().insert("v2".to_string(), vault2);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault1);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v2".to_string(), vault2);
 
         let result = compare_vaults_handler(&store, vec!["v1".to_string(), "v2".to_string()]);
         assert_eq!(result.vaults.len(), 2);
@@ -1111,7 +1128,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(100_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "json");
         assert!(result.is_ok());
@@ -1136,7 +1153,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(100_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "csv");
         assert!(result.is_ok());
@@ -1160,7 +1177,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(100_000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let result = generate_compliance_report(&store, &event_store, "v1");
         assert!(result.is_ok());
@@ -1234,7 +1251,7 @@ mod tests {
     fn test_get_vault_analytics_counts() {
         let store = create_vault_store();
         for i in 0..3 {
-            store.lock().unwrap().insert(
+            store.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 format!("v{i}"),
                 Vault {
                     id: format!("v{i}"),
@@ -1249,7 +1266,7 @@ mod tests {
                 },
             );
         }
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "vr".to_string(),
             Vault {
                 id: "vr".to_string(),
@@ -1273,7 +1290,7 @@ mod tests {
     #[test]
     fn test_get_vault_analytics_time_series() {
         let store = create_vault_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1298,7 +1315,7 @@ mod tests {
     fn test_backup_vault_creates_backup() {
         let store = create_vault_store();
         let backup_store = create_backup_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1332,7 +1349,7 @@ mod tests {
     fn test_restore_vault_from_backup() {
         let store = create_vault_store();
         let backup_store = create_backup_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1350,8 +1367,8 @@ mod tests {
         let backup = backup_vault_handler(&store, &backup_store, "v1").unwrap();
 
         // Remove vault then restore
-        store.lock().unwrap().remove("v1");
-        assert!(store.lock().unwrap().get("v1").is_none());
+        store.lock().unwrap_or_else(|p| p.into_inner()).remove("v1");
+        assert!(store.lock().unwrap_or_else(|p| p.into_inner()).get("v1").is_none());
 
         let req = RestoreRequest {
             backup_id: backup.backup_id,
@@ -1381,7 +1398,7 @@ mod tests {
         let share_store = create_share_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1410,7 +1427,7 @@ mod tests {
         // Verify audit entry created
         assert!(audit_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .any(|e| e.action == "vault_shared"));
     }
@@ -1442,7 +1459,7 @@ mod tests {
         let share_store = create_share_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1492,7 +1509,7 @@ mod tests {
         let share_store = create_share_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1531,7 +1548,7 @@ mod tests {
         let share_store = create_share_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1597,7 +1614,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1650,7 +1667,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1682,7 +1699,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1728,7 +1745,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1767,7 +1784,7 @@ mod tests {
         // Audit log written
         assert!(audit_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .any(|e| e.action == "vault_accessed_via_share"));
     }
@@ -1777,7 +1794,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1817,7 +1834,7 @@ mod tests {
         let store = create_vault_store();
         let token_store = create_share_token_store();
         let audit_store = create_audit_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1916,7 +1933,7 @@ mod tests {
     fn test_set_notification_preferences() {
         let store = create_vault_store();
         let notif_store = create_notification_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1947,7 +1964,7 @@ mod tests {
     fn test_get_notification_preferences() {
         let store = create_vault_store();
         let notif_store = create_notification_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -1995,7 +2012,7 @@ mod tests {
     fn test_notification_preferences_empty_channels_rejected() {
         let store = create_vault_store();
         let notif_store = create_notification_store();
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -2043,7 +2060,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(72000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
         assert!(result.is_ok());
@@ -2074,22 +2091,22 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(50000),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         // Add some events
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::CheckIn,
             timestamp: Utc::now() - chrono::Duration::days(5),
             data: serde_json::json!({"ttl_remaining": 86400}),
         });
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::Withdrawal,
             timestamp: Utc::now() - chrono::Duration::days(2),
             data: serde_json::json!({"amount": 500}),
         });
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::TtlUpdate,
             timestamp: Utc::now() - chrono::Duration::days(1),
@@ -2134,7 +2151,7 @@ mod tests {
             status: VaultStatus::Released,
             ttl_remaining: None,
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
         assert!(result.is_ok());
@@ -2160,10 +2177,10 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(86400),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         // Add old event (60 days ago) - should be filtered out
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::TtlUpdate,
             timestamp: Utc::now() - chrono::Duration::days(60),
@@ -2171,7 +2188,7 @@ mod tests {
         });
 
         // Add recent event (10 days ago) - should be included
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::TtlUpdate,
             timestamp: Utc::now() - chrono::Duration::days(10),
@@ -2208,22 +2225,22 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(86400),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         // Add multiple withdrawals
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::Withdrawal,
             timestamp: Utc::now() - chrono::Duration::days(10),
             data: serde_json::json!({"amount": 1000}),
         });
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::Withdrawal,
             timestamp: Utc::now() - chrono::Duration::days(5),
             data: serde_json::json!({"amount": 2000}),
         });
-        event_store.lock().unwrap().push(VaultEvent {
+        event_store.lock().unwrap_or_else(|p| p.into_inner()).push(VaultEvent {
             vault_id: "v1".to_string(),
             event_type: EventType::Withdrawal,
             timestamp: Utc::now() - chrono::Duration::days(2),
@@ -2261,7 +2278,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(86400),
         };
-        store.lock().unwrap().insert("v1".to_string(), vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), vault);
 
         // Create backup
         let backup = backup_vault_handler(&store, &backup_store, "v1").unwrap();
@@ -2292,7 +2309,7 @@ mod tests {
         let audit_store = create_audit_store();
         let query_cache = QueryCache::new();
 
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -2359,7 +2376,7 @@ mod tests {
         let notif_store = create_notification_store();
         let query_cache = QueryCache::new();
 
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v1".to_string(),
             Vault {
                 id: "v1".to_string(),
@@ -2412,7 +2429,7 @@ mod tests {
             status: VaultStatus::Active,
             ttl_remaining: Some(86400),
         };
-        store.lock().unwrap().insert("v1".to_string(), initial_vault.clone());
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), initial_vault.clone());
 
         // Cache initial read
         query_cache.set(&QueryCacheKey::vault_summary("v1"), serde_json::json!({"balance": 500}));
@@ -2426,7 +2443,7 @@ mod tests {
             balance: 1500,
             ..initial_vault
         };
-        store.lock().unwrap().insert("v1".to_string(), updated_vault);
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert("v1".to_string(), updated_vault);
         let backup = backup_vault_handler(&store, &backup_store, "v1").unwrap();
 
         // Restore with cache invalidation
@@ -2445,7 +2462,7 @@ mod tests {
         assert!(query_cache.get(&QueryCacheKey::vault_summary("v1")).is_none());
 
         // Subsequent read queries store and repopulates fresh cache value
-        let current_vault = store.lock().unwrap().get("v1").cloned().unwrap();
+        let current_vault = store.lock().unwrap_or_else(|p| p.into_inner()).get("v1").cloned().unwrap();
         query_cache.set(
             &QueryCacheKey::vault_summary("v1"),
             serde_json::json!({"balance": current_vault.balance}),
@@ -2462,7 +2479,7 @@ mod tests {
         let backup_store = create_backup_store();
         let query_cache = QueryCache::new();
 
-        store.lock().unwrap().insert(
+        store.lock().unwrap_or_else(|p| p.into_inner()).insert(
             "v-regression".to_string(),
             Vault {
                 id: "v-regression".to_string(),

@@ -584,7 +584,7 @@ pub async fn begin_registration(
     state
         .pending_registrations
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(session_id.clone(), pending);
 
     let response = BeginRegistrationResponse {
@@ -640,7 +640,7 @@ pub async fn complete_registration(
 {
     // 1. Retrieve and expire the pending session.
     let pending = {
-        let mut map = state.pending_registrations.lock().unwrap();
+        let mut map = state.pending_registrations.lock().unwrap_or_else(|p| p.into_inner());
         match map.remove(&body.session_id) {
             Some(p) => p,
             None => {
@@ -767,7 +767,7 @@ pub async fn complete_registration(
     //    let an attacker add a weak-algorithm credential to an account that
     //    has moved to a stronger one.
     {
-        let store = state.credentials.lock().unwrap();
+        let store = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
         for creds in store.values() {
             if creds.iter().any(|c| c.credential_id == body.credential_id) {
                 return Err((
@@ -816,7 +816,7 @@ pub async fn complete_registration(
     state
         .credentials
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .entry(pending.user_id.clone())
         .or_default()
         .push(credential);
@@ -850,7 +850,7 @@ pub async fn begin_authentication(
 
     // Build allow list from registered credentials.
     let allow_credentials: Vec<AllowCredential> = {
-        let store = state.credentials.lock().unwrap();
+        let store = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
         store
             .get(&body.user_id)
             .map(|creds| {
@@ -884,7 +884,7 @@ pub async fn begin_authentication(
     state
         .pending_authentications
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(session_id.clone(), pending);
 
     Ok((
@@ -910,7 +910,7 @@ pub async fn complete_authentication(
 {
     // 1. Retrieve and expire the pending session.
     let pending = {
-        let mut map = state.pending_authentications.lock().unwrap();
+        let mut map = state.pending_authentications.lock().unwrap_or_else(|p| p.into_inner());
         match map.remove(&body.session_id) {
             Some(p) => p,
             None => {
@@ -1006,7 +1006,7 @@ pub async fn complete_authentication(
     }
 
     // 5. Look up the credential.
-    let mut credentials = state.credentials.lock().unwrap();
+    let mut credentials = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
     let user_creds = credentials.get_mut(&pending.user_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1078,7 +1078,7 @@ pub async fn list_credentials(
     State(state): State<Arc<WebAuthnState>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<Vec<StoredCredential>>, (StatusCode, Json<serde_json::Value>)> {
-    let store = state.credentials.lock().unwrap();
+    let store = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
     let creds = store.get(&user_id).cloned().unwrap_or_default();
     Ok(Json(creds))
 }
@@ -1090,7 +1090,7 @@ pub async fn remove_credential(
     State(state): State<Arc<WebAuthnState>>,
     Path((user_id, cred_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let mut store = state.credentials.lock().unwrap();
+    let mut store = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
     let creds = store.get_mut(&user_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1142,7 +1142,7 @@ pub async fn add_backup_authenticator(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     // If the credential already exists, just flip the is_backup flag.
     {
-        let mut store = state.credentials.lock().unwrap();
+        let mut store = state.credentials.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(creds) = store.get_mut(&user_id) {
             if let Some(cred) = creds.iter_mut().find(|c| c.credential_id == cred_id) {
                 cred.is_backup = true;
@@ -1175,7 +1175,7 @@ pub async fn add_backup_authenticator(
     state
         .pending_registrations
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(session_id.clone(), pending);
 
     Ok((

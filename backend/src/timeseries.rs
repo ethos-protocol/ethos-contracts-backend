@@ -530,7 +530,7 @@ pub async fn ingest_handler(
         value: body.value,
         tags: body.tags.unwrap_or_default(),
     };
-    ts_store.lock().unwrap().ingest(point);
+    ts_store.lock().unwrap_or_else(|p| p.into_inner()).ingest(point);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -540,7 +540,7 @@ pub async fn query_handler(
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
     let resolution = body.resolution.unwrap_or(Resolution::Raw);
-    let engine = ts_store.lock().unwrap();
+    let engine = ts_store.lock().unwrap_or_else(|p| p.into_inner());
     let points = engine.downsample(&body.series, resolution, body.from, body.to);
     let count = points.len();
     Ok(Json(QueryResponse {
@@ -556,7 +556,7 @@ pub async fn compress_handler(
     State(ts_store): State<TimeSeriesStore>,
     Path(series): Path<String>,
 ) -> Result<Json<CompressResponse>, AppError> {
-    let mut engine = ts_store.lock().unwrap();
+    let mut engine = ts_store.lock().unwrap_or_else(|p| p.into_inner());
     let keys_before: Vec<String> = engine
         .partitions_for(&series)
         .iter()
@@ -586,7 +586,7 @@ pub async fn set_retention_handler(
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    ts_store.lock().unwrap().set_retention_policy(policy.clone());
+    ts_store.lock().unwrap_or_else(|p| p.into_inner()).set_retention_policy(policy.clone());
     Ok(Json(policy))
 }
 
@@ -595,6 +595,6 @@ pub async fn benchmark_handler(
     State(ts_store): State<TimeSeriesStore>,
     Path(series): Path<String>,
 ) -> Result<Json<BenchmarkResult>, AppError> {
-    let result = ts_store.lock().unwrap().benchmark(&series);
+    let result = ts_store.lock().unwrap_or_else(|p| p.into_inner()).benchmark(&series);
     Ok(Json(result))
 }

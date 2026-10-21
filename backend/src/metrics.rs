@@ -67,7 +67,7 @@ impl Metrics {
         let mut labels = self
             .label_values
             .lock()
-            .expect("metrics label registry poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         let values = labels.entry(label.to_string()).or_default();
 
         if values.iter().any(|existing| existing == value) {
@@ -92,7 +92,7 @@ impl Metrics {
     pub fn label_cardinality(&self, label: &str) -> usize {
         self.label_values
             .lock()
-            .expect("metrics label registry poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(label)
             .map(|values| values.len())
             .unwrap_or(0)

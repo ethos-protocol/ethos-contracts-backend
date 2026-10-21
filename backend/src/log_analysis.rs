@@ -178,14 +178,14 @@ impl LogStore {
         let entry = parse_log_line(line);
         self.inner
             .write()
-            .expect("log store lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .entries
             .push(entry.clone());
         entry
     }
 
     pub fn search(&self, q: &SearchQuery) -> Vec<LogEntry> {
-        let inner = self.inner.read().expect("log store lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         inner
             .entries
             .iter()
