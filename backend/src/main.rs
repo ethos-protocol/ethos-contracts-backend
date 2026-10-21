@@ -438,6 +438,13 @@ async fn main() {
 
     let db =
         Arc::new(Db::open_with_pool_config(&db_path, &pool_config).expect("failed to open db"));
+    // Log what the pool actually runs with, not just what was requested (#696).
+    tracing::info!(
+        read_connections_max = db.max_read_connections(),
+        read_connections_open = db.open_read_connections(),
+        write_connections = 1,
+        "database connection pool initialized"
+    );
     db.migrate().expect("migration failed");
 
     // Keep the sampler alive for the duration of the process. The RPC pool is
@@ -630,7 +637,11 @@ async fn main() {
     //     .with_state(log_store);
 
     // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
-    let webauthn_state = Arc::new(WebAuthnState::from_env());
+    // Fail startup on a missing or inconsistent relying-party config (#695).
+    let webauthn_state = Arc::new(
+        WebAuthnState::from_env()
+            .unwrap_or_else(|err| panic!("invalid WebAuthn configuration: {err}")),
+    );
     let webauthn_router = Router::new()
         .route("/webauthn/register/begin", post(begin_registration))
         .route("/webauthn/register/complete", post(complete_registration))

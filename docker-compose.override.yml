@@ -14,6 +14,9 @@ services:
       ALLOW_INSECURE_ADMIN: "true"
     ports:
       - "3000:3000"
+    # Local development only: cargo-watch reloads on host edits (#693).
+    volumes:
+      - ./backend/src:/app/src
 
   stellar-quickstart:
     environment:

@@ -30,6 +30,7 @@ pub mod contract_version_check;
 pub mod cost_tracking;
 pub mod custom_metrics;
 pub mod db;
+pub mod db_read_pool;
 pub mod deadlock;
 pub mod decompression;
 pub mod degradation;
@@ -102,6 +103,7 @@ pub mod two_factor;
 pub mod uptime;
 pub mod webauthn;
 pub mod vault_assistant;
+pub mod webauthn_config;
 pub mod webhook;
 pub mod websocket;
 

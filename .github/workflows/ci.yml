@@ -126,6 +126,14 @@ jobs:
           chmod +x scripts/check_playground_isolation.sh
           scripts/check_playground_isolation.sh environments.toml
 
+      # Issue #693: production compose files must run the built image only.
+      # Source bind mounts belong in docker-compose.override.yml.
+      - name: Check compose files have no source bind mounts
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/test_check_compose_bind_mounts.py
+          python3 scripts/check_compose_bind_mounts.py
+
       # Issues #580-#583: the ZK guide, API docs, deployment runbook and
       # troubleshooting guide are validated against the source tree so they
       # cannot silently drift from the code they describe.

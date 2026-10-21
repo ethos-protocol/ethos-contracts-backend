@@ -45,9 +45,14 @@ Client                Backend                   Authenticator
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEBAUTHN_RP_ID` | `localhost` | Relying Party ID — must match the domain serving the frontend |
+| `WEBAUTHN_RP_ID` | none (required) | Relying Party ID — must equal, or be a parent domain of, the origin's host |
 | `WEBAUTHN_RP_NAME` | `Ethos Protocol` | Human-readable name shown by authenticators |
-| `WEBAUTHN_ORIGIN` | `http://localhost:3000` | Exact origin of your frontend (`scheme://host[:port]`) |
+| `WEBAUTHN_ORIGIN` | none (required) | Exact origin of your frontend (`https://host[:port]`; `http` only for `localhost`) |
+
+The backend refuses to start if either required variable is unset or if the RP ID
+does not match the origin host. The localhost defaults (`localhost` and
+`http://localhost:3000`) apply only when `RUST_ENV=development`, which the
+development compose override sets.
 
 Set these before starting the backend:
 
