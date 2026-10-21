@@ -1401,3 +1401,22 @@ fn test_reschedule_consistency_check_different_oracle_rejected() {
     let credential_id = client.attest(&oracle_a, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
     client.reschedule_consistency_check(&oracle_b, &credential_id);
 }
+
+/// Truncated XDR input must return `Err(MalformedConditionalProof)`
+/// instead of panicking, so callers can distinguish malformed input
+/// from an unattested proof.
+#[test]
+fn test_verify_conditional_proof_truncated_xdr_returns_error() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    // A truncated XDR byte sequence — not a valid ConditionalProof
+    // encoding. The function must return Err(MalformedConditionalProof)
+    // rather than panicking with a host error.
+    let truncated_proof = bytes!(&env, 0x000102);
+    let condition = bytes!(&env, 0xcafebabe);
+
+    let result = client.verify_conditional_proof(&truncated_proof, &condition);
+    assert!(result.is_err());
+}

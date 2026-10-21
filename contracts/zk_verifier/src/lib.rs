@@ -753,15 +753,21 @@ impl ZkVerifierContract {
     /// branch otherwise — the caller cannot pick a branch that skips the
     /// condition check.
     ///
-    /// Returns `false` (does not panic) when the condition or the selected
-    /// branch is unattested; panics with `MalformedConditionalProof` if
-    /// `proof` is not a valid `ConditionalProof` encoding.
+    /// Returns `Ok(false)` when the condition or the selected branch is
+    /// unattested. Returns `Err(VerifierError::MalformedConditionalProof)`
+    /// when `proof` is not a valid `ConditionalProof` XDR encoding — this
+    /// is a typed, recoverable error rather than a host panic, so callers
+    /// can distinguish malformed input from an unattested proof.
     ///
     /// Emits a `vfy_cond` event with `(result, condition_result, claim_hash)`
     /// of the branch that was checked.
-    pub fn verify_conditional_proof(env: Env, proof: Bytes, condition: Bytes) -> bool {
+    pub fn verify_conditional_proof(
+        env: Env,
+        proof: Bytes,
+        condition: Bytes,
+    ) -> Result<bool, VerifierError> {
         let bundle = ConditionalProof::from_xdr(&env, &proof)
-            .unwrap_or_else(|_| panic_with_error!(&env, VerifierError::MalformedConditionalProof));
+            .map_err(|_| VerifierError::MalformedConditionalProof)?;
 
         let condition_result = Self::verify_internal(&env, &bundle.condition_proof, &condition);
 
@@ -779,7 +785,7 @@ impl ZkVerifierContract {
             (result, condition_result, claim_hash),
         );
 
-        result
+        Ok(result)
     }
 
     /// Sets the [`PrivacyLevel`] governing who may call
