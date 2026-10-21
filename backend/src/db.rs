@@ -90,6 +90,8 @@ pub struct AppState {
     /// consensus reconciliation job (#373), so a conflict opens the same
     /// kind of record a manually-filed incident would.
     pub incident_state: Arc<crate::incidents::IncidentState>,
+    /// RPC connection pool; probed by `/ready` (#698).
+    pub rpc_pool: Arc<crate::rpc_pool::RpcPool>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {

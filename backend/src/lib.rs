@@ -78,6 +78,7 @@ pub mod request_signing;
 pub mod retention;
 pub mod retry_policy;
 pub mod routes;
+pub mod readiness;
 pub mod rpc_pool;
 pub mod saga;
 pub mod scheduler;

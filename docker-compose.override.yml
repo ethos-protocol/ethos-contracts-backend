@@ -9,6 +9,9 @@ services:
     environment:
       RUST_ENV: development
       RUST_BACKTRACE: "1"
+      # Local development only: admin routes accept requests without
+      # ADMIN_API_KEY (#700). Never set this outside a dev machine.
+      ALLOW_INSECURE_ADMIN: "true"
     ports:
       - "3000:3000"
 
