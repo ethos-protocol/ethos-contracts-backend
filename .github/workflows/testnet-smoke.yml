@@ -8,21 +8,30 @@ on:
 env:
   STELLAR_CLI_VERSION: "21.4.0"
 
+# Workflow-level default is read-only. The smoke-test job also files and
+# comments on a failure issue (github-script step), so it alone gets
+# `issues: write`.
+permissions:
+  contents: read
+
 jobs:
   smoke-test:
     name: Stellar Testnet Smoke Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Pinned (not @stable): see ci.yml for the ethnum/E0512 rationale.
-      - uses: dtolnay/rust-toolchain@1.120.0
+      - uses: dtolnay/rust-toolchain@3f2778ee6a28c53e512b95bbcf7b2120993da70d # 1.96.1
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -107,7 +116,7 @@ jobs:
           EOF
           cat smoke-results/contract.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: smoke-test-${{ github.run_id }}
           path: smoke-results/
@@ -219,7 +228,7 @@ jobs:
       # issue for repeated failures so the tracker stays clean.
       - name: Alert — file failure issue
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
