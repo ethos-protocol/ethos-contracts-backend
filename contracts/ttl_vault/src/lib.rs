@@ -3782,14 +3782,17 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The remaining TTL in seconds (0 if expired)
-    pub fn ping_expiry(env: Env, vault_id: u64) -> u64 {
-        let vault = Self::try_load_vault(&env, vault_id)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+    /// `Ok(ttl)` with remaining TTL in seconds (0 if expired), or
+    /// `Err(ContractError::VaultNotFound)` if the vault does not exist.
+    pub fn ping_expiry(env: Env, vault_id: u64) -> Result<u64, ContractError> {
+        let vault = match Self::try_load_vault(&env, vault_id) {
+            Some(v) => v,
+            None => return Err(ContractError::VaultNotFound),
+        };
 
         // Only emit events for Locked vaults
         if vault.status != ReleaseStatus::Locked {
-            return 0;
+            return Ok(0);
         }
 
         let ttl = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
@@ -3800,7 +3803,7 @@ impl TtlVaultContract {
         // Issue #560: per-passkey expiry warning, additive to the vault-level check above.
         Self::check_passkey_expiry_warnings(&env, vault_id, env.ledger().timestamp());
 
-        ttl
+        Ok(ttl)
     }
 
     /// Emits `pk_expwrn` for every registered passkey on `vault_id` whose
