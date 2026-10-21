@@ -39,7 +39,7 @@ been recorded.
 1. **After first deploying/initializing the contract**, record a baseline:
 
    ```
-   set_upgrade_manifest_with_signatures(
+   set_upgrade_manifest_signed(
        exported_fn_count,
        error_code_count,
        storage_schema_hash,
@@ -57,7 +57,7 @@ been recorded.
    candidate WASM and call:
 
    ```
-   validate_upgrade_compatibility_with_signatures(
+   validate_upgrade_signed(
        new_exported_fn_count,
        new_error_code_count,
        new_storage_schema_hash,
@@ -71,7 +71,7 @@ been recorded.
 3. **Perform the upgrade** with the same manifest values via:
 
    ```
-   upgrade_with_manifest_and_signatures(
+   upgrade_with_signed_manifest(
        new_wasm_hash,
        new_exported_fn_count,
        new_error_code_count,
@@ -81,7 +81,7 @@ been recorded.
    ```
 
    This validates the hash (`validate_upgrade`), validates compatibility
-   (`validate_upgrade_compatibility_with_signatures`), performs the WASM swap,
+   (`validate_upgrade_signed`), performs the WASM swap,
    and then records the new values as the baseline for the *next* upgrade
    (incrementing `UpgradeManifest.version`).
 
@@ -92,7 +92,7 @@ check exact function signatures; new deployments and operational tooling
 should prefer their `*_with_signatures` counterparts. A successful legacy
 upgrade clears any stored signature fingerprint, so a strict upgrade cannot
 reuse a stale baseline; record it again with
-`set_upgrade_manifest_with_signatures`.
+`set_upgrade_manifest_signed`.
 
 ## Automated simulation
 
