@@ -106,7 +106,7 @@ pub enum AmlSource {
     Chainalysis,
     /// Cached Chainalysis result.
     Cache,
-    /// Provider screening is not configured; only the manual list applied.
+    /// Provider screening is not configured; only the manual list was checked.
     ManualListOnly,
     /// Provider call failed; verdict follows the fail-open/closed policy.
     ProviderUnavailable,
@@ -216,7 +216,10 @@ impl AmlScreener {
                 compliant: true,
                 source: AmlSource::ManualListOnly,
                 identifications: Vec::new(),
-                reason: None,
+                reason: Some(
+                    "Provider screening is not configured; only the manual list was applied."
+                        .to_string(),
+                ),
                 checked_at: now,
             });
         };
@@ -421,4 +424,29 @@ pub async fn list_flags(
         return e.into_response();
     }
     Json(screener.flags()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn manual_list_only_result_discloses_missing_provider_screening() {
+        let screener = AmlScreener::new(AmlConfig {
+            api_key: None,
+            api_url: DEFAULT_CHAINALYSIS_URL.to_string(),
+            cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+            fail_open: false,
+        });
+
+        let result = screener.screen("GABC123").await.unwrap();
+
+        assert!(result.compliant);
+        assert_eq!(result.source, AmlSource::ManualListOnly);
+        assert!(result
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("Provider screening is not configured"));
+    }
 }

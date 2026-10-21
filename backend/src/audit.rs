@@ -120,7 +120,7 @@ pub fn check_admin_access(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     match auth_header.strip_prefix("Bearer ") {
-        Some(token) if token == expected_key => Ok(()),
+        Some(token) if constant_time_eq(token.as_bytes(), expected_key.as_bytes()) => Ok(()),
         _ => Err(admin_unauthorized()),
     }
 }
@@ -178,6 +178,16 @@ mod admin_auth_tests {
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut difference = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        let left = a.get(index).copied().unwrap_or_default();
+        let right = b.get(index).copied().unwrap_or_default();
+        difference |= (left ^ right) as usize;
+    }
+    difference == 0
+}
+
 fn extract_client_ip(headers: &HeaderMap) -> String {
     if let Some(val) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         return val
@@ -199,4 +209,17 @@ fn extract_user_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_comparison_requires_exact_match() {
+        assert!(constant_time_eq(b"admin-key", b"admin-key"));
+        assert!(!constant_time_eq(b"Xadmin-key", b"admin-key"));
+        assert!(!constant_time_eq(b"admin-keY", b"admin-key"));
+        assert!(!constant_time_eq(b"admin", b"admin-key"));
+    }
 }
