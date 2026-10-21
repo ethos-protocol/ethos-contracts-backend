@@ -707,6 +707,7 @@ mod tests {
             failure_threshold: 1,
             success_threshold: 1,
             open_duration: Duration::from_millis(1),
+            half_open_max_requests: 1,
         };
         let cb = CircuitBreaker::new("redis-cache", cfg);
 

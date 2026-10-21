@@ -28,7 +28,6 @@ use axum::{
 use crate::clock::{Clock, SystemClock};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// Standard severity classification for an incident.

@@ -39,7 +39,6 @@ use axum::{
 use crate::clock::{Clock, SystemClock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use uuid::Uuid;
 
 // ── Domain types ──────────────────────────────────────────────────────────────

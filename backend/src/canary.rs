@@ -357,7 +357,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -379,7 +379,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -401,7 +401,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {
@@ -423,7 +423,7 @@ mod tests {
         let state = Arc::new(CanaryState::new());
         let deployment = start_deployment(&state).await;
 
-        let (_, Json(result)) = evaluate_canary(
+        let Json(result) = evaluate_canary(
             State(Arc::clone(&state)),
             Path(deployment.id.clone()),
             Json(EvaluateCanaryRequest {

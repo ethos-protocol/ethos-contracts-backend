@@ -522,6 +522,7 @@ async fn main() {
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         rpc_pool,
+        incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
@@ -651,7 +652,9 @@ async fn main() {
 
     // ── Issue #590: Alert Rules for Critical Events ───────────────────────────
     let alert_rules_state = Arc::new(AlertRulesState::new());
-    let alert_rules_router = Router::new()
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let alert_rules_router: Router = Router::new()
         .route(
             "/alerts/rules",
             post(create_alert_rule).get(list_alert_rules),
@@ -666,7 +669,9 @@ async fn main() {
 
     // ── Issue #591: Canary Deployment ─────────────────────────────────────────
     let canary_state = Arc::new(CanaryState::new());
-    let canary_router = Router::new()
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let canary_router: Router = Router::new()
         .route(
             "/deployments/canary",
             post(start_canary_deployment),
@@ -687,7 +692,9 @@ async fn main() {
 
     // ── Issue #592: Blue-Green Deployment ─────────────────────────────────────
     let blue_green_state = Arc::new(BlueGreenState::new());
-    let blue_green_router = Router::new()
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let blue_green_router: Router = Router::new()
         .route(
             "/deployments/blue-green",
             post(create_blue_green_deployment).get(list_blue_green_deployments),
@@ -712,7 +719,9 @@ async fn main() {
 
     // ── Issue #593: Automated Rollback on Test Failure ────────────────────────
     let rollback_state = Arc::new(RollbackState::new());
-    let rollback_router = Router::new()
+    // Built but not mounted yet (see the `.merge` list below); the explicit
+    // type keeps the unmounted router compiling.
+    let rollback_router: Router = Router::new()
         .route(
             "/deployments/rollback/plan",
             post(create_rollback_plan).get(list_rollback_plans),

@@ -62,6 +62,10 @@ jobs:
       - name: Build crate
         run: cargo build --package ttl-vault --lib
 
+      # The backend binary and library must compile from main (#673).
+      - name: Build backend
+        run: cargo build --package ethos-protocol-backend
+
       # Build the deployable artifact before tests so the upgrade simulation
       # can install and replace a real Soroban WASM contract.
       - name: Build WASM artifact

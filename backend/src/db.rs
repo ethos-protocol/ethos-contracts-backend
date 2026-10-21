@@ -700,7 +700,7 @@ impl PoolConfig {
 }
 
 pub struct Db {
-    conn: std::sync::Mutex<Connection>,
+    pub(crate) conn: std::sync::Mutex<Connection>,
     // DB_POOL_MIN/DB_POOL_MAX are accepted for forward compatibility but unused:
     // `conn` is a single mutex-guarded connection, not a real pool. Only
     // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
