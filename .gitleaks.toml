@@ -36,13 +36,14 @@ title = "Ethos-Protocol gitleaks config"
     "test-secret-key-for-unit-tests",
     "tok-secret",
     "REMINDER_ENCRYPTION_SECRET=",
-    # Local-dev-only Postgres credentials in docker-compose.yml, matching the
-    # POSTGRES_USER/POSTGRES_PASSWORD set for the same file's local `db`
-    # service — not a real secret, never used outside a developer's machine.
-    # Pattern (not a literal) because this project has been renamed before
-    # (e.g. historical "ttl_user:ttl_password@" prior to the Ethos rename)
-    # and the same dev-only convention could recur under a future name.
-    '''\w+_user:\w+_password@'''
+  ]
+  # Historical revisions of docker-compose.yml that committed the local-dev
+  # Postgres credential pair (#688). History is not rewritten,
+  # so these commits are allowlisted by SHA. The current tree no longer contains
+  # the pair. Anyone who ran that compose file outside a laptop should rotate it.
+  commits = [
+    "d4dfd88a587f8b49a83161a1959e536fda083771",
+    "8373192cc47075de678550f7aff6ef88eccc0c98",
   ]
 
 # ── Project-specific secret patterns (#397) ───────────────────────────────────
@@ -66,6 +67,17 @@ title = "Ethos-Protocol gitleaks config"
   description = "Database/cache connection URI with an embedded username:password (Postgres, MySQL, MongoDB, Redis)"
   regex = '''\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss)://[^\s:'"@/]+:[^\s@'"]{3,}@[^\s'"]+'''
   tags = ["database", "connection-string"]
+
+# The Postgres user/password pair that docker-compose.yml used to hard-code and
+# that was reused across environments (#688). Matched literally so the pair is
+# caught wherever it appears, including outside a connection URI. The generic
+# `\w+_user:\w+_password@` allowlist entry was removed for the same reason.
+[[rules]]
+  id = "ethos-local-postgres-credential-pair"
+  description = "Hard-coded Ethos local Postgres credential pair (formerly in docker-compose.yml, #688)"
+  # Written as `ethos_pass(?:word)` so this file does not contain the literal pair it detects.
+  regex = '''ethos_user:ethos_pass(?:word)'''
+  tags = ["database", "credentials"]
 
 [[rules]]
   id = "abuseipdb-api-key"

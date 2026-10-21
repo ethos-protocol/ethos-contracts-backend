@@ -1301,3 +1301,45 @@ fn test_is_credential_chain_valid_reflects_ancestor_invalidation() {
     assert!(!client.is_credential_chain_valid(&root_id));
     assert!(!client.is_credential_chain_valid(&child_id));
 }
+
+// ---- verify_credentials_consistent: batch validation guards (#776) ----
+
+/// Mismatched proof/claim vectors must panic with MismatchedBatchLengths (#11).
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_verify_credentials_consistent_mismatched_lengths_panics() {
+    let (env, _, client) = setup();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+
+    let mut proofs: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+    proofs.push_back(proof.clone());
+    proofs.push_back(proof);
+
+    let mut claims: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+    claims.push_back(claim);
+
+    // Two proofs, one claim — must be rejected.
+    client.verify_credentials_consistent(&proofs, &claims);
+}
+
+/// A batch exceeding MAX_CREDENTIAL_BATCH_SIZE must panic with BatchTooLarge (#22).
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_verify_credentials_consistent_oversized_batch_panics() {
+    let (env, _, client) = setup();
+
+    let mut proofs: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+    let mut claims: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+
+    // Push MAX_CREDENTIAL_BATCH_SIZE + 1 entries to exceed the cap.
+    for i in 0..(MAX_CREDENTIAL_BATCH_SIZE + 1) {
+        // Use the index as a simple discriminator to produce distinct byte values.
+        let b = bytes!(&env, 0x01);
+        let _ = i; // discriminator noted; content uniqueness not required for this guard test
+        proofs.push_back(b.clone());
+        claims.push_back(b);
+    }
+
+    client.verify_credentials_consistent(&proofs, &claims);
+}

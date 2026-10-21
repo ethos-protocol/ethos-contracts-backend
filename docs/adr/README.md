@@ -24,7 +24,8 @@ An ADR is a short document that captures an important architectural decision, th
 | [ADR-0002](0002-passkey-authentication.md) | Use Passkeys (WebAuthn) for Owner Authentication | Accepted | 2024-02-01 |
 | [ADR-0003](0003-ttl-based-release.md) | TTL-Based Automatic Release Mechanism | Accepted | 2024-02-15 |
 | [ADR-0004](0004-rust-backend.md) | Rust for the Backend Service | Accepted | 2024-03-01 |
-| [ADR-0005](0005-postgresql-backend-storage.md) | PostgreSQL for Backend Storage | Accepted | 2024-03-10 |
+| [ADR-0005](0005-postgresql-backend-storage.md) | PostgreSQL for Backend Storage | Superseded by ADR-0006 | 2024-03-10 |
+| [ADR-0006](0006-sqlite-backend-storage.md) | SQLite for Backend Storage | Accepted | 2026-10-16 |
 
 ## Creating a new ADR
 

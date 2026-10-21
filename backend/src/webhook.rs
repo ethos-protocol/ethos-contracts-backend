@@ -15,12 +15,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
+use crate::clock::{Clock, SystemClock};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -92,6 +94,8 @@ pub fn create_webhook_store() -> WebhookStore {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── Axum handler state ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -102,6 +106,7 @@ pub struct WebhookState {
     pub dlq_state: Arc<crate::dlq::DlqState>,
     /// Health-aware routing weights, keyed by webhook URL.
     pub health_routing_state: Arc<crate::health_routing::HealthRoutingState>,
+    clock: Arc<dyn Clock>,
 }
 
 impl WebhookState {
@@ -118,10 +123,20 @@ impl WebhookState {
     ) -> Self {
         Self {
             store: create_webhook_store(),
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .timeout(DELIVERY_TIMEOUT)
+                .build()
+                .expect("webhook HTTP client configuration is valid"),
             dlq_state,
             health_routing_state,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        let mut state = Self::new();
+        state.clock = clock;
+        state
     }
 }
 
@@ -155,7 +170,7 @@ pub async fn register_webhook(
         // one. The generated secret is returned in the response body once.
         secret: Some(body.secret.filter(|s| !s.is_empty()).unwrap_or_else(generate_secret)),
         algorithm: body.algorithm,
-        created_at: Utc::now(),
+        created_at: state.clock.now(),
         active: true,
     };
 
@@ -207,7 +222,7 @@ pub fn deliver_event(
         id: Uuid::new_v4().to_string(),
         event_type: event_type.clone(),
         vault_id: vault_id.clone(),
-        timestamp: Utc::now(),
+        timestamp: state.clock.now(),
         data,
     };
 
@@ -295,7 +310,12 @@ async fn attempt_delivery(
         // hand-constructed registrations used in tests.
         if let Some(ref secret) = registration.secret {
             let (signature, timestamp) =
-                build_signature_headers(&body, secret, registration.algorithm);
+                build_signature_headers_at(
+                    &body,
+                    secret,
+                    registration.algorithm,
+                    state.clock.now(),
+                );
             req = req
                 .header("X-Ethos-Signature", &signature)
                 .header("X-Ethos-Timestamp", timestamp)
@@ -472,13 +492,20 @@ pub const TIMESTAMP_TOLERANCE_SECS: i64 = 300;
 /// Returns `Ok(())` when the timestamp is acceptable.
 /// Returns `Err(reason)` when it is absent, unparseable, or too old/future.
 pub fn validate_timestamp(timestamp: Option<&str>) -> Result<(), String> {
+    validate_timestamp_at(timestamp, SystemClock.now())
+}
+
+pub fn validate_timestamp_at(
+    timestamp: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let ts_str = timestamp.ok_or_else(|| "missing X-Ethos-Timestamp header".to_string())?;
 
     let ts_secs: i64 = ts_str
         .parse()
         .map_err(|_| format!("unparseable timestamp: {ts_str}"))?;
 
-    let now_secs = Utc::now().timestamp();
+    let now_secs = now.timestamp();
     let diff = (now_secs - ts_secs).abs();
 
     if diff > TIMESTAMP_TOLERANCE_SECS {
@@ -519,8 +546,24 @@ pub fn verify_webhook_signature(
     signature_header: Option<&str>,
     timestamp_header: Option<&str>,
 ) -> VerificationResult {
+    verify_webhook_signature_at(
+        body,
+        secret,
+        signature_header,
+        timestamp_header,
+        SystemClock.now(),
+    )
+}
+
+pub fn verify_webhook_signature_at(
+    body: &str,
+    secret: &str,
+    signature_header: Option<&str>,
+    timestamp_header: Option<&str>,
+    now: DateTime<Utc>,
+) -> VerificationResult {
     // 1. Validate timestamp first (cheapest check).
-    if let Err(reason) = validate_timestamp(timestamp_header) {
+    if let Err(reason) = validate_timestamp_at(timestamp_header, now) {
         return VerificationResult {
             valid: false,
             algorithm: None,
@@ -614,13 +657,15 @@ pub struct VerifyWebhookRequest {
 /// Consumers can call this endpoint to check whether an incoming webhook
 /// request is authentic before processing it.
 pub async fn verify_webhook(
+    State(state): State<Arc<WebhookState>>,
     Json(body): Json<VerifyWebhookRequest>,
 ) -> (StatusCode, Json<VerificationResult>) {
-    let result = verify_webhook_signature(
+    let result = verify_webhook_signature_at(
         &body.body,
         &body.secret,
         Some(&body.signature),
         body.timestamp.as_deref(),
+        state.clock.now(),
     );
 
     let status = if result.valid {
@@ -644,8 +689,17 @@ pub fn build_signature_headers(
     secret: &str,
     algorithm: SignatureAlgorithm,
 ) -> (String, String) {
+    build_signature_headers_at(body, secret, algorithm, SystemClock.now())
+}
+
+pub fn build_signature_headers_at(
+    body: &str,
+    secret: &str,
+    algorithm: SignatureAlgorithm,
+    now: DateTime<Utc>,
+) -> (String, String) {
     let signature = sign_payload_with_algorithm(body, secret, algorithm);
-    let timestamp = Utc::now().timestamp().to_string();
+    let timestamp = now.timestamp().to_string();
     (signature, timestamp)
 }
 
@@ -694,9 +748,14 @@ pub async fn rotate_webhook_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
+
+    fn test_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
 
     fn ts_now() -> String {
-        Utc::now().timestamp().to_string()
+        SystemClock.now().timestamp().to_string()
     }
 
     fn sample_payload(id: &str) -> WebhookPayload {
@@ -704,7 +763,7 @@ mod tests {
             id: id.to_string(),
             event_type: WebhookEventType::VaultReleased,
             vault_id: "vault-1".to_string(),
-            timestamp: Utc::now(),
+            timestamp: SystemClock.now(),
             data: serde_json::json!({ "ok": true }),
         }
     }
@@ -806,7 +865,7 @@ mod tests {
             // A non-256 algorithm configured: X-Signature-256 must still be SHA-256.
             secret: Some("delivery-secret".to_string()),
             algorithm: SignatureAlgorithm::Sha512,
-            created_at: Utc::now(),
+            created_at: SystemClock.now(),
             active: true,
         };
 
@@ -849,7 +908,7 @@ mod tests {
             event_types: vec![],
             secret: None, // hand-built registration: payloads go out unsigned
             algorithm: SignatureAlgorithm::Sha256,
-            created_at: Utc::now(),
+            created_at: SystemClock.now(),
             active: true,
         };
 
@@ -946,7 +1005,7 @@ mod tests {
         let secret = "key";
         let sig = sign_payload_with_algorithm(body, secret, SignatureAlgorithm::Sha256);
         // Timestamp from 10 minutes ago.
-        let old_ts = (Utc::now().timestamp() - 600).to_string();
+        let old_ts = (SystemClock.now().timestamp() - 600).to_string();
 
         let result = verify_webhook_signature(body, secret, Some(&sig), Some(&old_ts));
         assert!(!result.valid);
@@ -979,27 +1038,57 @@ mod tests {
 
     #[test]
     fn test_validate_timestamp_ok() {
-        let ts = Utc::now().timestamp().to_string();
+        let ts = SystemClock.now().timestamp().to_string();
         assert!(validate_timestamp(Some(&ts)).is_ok());
     }
 
     #[test]
     fn test_validate_timestamp_future_within_tolerance() {
         // 1 minute in the future — still acceptable.
-        let ts = (Utc::now().timestamp() + 60).to_string();
+        let ts = (SystemClock.now().timestamp() + 60).to_string();
         assert!(validate_timestamp(Some(&ts)).is_ok());
     }
 
     #[test]
     fn test_validate_timestamp_too_old() {
-        let ts = (Utc::now().timestamp() - 600).to_string();
+        let ts = (SystemClock.now().timestamp() - 600).to_string();
         let err = validate_timestamp(Some(&ts)).unwrap_err();
         assert!(err.contains("out of tolerance"));
     }
 
+    #[test]
+    fn timestamp_validation_uses_supplied_time() {
+        let now = test_now();
+        let timestamp = now.timestamp().to_string();
+
+        assert!(validate_timestamp_at(Some(&timestamp), now).is_ok());
+        assert!(validate_timestamp_at(
+            Some(&(now.timestamp() - TIMESTAMP_TOLERANCE_SECS - 1).to_string()),
+            now
+        )
+        .is_err());
+
+        let (signature, timestamp) = build_signature_headers_at(
+            "payload",
+            "secret",
+            SignatureAlgorithm::Sha256,
+            now,
+        );
+        assert_eq!(timestamp, now.timestamp().to_string());
+        assert!(verify_webhook_signature_at(
+            "payload",
+            "secret",
+            Some(&signature),
+            Some(&timestamp),
+            now
+        )
+        .valid);
+    }
+
     #[tokio::test]
     async fn test_register_webhook_creates_registration() {
-        let state = Arc::new(WebhookState::new());
+        let now = test_now();
+        let state = Arc::new(WebhookState::with_clock(Arc::new(ManualClock::new(now))));
         let req = RegisterWebhookRequest {
             url: "https://example.test/hook".to_string(),
             vault_id: None,
@@ -1013,6 +1102,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(reg.created_at, now);
         assert!(!reg.id.is_empty());
         assert!(reg.active);
 

@@ -41,6 +41,7 @@ use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
+    cost_estimation::estimate_cost_handler,
     cost_tracking::{
         allocate_cost, get_budget_breaches, get_cost_dashboard, get_cost_report,
         get_gas_cost_report, get_optimization_suggestions, record_cost_entry, record_gas_cost,
@@ -50,14 +51,20 @@ use ethos_protocol_backend::{
         confirm_dr_action, get_dr_test_schedule, get_rto_rpo, list_playbooks, request_dr_action,
         DrAutomationState,
     },
-    // Commented out: custom_metrics unused in current build
-    // custom_metrics::{
-    //     aggregate_custom_metric, create_dashboard_share, get_shared_dashboard, list_custom_metrics,
-    //     list_dashboard_templates, record_custom_metric, CustomMetricsStore,
-    // },
+    custom_metrics::{
+        aggregate_custom_metric, create_dashboard_share, define_custom_metric,
+        export_custom_metrics, get_shared_dashboard, list_custom_metric_definitions,
+        list_custom_metrics, list_dashboard_templates, record_custom_metric, CustomMetricsStore,
+    },
+    log_patterns::analyze_logs,
+    realtime_dashboard::{
+        add_metric_alert_rule, drill_down_metric, get_dashboard_snapshot, ingest_metric,
+        stream_metrics, RealtimeDashboard,
+    },
+    uptime::{get_downtime_alerts, get_uptime_report, record_uptime_check, UptimeMonitor},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
-        create_vault_store, AppState, Db, PoolConfig,
+        create_vault_store, resolve_db_path, AppState, Db, PoolConfig,
     },
     decompression::DecompressionConfig,
     degradation::{
@@ -67,6 +74,10 @@ use ethos_protocol_backend::{
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    jobs::{
+        cancel_job_handler, create_job_handler, create_job_store, get_job_handler,
+        list_jobs_handler,
+    },
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
     metrics::Metrics,
@@ -75,6 +86,10 @@ use ethos_protocol_backend::{
     },
     priority::{PriorityConfig, PriorityEnforcer},
     rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
+    replay::{
+        batch_replay_handler, create_request_log_store, get_log_handler, list_logs_handler,
+        replay_handler,
+    },
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
@@ -82,6 +97,13 @@ use ethos_protocol_backend::{
     streaming::{stream_events, stream_vaults},
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
+    timeseries::{
+        benchmark_handler, compress_handler, create_timeseries_store, ingest_handler,
+        query_handler, set_retention_handler,
+    },
+    two_factor::{
+        challenge_2fa, clear_2fa_session, disable_2fa, enable_2fa, get_2fa_status, verify_2fa,
+    },
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
@@ -135,17 +157,9 @@ async fn encryption_keys_handler(
     }
 }
 
-async fn ready_handler(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "database": "connected",
-        }))),
-        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
+/// GET /ready — 200 when every required subsystem passes, else 503 (#698).
+async fn ready_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    ethos_protocol_backend::readiness::ready_response(&state).await
 }
 
 /// Prometheus text-format metrics for scraping, combining base counters
@@ -185,12 +199,40 @@ pub fn build_router(state: AppState) -> Router {
     // let retry_state = RetryPolicyState::new();
     // let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
     let _timeout_state = TimeoutState::new();
+    let two_factor_router = Router::new()
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(clear_2fa_session),
+        )
+        .with_state(Arc::clone(&state.db));
 
     Router::new()
+        .merge(two_factor_router)
         // ── Feature flags (#274) ─────────────────────────────────────────────
         .route("/admin/flags", post(upsert_flag).get(list_flags))
         .route("/admin/flags/:key", get(get_flag))
         .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
+        .route("/estimate-cost", post(estimate_cost_handler))
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
@@ -253,6 +295,45 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+fn build_operational_router() -> Router {
+    let timeseries_router = Router::new()
+        .route("/timeseries/ingest", post(ingest_handler))
+        .route("/timeseries/query", post(query_handler))
+        .route(
+            "/timeseries/:series/compress",
+            post(compress_handler),
+        )
+        .route(
+            "/timeseries/:series/retention",
+            post(set_retention_handler),
+        )
+        .route(
+            "/timeseries/:series/benchmark",
+            post(benchmark_handler),
+        )
+        .with_state(create_timeseries_store());
+
+    let jobs_router = Router::new()
+        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route(
+            "/jobs/:job_id",
+            get(get_job_handler).delete(cancel_job_handler),
+        )
+        .with_state(create_job_store());
+
+    let replay_router = Router::new()
+        .route("/replay", post(replay_handler))
+        .route("/replay/batch", post(batch_replay_handler))
+        .route("/replay/logs", get(list_logs_handler))
+        .route("/replay/logs/:log_id", get(get_log_handler))
+        .with_state(create_request_log_store());
+
+    Router::new()
+        .merge(timeseries_router)
+        .merge(jobs_router)
+        .merge(replay_router)
 }
 
 /// Rate limiter used by [`enforce_rate_limit`] for the whole app (#348).
@@ -333,19 +414,49 @@ async fn main() {
         "database pool configuration"
     );
 
+    // #690: vault, subscription and audit data must survive restarts, so the
+    // database is a file on a persistent volume. `:memory:` needs an explicit opt-in.
+    let allow_ephemeral_db = std::env::var("ALLOW_EPHEMERAL_DB").is_ok_and(|v| v == "true");
+    let db_path =
+        match resolve_db_path(std::env::var("DB_PATH").ok().as_deref(), allow_ephemeral_db) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                std::process::exit(1);
+            }
+        };
+    if let Some(parent) = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::error!(dir = %parent.display(), "cannot create database directory: {err}");
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(db_path = %db_path, "opening database");
+
     let db =
-        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+        Arc::new(Db::open_with_pool_config(&db_path, &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
-    // Keep sampler and rpc_pool alive for the duration of the process.
-    // They are logged at startup; full integration into AppState is done when
-    // handlers need them directly.
-    let _ = (rpc_pool, sampler);
+    // Keep the sampler alive for the duration of the process. The RPC pool is
+    // shared through AppState so `/ready` can probe it (#698).
+    let _ = sampler;
+    let rpc_pool = Arc::new(rpc_pool);
 
-    let consensus = NodeCache::from_env();
+    // #699: an unrecognised CONSENSUS_STRATEGY aborts startup rather than
+    // silently running with last-write-wins.
+    let consensus = match NodeCache::from_env() {
+        Ok(consensus) => consensus,
+        Err(err) => {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         node_id = consensus.node_id(),
-        strategy = ?consensus.strategy(),
+        strategy = consensus.strategy().as_str(),
         "consensus cache initialized"
     );
 
@@ -410,6 +521,7 @@ async fn main() {
         flag_state,
         query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
+        rpc_pool,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
@@ -423,22 +535,26 @@ async fn main() {
     //     .route("/admin/acl/audit", get(acl_audit_trail))
     //     .with_state(acl_store);
 
-    // ── Custom metrics + Grafana dashboard routes ────────────────────────
-    // NOTE: Custom metrics functionality is pending implementation.
-    // let custom_metrics_store = CustomMetricsStore::new();
-    // let custom_metrics_router = Router::new()
-    //     .route(
-    //         "/metrics/custom",
-    //         post(record_custom_metric).get(list_custom_metrics),
-    //     )
-    //     .route(
-    //         "/metrics/custom/:name/aggregate",
-    //         get(aggregate_custom_metric),
-    //     )
-    //     .route("/dashboards/templates", get(list_dashboard_templates))
-    //     .route("/dashboards/share", post(create_dashboard_share))
-    //     .route("/dashboards/shared/:token", get(get_shared_dashboard))
-    //     .with_state(custom_metrics_store);
+    // ── Custom metrics + Grafana dashboard routes (#604) ─────────────────
+    let custom_metrics_store = CustomMetricsStore::new();
+    let custom_metrics_router = Router::new()
+        .route(
+            "/metrics/custom",
+            post(record_custom_metric).get(list_custom_metrics),
+        )
+        .route(
+            "/metrics/custom/definitions",
+            post(define_custom_metric).get(list_custom_metric_definitions),
+        )
+        .route("/metrics/custom/export", get(export_custom_metrics))
+        .route(
+            "/metrics/custom/:name/aggregate",
+            get(aggregate_custom_metric),
+        )
+        .route("/dashboards/templates", get(list_dashboard_templates))
+        .route("/dashboards/share", post(create_dashboard_share))
+        .route("/dashboards/shared/:token", get(get_shared_dashboard))
+        .with_state(custom_metrics_store);
 
     // ── Cost tracking routes (#594) ────────────────────────────────────────
     // Records per-operation cost entries (fiat + gas), surfaces dashboards,
@@ -640,16 +756,43 @@ async fn main() {
         .route("/sla/compliance", get(get_compliance_summary))
         .with_state(sla_state);
 
+    // ── Log pattern analysis (#603) ──────────────────────────────────────
+    // Stateless: the posted lines are analysed and discarded. The in-memory
+    // LogStore (ingest/search) is still not mounted because it has no size
+    // cap and would grow without bound.
+    let log_analysis_router = Router::new().route("/logs/analyze", post(analyze_logs));
+
+    // ── Uptime monitoring (#601) ─────────────────────────────────────────
+    let uptime_monitor = UptimeMonitor::new();
+    let uptime_router = Router::new()
+        .route("/uptime/checks", post(record_uptime_check))
+        .route("/uptime/report", get(get_uptime_report))
+        .route("/uptime/alerts", get(get_downtime_alerts))
+        .with_state(uptime_monitor);
+
+    // ── Real-time dashboards (#602) ──────────────────────────────────────
+    let realtime_dashboard = RealtimeDashboard::new();
+    let realtime_router = Router::new()
+        .route("/dashboard/metrics", post(ingest_metric))
+        .route("/dashboard/metrics/:name", get(drill_down_metric))
+        .route("/dashboard/snapshot", get(get_dashboard_snapshot))
+        .route("/dashboard/stream", get(stream_metrics))
+        .route("/dashboard/alerts", post(add_metric_alert_rule))
+        .with_state(realtime_dashboard);
+
     let app = build_router(state)
+        .merge(build_operational_router())
         // .merge(acl_router)
-        // .merge(custom_metrics_router)
+        .merge(custom_metrics_router)
         .merge(anomaly_router)
         .merge(aml_router)
-        // .merge(log_router)
+        .merge(log_analysis_router)
         .merge(webauthn_router)
         .merge(cost_router)
         .merge(dr_router)
-        .merge(sla_router);
+        .merge(sla_router)
+        .merge(uptime_router)
+        .merge(realtime_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
