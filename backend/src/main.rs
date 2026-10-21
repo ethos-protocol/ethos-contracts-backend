@@ -72,6 +72,7 @@ use ethos_protocol_backend::{
     },
     event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
+    fraud_detection::{self, FraudDetector},
     graphql::{build_schema, graphql_handler, graphql_playground},
     jobs::{
         cancel_job_handler, create_job_handler, create_job_store, get_job_handler,
@@ -86,7 +87,7 @@ use ethos_protocol_backend::{
         self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
     },
     priority::{PriorityConfig, PriorityEnforcer},
-    rate_limit::{enforce_rate_limit, RateLimiter, TierLimit},
+    rate_limit::{enforce_rate_limit, EndpointConfig, RateLimiter, TierLimit, UserTier},
     replay::{
         batch_replay_handler, create_request_log_store, get_log_handler, list_logs_handler,
         replay_handler,
@@ -94,6 +95,7 @@ use ethos_protocol_backend::{
     routes,
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
+    saml::{self, AttributeMapping, SamlConfig, SamlState},
     schema_validation::{openapi_validation_middleware, OpenApiSpec},
     sla::{
         create_sla_policy, delete_sla_policy, get_compliance_summary, get_sla_policy,
@@ -338,6 +340,12 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/compliance-report",
             get(ethos_protocol_backend::compliance::compliance_report_handler),
         )
+        // ── Enterprise SSO ──────────────────────────────────────────────────
+        .route("/saml/metadata", get(saml::get_metadata))
+        .route("/saml/login", get(saml::initiate_login))
+        .route("/saml/acs", post(saml::assertion_consumer_service))
+        // ── Fraud detection ──────────────────────────────────────────────────
+        .route("/fraud/score", post(fraud_detection::score_transaction))
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",
@@ -488,7 +496,16 @@ fn build_rate_limiter() -> RateLimiter {
 
     // Global default for authenticated tiers on endpoints without a specific
     // entry: 300 requests / minute.
-    RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)))
+    let mut limiter = RateLimiter::new(TierLimit::new(300, Duration::from_secs(60)));
+    let mut fraud_scoring = EndpointConfig::new();
+    fraud_scoring.set_tier_limit(UserTier::Free, TierLimit::new(30, Duration::from_secs(60)));
+    fraud_scoring.set_tier_limit(UserTier::Pro, TierLimit::new(120, Duration::from_secs(60)));
+    fraud_scoring.set_tier_limit(
+        UserTier::Enterprise,
+        TierLimit::new(600, Duration::from_secs(60)),
+    );
+    limiter.register_endpoint("POST /fraud/score", fraud_scoring);
+    limiter
 }
 
 #[tokio::main]
@@ -647,6 +664,10 @@ async fn main() {
     let webhook_state = Arc::new(WebhookState::new());
 
     let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+    let saml_state = SamlConfig::from_env()
+        .expect("invalid SAML configuration")
+        .map(|config| Arc::new(SamlState::new(config, AttributeMapping::default())))
+        .unwrap_or_else(|| Arc::new(SamlState::disabled()));
 
     let state = AppState {
         db: Arc::clone(&db),
@@ -680,6 +701,8 @@ async fn main() {
         token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
         notification_service: ethos_protocol_backend::notifications::create_service(),
         profiler_state: Arc::new(ethos_protocol_backend::profiler::ProfilerState::new()),
+        saml_state,
+        fraud_detector: FraudDetector::new(),
     };
 
     let notification_interval_secs = std::env::var("NOTIFICATION_SCHEDULER_INTERVAL_SECS")

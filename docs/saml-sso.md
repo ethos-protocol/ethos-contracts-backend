@@ -20,6 +20,7 @@ GET  /saml/metadata → get_metadata                (XML to paste into the IdP)
 GET  /saml/login    → initiate_login              (AuthnRequest + request ID)
 POST /saml/acs      → assertion_consumer_service
                         base64-decode SAMLResponse
+                        verify XML-DSig against the pinned IdP certificate
                         parse_response      → SamlAssertion
                         validate_assertion  → issuer, audience, window,
                                               InResponseTo, replay, signer
@@ -32,16 +33,20 @@ while every other check still applies.
 
 ## Configuration
 
-`SamlConfig` holds one IdP integration:
+Configure one IdP integration with the following environment variables:
 
-| Field | Meaning |
+| Variable | Meaning |
 | --- | --- |
-| `entity_id` | SP entity ID, and the audience assertions must be scoped to |
-| `acs_url` | Absolute URL of the ACS endpoint, advertised in metadata |
-| `idp_entity_id` | Expected assertion issuer |
-| `idp_sso_url` | Where `AuthnRequest`s are POSTed |
-| `idp_certificate` | Base64 body of the IdP signing certificate, no PEM armor |
-| `clock_skew_secs` | Tolerance applied to `NotBefore` / `NotOnOrAfter` |
+| `SAML_SP_ENTITY_ID` | SP entity ID, and the audience assertions must be scoped to |
+| `SAML_SP_ACS_URL` | Absolute URL of the ACS endpoint, advertised in metadata |
+| `SAML_IDP_ENTITY_ID` | Expected assertion issuer |
+| `SAML_IDP_SSO_URL` | Where `AuthnRequest`s are POSTed |
+| `SAML_IDP_CERTIFICATE` | Base64 DER body of the IdP signing certificate, no PEM armor |
+| `SAML_CLOCK_SKEW_SECS` | Optional tolerance applied to `NotBefore` / `NotOnOrAfter` (default `60`) |
+
+SAML routes stay unavailable until all required variables are set. Partial
+configuration or an invalid certificate causes startup to fail rather than
+allowing an incomplete trust configuration.
 
 `certificate_fingerprint` returns the SHA-256 hex digest of a certificate
 body, for pinning it in config review and audit logs.
@@ -59,8 +64,10 @@ own `SamlError` variant:
 - **Validity window** - `NotBefore` / `NotOnOrAfter` from both `Conditions`
   and `SubjectConfirmationData`, using whichever expiry is tighter, widened
   by `clock_skew_secs` (`OutsideValidityWindow`).
-- **Signer** - a `<Signature>` must be present (`Unsigned`) and its
-  `<X509Certificate>` must match the pinned certificate, whitespace ignored
+- **Signer** - XML-DSig must verify against the configured certificate using
+  RSA/ECDSA SHA-256 or stronger; unsigned, tampered, and unsupported-algorithm
+  responses are refused (`InvalidSignature`). The certificate embedded in the
+  signed response must also match the configured certificate
   (`UntrustedSigner`).
 - **Request correlation** - a present `InResponseTo` must match an
   `AuthnRequest` this SP issued and has not consumed (`UnknownRequest`).
@@ -78,14 +85,6 @@ the guard entry is purged at that point instead of being retained forever.
 This bounds the memory used by `consumed_assertions` to the set of
 assertions issued within one validity window, rather than growing without
 limit for the lifetime of the process.
-
-### Signature verification scope
-
-The signature check pins the signing certificate; it does not perform
-XML-DSig RSA digest verification, which requires an XML security library.
-Deployments must therefore terminate `/saml/acs` over TLS and keep
-`idp_certificate` pinned to the IdP's current signing certificate, rotating
-it when the IdP rotates.
 
 ## Attribute mapping
 
@@ -145,11 +144,11 @@ session is established.
 
 1. Serve `GET /saml/metadata` and register the resulting XML with the IdP, or
    configure the IdP manually with the SP entity ID and ACS URL it contains.
-2. Copy the IdP entity ID, SSO URL, and signing certificate into
-   `SamlConfig`. Strip the `-----BEGIN CERTIFICATE-----` armor and keep only
-   the base64 body.
-3. Set `clock_skew_secs` to match the fleet's clock discipline. 60 seconds is
-   a reasonable default for NTP-synced hosts.
+2. Set `SAML_SP_ENTITY_ID`, `SAML_SP_ACS_URL`, `SAML_IDP_ENTITY_ID`,
+   `SAML_IDP_SSO_URL`, and `SAML_IDP_CERTIFICATE`. Strip certificate armor
+   and keep only the base64 body.
+3. Optionally set `SAML_CLOCK_SKEW_SECS` to match the fleet's clock
+   discipline. 60 seconds is a reasonable default for NTP-synced hosts.
 4. Configure the IdP to sign assertions and to send email, display name, and
    group claims. Adjust `AttributeMapping` if the claim names differ.
 5. Verify end to end: hit `GET /saml/login`, POST the returned
@@ -161,5 +160,7 @@ session is established.
 - Single Logout (SLO) is not implemented; sessions expire locally.
 - Encrypted assertions (`EncryptedAssertion`) are not supported, so the IdP
   must be configured to sign without encrypting.
+- XML signature verification uses the native `xmlsec1` and `libxml2`
+  libraries; install their development packages when building the backend.
 - One IdP per configuration. Multi-tenant SSO needs one `SamlState` per
   tenant, selected before the ACS handler runs.

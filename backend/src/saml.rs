@@ -34,6 +34,9 @@ use std::sync::{Arc, Mutex};
 use axum::{extract::State, http::StatusCode, Form, Json};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use samael::crypto::{
+    AllowedSignatureAlgorithm, CertificateDer, Crypto, CryptoProvider, ReduceMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -55,6 +58,76 @@ pub struct SamlConfig {
     pub idp_certificate: String,
     /// Tolerance applied to `NotBefore` / `NotOnOrAfter`, for clock drift.
     pub clock_skew_secs: i64,
+}
+
+impl SamlConfig {
+    /// Read the required SAML settings from the environment. No configuration
+    /// disables SAML; a partially configured integration is a startup error.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let variables = [
+            ("SAML_SP_ENTITY_ID", "entity_id"),
+            ("SAML_SP_ACS_URL", "acs_url"),
+            ("SAML_IDP_ENTITY_ID", "idp_entity_id"),
+            ("SAML_IDP_SSO_URL", "idp_sso_url"),
+            ("SAML_IDP_CERTIFICATE", "idp_certificate"),
+        ];
+        let values: Vec<_> = variables
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect();
+        if values.iter().all(|(_, value)| value.is_none()) {
+            return Ok(None);
+        }
+
+        let missing: Vec<_> = values
+            .iter()
+            .filter_map(|(key, value)| value.is_none().then_some(*key))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "SAML is partially configured; set all required variables (missing: {})",
+                missing.join(", ")
+            ));
+        }
+        if values.iter().any(|(_, value)| {
+            value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        }) {
+            return Err("SAML configuration values must not be empty".to_string());
+        }
+
+        let values: HashMap<_, _> = values
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect();
+        let certificate = normalize_certificate(
+            values
+                .get("SAML_IDP_CERTIFICATE")
+                .expect("required SAML certificate was checked"),
+        );
+        let decoded_certificate = STANDARD
+            .decode(&certificate)
+            .map_err(|_| "SAML_IDP_CERTIFICATE must be a base64 DER certificate".to_string())?;
+        openssl::x509::X509::from_der(&decoded_certificate)
+            .map_err(|_| "SAML_IDP_CERTIFICATE is not a valid DER certificate".to_string())?;
+        let clock_skew_secs = std::env::var("SAML_CLOCK_SKEW_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse()
+            .map_err(|_| "SAML_CLOCK_SKEW_SECS must be a non-negative integer".to_string())?;
+        if clock_skew_secs < 0 {
+            return Err("SAML_CLOCK_SKEW_SECS must be a non-negative integer".to_string());
+        }
+
+        Ok(Some(Self {
+            entity_id: values["SAML_SP_ENTITY_ID"].clone(),
+            acs_url: values["SAML_SP_ACS_URL"].clone(),
+            idp_entity_id: values["SAML_IDP_ENTITY_ID"].clone(),
+            idp_sso_url: values["SAML_IDP_SSO_URL"].clone(),
+            idp_certificate: certificate,
+            clock_skew_secs,
+        }))
+    }
 }
 
 /// Maps IdP attribute names onto the fields this backend needs.
@@ -126,6 +199,8 @@ pub enum SamlError {
     Unsigned,
     #[error("assertion was signed by an untrusted certificate")]
     UntrustedSigner,
+    #[error("SAML response signature verification failed")]
+    InvalidSignature,
     #[error("InResponseTo {0:?} does not match a pending AuthnRequest")]
     UnknownRequest(Option<String>),
     #[error("assertion {0} has already been consumed")]
@@ -154,8 +229,7 @@ pub fn parse_response(xml: &str) -> Result<SamlAssertion, SamlError> {
         return Err(SamlError::StatusNotSuccess(status));
     }
 
-    let assertion =
-        element_body(xml, "Assertion").ok_or(SamlError::MissingElement("Assertion"))?;
+    let assertion = element_body(xml, "Assertion").ok_or(SamlError::MissingElement("Assertion"))?;
     let assertion_tag =
         element_start_tag(xml, "Assertion").ok_or(SamlError::MissingElement("Assertion"))?;
 
@@ -189,8 +263,8 @@ pub fn parse_response(xml: &str) -> Result<SamlAssertion, SamlError> {
     .filter_map(|value| parse_instant(&value))
     .min();
 
-    let session_index =
-        element_start_tag(assertion, "AuthnStatement").and_then(|tag| tag_attribute(tag, "SessionIndex"));
+    let session_index = element_start_tag(assertion, "AuthnStatement")
+        .and_then(|tag| tag_attribute(tag, "SessionIndex"));
 
     let signing_certificate = element_body(assertion, "Signature")
         .or_else(|| element_body(xml, "Signature"))
@@ -374,6 +448,7 @@ pub struct SamlState {
     pub config: SamlConfig,
     pub mapping: AttributeMapping,
     pub security: Arc<SamlSecurityState>,
+    pub enabled: bool,
     /// Users authenticated through SSO, most recent last.
     pub sessions: Arc<Mutex<Vec<SamlUser>>>,
 }
@@ -384,6 +459,24 @@ impl SamlState {
             config,
             mapping,
             security: Arc::new(SamlSecurityState::default()),
+            enabled: true,
+            sessions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            config: SamlConfig {
+                entity_id: String::new(),
+                acs_url: String::new(),
+                idp_entity_id: String::new(),
+                idp_sso_url: String::new(),
+                idp_certificate: String::new(),
+                clock_skew_secs: 60,
+            },
+            mapping: AttributeMapping::default(),
+            security: Arc::new(SamlSecurityState::default()),
+            enabled: false,
             sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -444,19 +537,36 @@ pub fn build_authn_request(state: &SamlState, request_id: &str) -> String {
 
 /// `GET /saml/metadata` handler.
 pub async fn get_metadata(State(state): State<Arc<SamlState>>) -> (StatusCode, String) {
+    if !state.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SAML is not configured".to_string(),
+        );
+    }
     (StatusCode::OK, sp_metadata(&state.config))
 }
 
 /// `GET /saml/login` starts SP-initiated SSO, returning the request the
 /// browser must POST to the IdP.
-pub async fn initiate_login(State(state): State<Arc<SamlState>>) -> Json<serde_json::Value> {
+pub async fn initiate_login(
+    State(state): State<Arc<SamlState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SAML is not configured" })),
+        );
+    }
     let request_id = format!("_{}", uuid::Uuid::new_v4());
     let authn_request = build_authn_request(&state, &request_id);
-    Json(serde_json::json!({
-        "request_id": request_id,
-        "destination": state.config.idp_sso_url,
-        "saml_request": STANDARD.encode(authn_request),
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "destination": state.config.idp_sso_url,
+            "saml_request": STANDARD.encode(authn_request),
+        })),
+    )
 }
 
 /// `POST /saml/acs` consumes an IdP assertion and establishes a session.
@@ -464,10 +574,18 @@ pub async fn assertion_consumer_service(
     State(state): State<Arc<SamlState>>,
     Form(body): Form<AcsForm>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let outcome = parse_encoded_response(&body.SAMLResponse).and_then(|assertion| {
-        validate_assertion(&assertion, &state.config, &state.security, Utc::now())?;
-        map_attributes(&assertion, &state.mapping)
-    });
+    if !state.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SAML is not configured" })),
+        );
+    }
+
+    let outcome =
+        parse_verified_response(&body.SAMLResponse, &state.config).and_then(|assertion| {
+            validate_assertion(&assertion, &state.config, &state.security, Utc::now())?;
+            map_attributes(&assertion, &state.mapping)
+        });
 
     match outcome {
         Ok(user) => {
@@ -489,6 +607,38 @@ pub async fn assertion_consumer_service(
             )
         }
     }
+}
+
+fn parse_verified_response(encoded: &str, config: &SamlConfig) -> Result<SamlAssertion, SamlError> {
+    let raw = STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| SamlError::NotBase64)?;
+    let xml = String::from_utf8(raw).map_err(|_| SamlError::NotUtf8)?;
+    let certificate = STANDARD
+        .decode(normalize_certificate(&config.idp_certificate))
+        .map_err(|_| SamlError::InvalidSignature)?;
+    let certificate = CertificateDer::from(certificate);
+    let allowed_algorithms = [
+        AllowedSignatureAlgorithm::RsaSha256,
+        AllowedSignatureAlgorithm::RsaSha384,
+        AllowedSignatureAlgorithm::RsaSha512,
+        AllowedSignatureAlgorithm::EcdsaSha256,
+        AllowedSignatureAlgorithm::EcdsaSha384,
+        AllowedSignatureAlgorithm::EcdsaSha512,
+    ];
+    // Requiring the Response digest prevents accepting an assertion-only signature.
+    let verified_xml = Crypto::reduce_xml_to_signed_with_allowed_algorithms(
+        &xml,
+        &[certificate],
+        ReduceMode::PreDigest,
+        Some(&allowed_algorithms),
+    )
+    .map_err(|_| SamlError::InvalidSignature)?;
+    let mut assertion = parse_response(&verified_xml)?;
+    if assertion.signing_certificate.is_none() {
+        assertion.signing_certificate = Some(normalize_certificate(&config.idp_certificate));
+    }
+    Ok(assertion)
 }
 
 // === XML helpers
@@ -584,6 +734,13 @@ fn tag_attribute(tag: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::{
+        asn1::Asn1Time,
+        hash::MessageDigest,
+        pkey::PKey,
+        rsa::Rsa,
+        x509::{X509NameBuilder, X509},
+    };
 
     const CERT: &str = "MIIDpDCCAoygAwIBAgIGAV2ka+4iMA0GCSqGSIb3DQEBCwUAMIGSMQsw";
 
@@ -649,6 +806,67 @@ mod tests {
         )
     }
 
+    fn signed_response() -> (String, SamlConfig) {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "SAML test IdP").unwrap();
+        let name = name.build();
+        let mut cert_builder = X509::builder().unwrap();
+        cert_builder.set_version(2).unwrap();
+        cert_builder
+            .set_serial_number(
+                &openssl::bn::BigNum::from_u32(1)
+                    .unwrap()
+                    .to_asn1_integer()
+                    .unwrap(),
+            )
+            .unwrap();
+        cert_builder.set_subject_name(&name).unwrap();
+        cert_builder.set_issuer_name(&name).unwrap();
+        cert_builder.set_pubkey(&key).unwrap();
+        cert_builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert_builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert_builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let certificate = cert_builder.build().to_der().unwrap();
+
+        let placeholder = format!(
+            r#"    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+      <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{CERT}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+    </ds:Signature>"#
+        );
+        let signature_template = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="#_response-1">
+      <ds:Transforms>
+        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+        <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      </ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue></ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue></ds:SignatureValue>
+</ds:Signature>"##;
+        let unsigned_xml = valid_response()
+            .replace(&placeholder, "")
+            .replace("<samlp:Response ", r#"<samlp:Response ID="_response-1" "#)
+            .replace(
+                "</samlp:Status>",
+                &format!("</samlp:Status>{signature_template}"),
+            );
+        let private_key = key.private_key_to_der().unwrap();
+        let signed_xml = Crypto::sign_xml(unsigned_xml.as_bytes(), &private_key).unwrap();
+        let mut config = config();
+        config.idp_certificate = STANDARD.encode(certificate);
+        (STANDARD.encode(signed_xml.as_bytes()), config)
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-30T10:01:00Z")
             .unwrap()
@@ -678,6 +896,28 @@ mod tests {
         assert_eq!(assertion.in_response_to.as_deref(), Some("_req-1"));
         assert_eq!(assertion.session_index.as_deref(), Some("idx-99"));
         assert_eq!(assertion.signing_certificate.as_deref(), Some(CERT));
+    }
+
+    #[test]
+    fn response_signature_is_verified_against_the_pinned_certificate() {
+        let (encoded, config) = signed_response();
+        let assertion = parse_verified_response(&encoded, &config).unwrap();
+        assert_eq!(assertion.subject, "ada@corp.example");
+        assert_eq!(
+            assertion.signing_certificate.as_deref(),
+            Some(config.idp_certificate.as_str())
+        );
+    }
+
+    #[test]
+    fn tampered_response_is_rejected_even_when_the_certificate_is_trusted() {
+        let (encoded, config) = signed_response();
+        let xml = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        let tampered = STANDARD.encode(xml.replace("ada@corp.example", "mallory@corp.example"));
+        assert_eq!(
+            parse_verified_response(&tampered, &config),
+            Err(SamlError::InvalidSignature)
+        );
     }
 
     #[test]

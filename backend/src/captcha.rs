@@ -603,6 +603,8 @@ mod tests {
             profiler_state: Arc::new(crate::profiler::ProfilerState::new()),
             incident_state: Arc::new(crate::incidents::IncidentState::new()),
             token_revocations: crate::token_revocation::RevocationList::new(),
+            saml_state: Arc::new(crate::saml::SamlState::disabled()),
+            fraud_detector: crate::fraud_detection::FraudDetector::new(),
         }
     }
 
