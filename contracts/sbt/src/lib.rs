@@ -10,6 +10,8 @@ mod delegation_tests;
 mod event_registry_tests;
 #[cfg(test)]
 mod custody_tracking_tests;
+#[cfg(test)]
+mod composition_tests;
 mod compression;
 
 use crate::compression::{
@@ -44,6 +46,19 @@ pub const RECOVERY_ATTEMPT_WINDOW_SECONDS: u64 = 3600;
 
 /// A whole share of ownership, expressed in basis points (10_000 = 100%).
 const TOTAL_BASIS_POINTS: u64 = 10_000;
+
+/// Maximum number of direct components a single composition node may reference
+/// (issue #782). Prevents unbounded storage writes in `set_composition_components`.
+pub const MAX_COMPOSITION_COMPONENTS: u32 = 16;
+
+/// Maximum nesting depth allowed when resolving a composition graph (issue #782).
+/// Prevents unbounded recursion / stack growth in `resolve_composition_inner`
+/// and limits the total nodes traversed in `composition_reaches_any`.
+pub const MAX_COMPOSITION_DEPTH: u32 = 8;
+
+/// Maximum number of credentials accepted per `atomic_release_credentials` call
+/// (issue #781). Keeps the batch within per-transaction compute budget.
+pub const MAX_CREDENTIAL_BATCH: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -105,6 +120,12 @@ pub enum SbtError {
     NoRecoveryCodes = 27,
     /// Recovery attempts have exceeded the allowed rate for the current window.
     RecoveryRateLimited = 28,
+    /// The credential batch exceeds the per-transaction limit (issue #781).
+    BatchTooLarge = 29,
+    /// The component list exceeds the per-composition limit (issue #782).
+    TooManyComponents = 30,
+    /// The composition graph exceeds the maximum nesting depth (issue #782).
+    CompositionTooDeep = 31,
 }
 
 /// Storage key discriminants. All per-token state is keyed by `sbt_id`.
@@ -564,6 +585,9 @@ impl SbtContract {
         if credential_ids.is_empty() {
             panic_with_error!(&env, SbtError::EmptyBatch);
         }
+        if credential_ids.len() > MAX_CREDENTIAL_BATCH {
+            panic_with_error!(&env, SbtError::BatchTooLarge);
+        }
 
         let mut seen_ids: Map<u64, bool> = Map::new(&env);
         let mut authorized_agents: Map<Address, bool> = Map::new(&env);
@@ -671,6 +695,9 @@ impl SbtContract {
         Self::require_owner(&env, sbt_id);
         if component_ids.is_empty() || Self::composition_reaches_any(&env, &component_ids, sbt_id) {
             panic_with_error!(&env, SbtError::InvalidCompositionGraph);
+        }
+        if component_ids.len() > MAX_COMPOSITION_COMPONENTS {
+            panic_with_error!(&env, SbtError::TooManyComponents);
         }
         for component_id in component_ids.iter() {
             Self::load_owner(&env, *component_id);
@@ -1053,7 +1080,7 @@ impl SbtContract {
         resolved: &mut Vec<u64>,
     ) {
         if depth >= MAX_COMPOSITION_DEPTH || visited.contains_key(current) {
-            panic_with_error!(env, SbtError::InvalidCompositionGraph);
+            panic_with_error!(env, SbtError::CompositionTooDeep);
         }
         visited.set(current, true);
         if let Some(components) = env.storage().persistent().get::<DataKey, CompositionComponents>(

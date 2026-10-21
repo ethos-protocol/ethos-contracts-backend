@@ -114,3 +114,49 @@ fn atomic_release_requires_every_distinct_escrow_agent() {
     assert!(!client.get_escrow_status(&first).unwrap().released);
     assert!(!client.get_escrow_status(&second).unwrap().released);
 }
+
+// ---- issue #781: batch size cap ----
+
+/// A batch of exactly MAX_CREDENTIAL_BATCH credentials must succeed.
+#[test]
+fn atomic_release_accepts_batch_exactly_at_cap() {
+    let (env, contract_id, owner, _) = setup();
+    let escrow_agent = Address::generate(&env);
+    let client = SbtContractClient::new(&env, &contract_id);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_CREDENTIAL_BATCH {
+        ids.push_back(create_escrowed_credential(&env, &contract_id, &owner, &escrow_agent));
+    }
+
+    // All at cap — must not panic.
+    let results = client.atomic_release_credentials(&ids);
+    assert_eq!(results.len(), MAX_CREDENTIAL_BATCH);
+    assert!(results.iter().all(|r| *r));
+}
+
+/// A batch of MAX_CREDENTIAL_BATCH + 1 must be rejected with BatchTooLarge
+/// before any escrow record is mutated.
+#[test]
+fn atomic_release_rejects_batch_above_cap() {
+    let (env, contract_id, owner, _) = setup();
+    let escrow_agent = Address::generate(&env);
+    let client = SbtContractClient::new(&env, &contract_id);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..=MAX_CREDENTIAL_BATCH {
+        // MAX + 1
+        ids.push_back(create_escrowed_credential(&env, &contract_id, &owner, &escrow_agent));
+    }
+
+    let err = client
+        .try_atomic_release_credentials(&ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, SbtError::BatchTooLarge);
+
+    // No credential should have been released.
+    for id in ids.iter() {
+        assert!(!client.get_escrow_status(id).unwrap().released);
+    }
+}
