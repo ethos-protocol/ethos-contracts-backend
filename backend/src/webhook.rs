@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
@@ -93,6 +94,8 @@ pub fn create_webhook_store() -> WebhookStore {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── Axum handler state ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -120,7 +123,10 @@ impl WebhookState {
     ) -> Self {
         Self {
             store: create_webhook_store(),
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .timeout(DELIVERY_TIMEOUT)
+                .build()
+                .expect("webhook HTTP client configuration is valid"),
             dlq_state,
             health_routing_state,
             clock: Arc::new(SystemClock),
