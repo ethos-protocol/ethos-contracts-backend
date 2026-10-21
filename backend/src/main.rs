@@ -95,6 +95,7 @@ use ethos_protocol_backend::{
     scheduler,
     schema_validation::{openapi_validation_middleware, OpenApiSpec},
     streaming::{stream_events, stream_vaults},
+    token_revocation::revoke_token,
     timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
     timeseries::{
@@ -238,6 +239,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/auth/revoke", post(revoke_token))
         // ── Graceful degradation routes ─────────────────────────────────────
         .route(
             "/admin/capabilities",
@@ -530,6 +532,7 @@ async fn main() {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         rpc_pool,
         incident_state: Arc::new(ethos_protocol_backend::incidents::IncidentState::new()),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

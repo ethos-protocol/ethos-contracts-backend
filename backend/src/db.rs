@@ -92,6 +92,8 @@ pub struct AppState {
     pub incident_state: Arc<crate::incidents::IncidentState>,
     /// RPC connection pool; probed by `/ready` (#698).
     pub rpc_pool: Arc<crate::rpc_pool::RpcPool>,
+    /// In-memory deny-list shared by token revocation and authentication.
+    pub token_revocations: Arc<crate::token_revocation::RevocationList>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -109,6 +111,12 @@ impl axum::extract::FromRef<AppState> for Arc<AppState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
     fn from_ref(state: &AppState) -> Arc<crate::webhook::WebhookState> {
         Arc::clone(&state.webhook_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::token_revocation::RevocationList> {
+    fn from_ref(state: &AppState) -> Arc<crate::token_revocation::RevocationList> {
+        Arc::clone(&state.token_revocations)
     }
 }
 

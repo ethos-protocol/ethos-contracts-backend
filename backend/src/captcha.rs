@@ -598,6 +598,8 @@ mod tests {
             flag_state,
             query_cache: Arc::new(QueryCache::new()),
             deadlock_detector: Arc::new(DeadlockDetector::new()),
+            incident_state: Arc::new(crate::incidents::IncidentState::new()),
+            token_revocations: crate::token_revocation::RevocationList::new(),
         }
     }
 

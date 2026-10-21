@@ -97,6 +97,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         rpc_pool: test_rpc_pool(),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
     }
 }
 
@@ -445,6 +446,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
         incident_state: Arc::new(IncidentState::new()),
         rpc_pool: test_rpc_pool(),
+        token_revocations: ethos_protocol_backend::token_revocation::RevocationList::new(),
     };
     db.migrate().unwrap();
 
