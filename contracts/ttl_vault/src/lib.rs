@@ -626,6 +626,7 @@ pub enum ContractError {
     UpgradeFunctionSignaturesRequired = 166,
     NoPendingUpgrade = 167,
     UpgradeTimeLocked = 168,
+    BatchSizeExceeded = 169,
 }
 
 #[contract]
@@ -6676,16 +6677,28 @@ impl TtlVaultContract {
         Self::load_token(&env)
     }
 
-    /// Returns all vault IDs where the given address is a beneficiary - Issue #398
+    /// Returns a paginated slice of vault IDs where the given address is a beneficiary.
+    pub fn get_vaults_as_beneficiary_page(
+        env: Env,
+        beneficiary: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<u64> {
+        let all = Self::load_beneficiary_vault_ids(&env, &beneficiary);
+        Self::paginate(&env, all, page, page_size)
+    }
+
+    /// Returns up to 50 vault IDs where the given address is a beneficiary.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `beneficiary` - The beneficiary address
     ///
     /// # Returns
-    /// A vector of vault IDs where the address is a beneficiary
+    /// The first page of vault IDs where the address is a beneficiary
+    #[deprecated(note = "Use get_vaults_as_beneficiary_page to paginate beneficiary vault IDs")]
     pub fn get_vaults_as_beneficiary(env: Env, beneficiary: Address) -> Vec<u64> {
-        Self::load_beneficiary_vault_ids(&env, &beneficiary)
+        Self::get_vaults_as_beneficiary_page(env, beneficiary, 0, 50)
     }
 
     /// Returns passkey usage history for a vault - Issue #395
@@ -8564,9 +8577,9 @@ impl TtlVaultContract {
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
     }
 
-    /// Returns the vault activity log (alias for get_vault_audit_log).
+    /// Returns the first page of the vault activity log.
     pub fn get_vault_activity_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
-        Self::get_vault_audit_log(env, vault_id)
+        Self::get_vault_audit_log_page(env, vault_id, 0, Self::AUDIT_LOG_PAGE_SIZE)
     }
 
     /// Transfers vault ownership immediately (single-step, backwards-compatible).
@@ -9907,6 +9920,7 @@ impl TtlVaultContract {
     ///
     /// # Returns
     /// A vector of audit entries in chronological order (oldest first)
+    #[deprecated(note = "Use get_vault_audit_log_page to read audit entries in bounded pages")]
     pub fn get_vault_audit_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
         let mut result: Vec<AuditEntry> = Vec::new(&env);
 
@@ -9963,20 +9977,51 @@ impl TtlVaultContract {
         page: u32,
         page_size: u32,
     ) -> Vec<AuditEntry> {
-        // Gather all entries (legacy + new) then return the requested slice.
-        // For most vaults only the new layout is active; legacy vaults are handled
-        // in get_vault_audit_log above.
-        let all = Self::get_vault_audit_log(env.clone(), vault_id);
-        let total = all.len() as u32;
         let cap = page_size.min(Self::AUDIT_LOG_PAGE_SIZE);
-        let start = page * cap;
-        if start >= total {
+        if cap == 0 {
             return Vec::new(&env);
         }
-        let end = (start + cap).min(total);
+        let start = page.saturating_mul(cap);
         let mut result: Vec<AuditEntry> = Vec::new(&env);
-        for i in start..end {
-            result.push_back(all.get(i).unwrap());
+
+        let legacy: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultAuditLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let legacy_len = legacy.len();
+        if start < legacy_len {
+            let legacy_end = start.saturating_add(cap).min(legacy_len);
+            for index in start..legacy_end {
+                result.push_back(legacy.get(index).unwrap());
+            }
+        }
+
+        let mut new_index = start.saturating_sub(legacy_len);
+        let total_new: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultAuditLogLen(vault_id))
+            .unwrap_or(0);
+        while result.len() < cap && new_index < total_new {
+            let page_index = new_index / Self::AUDIT_LOG_PAGE_SIZE;
+            let page_offset = new_index % Self::AUDIT_LOG_PAGE_SIZE;
+            let entries: Vec<AuditEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VaultAuditLogPage(vault_id, page_index))
+                .unwrap_or_else(|| Vec::new(&env));
+            let count = entries
+                .len()
+                .saturating_sub(page_offset)
+                .min(cap - result.len());
+            if count == 0 {
+                break;
+            }
+            for offset in 0..count {
+                result.push_back(entries.get(page_offset + offset).unwrap());
+            }
+            new_index += count;
         }
         result
     }
@@ -10275,8 +10320,11 @@ impl TtlVaultContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `vault_ids` - Vector of vault IDs to check
+    /// * `vault_ids` - Vector of up to 50 vault IDs to check
     pub fn emit_expiry_warnings(env: Env, vault_ids: Vec<u64>) {
+        if vault_ids.len() > 50 {
+            panic_with_error!(&env, ContractError::BatchSizeExceeded);
+        }
         let warning_threshold: u64 = 604_800; // 7 days in seconds
 
         for vault_id in vault_ids.iter() {
@@ -12597,11 +12645,14 @@ impl TtlVaultContract {
     /// to poll many vaults efficiently.
     ///
     /// # Arguments
-    /// * `vault_ids` - List of vault IDs to query (max 20 to stay within gas limits)
+    /// * `vault_ids` - List of up to 20 vault IDs to query
     ///
     /// # Returns
     /// A vector of `VaultStatusSummary` for each found vault.
     pub fn get_vault_batch_status(env: Env, vault_ids: Vec<u64>) -> Vec<VaultStatusSummary> {
+        if vault_ids.len() > 20 {
+            panic_with_error!(&env, ContractError::BatchSizeExceeded);
+        }
         let mut results = Vec::new(&env);
         let now = env.ledger().timestamp();
         for vault_id in vault_ids.iter() {

@@ -3728,6 +3728,7 @@ fn test_non_primary_beneficiary_cannot_veto() {
 // ---- Issue #398: Beneficiary Notification System Tests ----
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3743,6 +3744,7 @@ fn test_get_vaults_as_beneficiary() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_get_vaults_as_beneficiary_empty() {
     let (env, owner, beneficiary, _, _, client) = setup();
     
@@ -3754,6 +3756,27 @@ fn test_get_vaults_as_beneficiary_empty() {
     // Get vaults for non-beneficiary
     let vaults = client.get_vaults_as_beneficiary(&other_beneficiary);
     assert_eq!(vaults.len(), 0);
+}
+
+#[test]
+fn test_get_vaults_as_beneficiary_pagination() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let ids: alloc::vec::Vec<u64> = (0..5)
+        .map(|_| client.create_vault(&owner, &beneficiary, &100u64, &None))
+        .collect();
+
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &0u32, &2u32),
+        vec![&env, ids[0], ids[1]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &1u32, &2u32),
+        vec![&env, ids[2], ids[3]]
+    );
+    assert_eq!(
+        client.get_vaults_as_beneficiary_page(&beneficiary, &2u32, &2u32),
+        vec![&env, ids[4]]
+    );
 }
 
 #[test]
@@ -4597,9 +4620,8 @@ fn test_audit_log_page_size_stays_bounded() {
         client.withdraw(&vault_id, &owner, &1i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
-    // We expect exactly 125 entries (1 create + 124 deposit/withdraw).
-    assert_eq!(all.len(), 125, "expected 125 total audit entries");
+    // The compatibility alias is now bounded to a single page.
+    assert_eq!(client.get_vault_activity_log(&vault_id).len(), 50);
 
     // Verify that each paginated storage key holds at most PAGE_SIZE entries by
     // reading pages 0..2 through the public paged accessor.
@@ -4612,11 +4634,13 @@ fn test_audit_log_page_size_stays_bounded() {
     assert_eq!(page1.len(), 50, "page 1 must contain exactly 50 entries");
     assert_eq!(page2.len(), 25, "page 2 (tail) must contain the remaining 25 entries");
     assert!(page3.is_empty(), "page 3 does not exist and should be empty");
+    assert_eq!(page0.len() + page1.len() + page2.len(), 125);
 }
 
 /// Verify that all historical entries remain retrievable via the paged accessor
 /// after the storage layout change — no entries should be dropped or reordered.
 #[test]
+#[allow(deprecated)]
 fn test_audit_log_historical_entries_readable_via_pagination() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
@@ -4627,7 +4651,7 @@ fn test_audit_log_historical_entries_readable_via_pagination() {
         client.withdraw(&vault_id, &owner, &1_000i128);
     }
 
-    let all = client.get_vault_activity_log(&vault_id);
+    let all = client.get_vault_audit_log(&vault_id);
     assert_eq!(all.len(), 55);
 
     // First entry is create_vault (written before the loop).
@@ -7342,4 +7366,44 @@ fn test_beneficiary_delegation_chain_order_preserved() {
     for (i, addr) in chain.iter().enumerate() {
         assert_eq!(addr, delegates[i]);
     }
+}
+
+#[test]
+fn test_get_vault_batch_status_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..20 {
+        vault_ids.push_back(vault_id);
+    }
+
+    assert!(client.get_vault_batch_status(&vault_ids).is_empty());
+    vault_ids.push_back(20);
+    let err = client
+        .try_get_vault_batch_status(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
+}
+
+#[test]
+fn test_emit_expiry_warnings_enforces_maximum_batch_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut vault_ids = Vec::new(&env);
+    for vault_id in 0..50 {
+        vault_ids.push_back(vault_id);
+    }
+
+    client.emit_expiry_warnings(&vault_ids);
+    vault_ids.push_back(50);
+    let err = client
+        .try_emit_expiry_warnings(&vault_ids)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(ContractError::BatchSizeExceeded as u32)
+    );
 }
