@@ -36,6 +36,11 @@ pub const MAX_CREDENTIAL_SNAPSHOTS: u32 = 1000;
 /// validating a parent's ancestry, so that chain walks (and the gas they
 /// cost) stay bounded. See docs/zk-verifier.md, "Credential Hierarchies".
 pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
+/// Maximum number of (proof, claim) pairs accepted by
+/// [`ZkVerifierContract::verify_credentials_consistent`] in a single call.
+/// Caps both on-chain gas and the O(n²) consistency-pair expansion so that
+/// one call cannot exhaust ledger resources.
+pub const MAX_CREDENTIAL_BATCH_SIZE: u32 = 100;
 /// Number of ledger seconds between scheduled consistency re-checks for a
 /// long-lived attestation. `attest` and `create_derived_credential` schedule
 /// the first check this far after attestation; each completed re-check (via
@@ -104,6 +109,9 @@ pub enum VerifierError {
     /// The caller is not permitted to view this credential's attestation
     /// record at its current privacy level.
     AccessDenied = 21,
+    /// The batch passed to `verify_credentials_consistent` exceeds
+    /// `MAX_CREDENTIAL_BATCH_SIZE`.
+    BatchTooLarge = 22,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -1181,13 +1189,19 @@ impl ZkVerifierContract {
     ///
     /// # Panics
     ///
-    /// Panics if the input lists are mismatched lengths or empty.
+    /// Panics with a typed [`VerifierError`] if:
+    /// - `proofs` and `claims` have different lengths (`MismatchedBatchLengths`)
+    /// - either list is empty (`EmptyBatchIds`)
+    /// - the batch exceeds [`MAX_CREDENTIAL_BATCH_SIZE`] (`BatchTooLarge`)
     pub fn verify_credentials_consistent(env: Env, proofs: Vec<Bytes>, claims: Vec<Bytes>) -> bool {
         if proofs.len() != claims.len() {
             panic_with_error!(&env, VerifierError::MismatchedBatchLengths);
         }
         if proofs.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyBatchIds);
+        }
+        if proofs.len() > MAX_CREDENTIAL_BATCH_SIZE {
+            panic_with_error!(&env, VerifierError::BatchTooLarge);
         }
 
         // Step 1: Verify each credential individually

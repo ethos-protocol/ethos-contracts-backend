@@ -13,7 +13,7 @@ http://localhost:3000/api
 **Environment Variables**:
 
 - `ALLOWED_ORIGINS` — Comma-separated CORS origins (e.g., `http://localhost:3001,https://example.com`)
-- `DATABASE_URL` — Database connection string (defaults to in-memory `:memory:`)
+- `DB_PATH` — SQLite file path (default `/var/lib/ethos-protocol/ethos-protocol.db`). `:memory:` is refused unless `ALLOW_EPHEMERAL_DB=true`
 - `DATABASE_POOL_MIN` — Minimum connections (default: 5)
 - `DATABASE_POOL_MAX` — Maximum connections (default: 20)
 - `DATABASE_POOL_TIMEOUT_SECS` — Connection timeout (default: 30)

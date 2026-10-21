@@ -14,8 +14,8 @@ use soroban_sdk::{
 
 pub mod aml;
 pub mod compliance;
-pub mod compliance_policy;
 pub mod composition_rules;
+pub mod compliance_policy;
 // QUARANTINED: this test module calls contract APIs that are not yet
 // implemented in lib.rs (see git history). Re-enable once they exist.
 // #[cfg(test)]
@@ -133,6 +133,7 @@ use types::{
     ConflictResolution,
     CountdownConfig,
     CustomMetadataEntry,
+    // Issue #560: Merkle history proofs
     PasskeyLockout,
     PasskeyRecoveryRequest,
     PasskeyRotationPolicy,
@@ -164,6 +165,7 @@ use types::{
     COUNTDOWN_NOTIF_TOPIC,
     EMERGENCY_RECOVERY_GENERATED_TOPIC,
     EMERGENCY_RECOVERY_USED_TOPIC,
+    // New event topics
     MAX_VESTING_SCHEDULES,
     MILESTONE_ADJUST_TOPIC,
     MILESTONE_CLAIM_TOPIC,
@@ -574,28 +576,28 @@ pub enum ContractError {
     // Upgrade safety: a new contract changed a public function signature.
     UpgradeFunctionSignaturesChanged = 138,
     UpgradeFunctionSignaturesNotSet = 139,
+    // Compliance controls (#635): blacklist, allowlist, KYC, reporting
+    InvalidBlacklistReason = 140,
+    AddressBlacklisted = 141,
+    AddressNotAllowlisted = 142,
+    KycProviderNotSet = 143,
+    KycNotFound = 144,
+    KycRequired = 145,
+    AlertNotFound = 146,
+    InvalidReportRange = 147,
+    ReportSignerNotSet = 148,
+    // Composition rules: candidate rule contradicts an enabled rule
+    CompositionRuleConflict = 149,
     // Lending (Issue #609)
-    PoolAlreadyExists = 140,
-    PoolNotFound = 141,
-    InsufficientPoolLiquidity = 142,
-    InsufficientCollateral = 143,
-    LoanNotFound = 144,
-    LoanNotActive = 145,
-    LoanNotDue = 146,
-    InvalidLendingConfig = 147,
-    InsufficientShares = 148,
-    // Compliance (Issues #547-#550): blacklist, allowlist, KYC, alerts, reports
-    InvalidBlacklistReason = 149,
-    AddressBlacklisted = 150,
-    AddressNotAllowlisted = 151,
-    KycProviderNotSet = 152,
-    KycNotFound = 153,
-    KycRequired = 154,
-    AlertNotFound = 155,
-    InvalidReportRange = 156,
-    ReportSignerNotSet = 157,
-    // Composition rules (Issue #44): new rule conflicts with an enabled rule
-    CompositionRuleConflict = 158,
+    PoolAlreadyExists = 150,
+    PoolNotFound = 151,
+    InsufficientPoolLiquidity = 152,
+    InsufficientCollateral = 153,
+    LoanNotFound = 154,
+    LoanNotActive = 155,
+    LoanNotDue = 156,
+    InvalidLendingConfig = 157,
+    InsufficientShares = 158,
 }
 
 #[contract]
@@ -1124,7 +1126,7 @@ impl TtlVaultContract {
     /// Admin-only. Records the function-signature fingerprint alongside the
     /// legacy upgrade manifest. The fingerprint is computed from the sorted
     /// public function names, argument types, and return types in the WASM spec.
-    pub fn set_manifest_with_signatures(
+    pub fn set_upgrade_manifest_signed(
         env: Env,
         exported_fn_count: u32,
         error_code_count: u32,
@@ -1196,7 +1198,7 @@ impl TtlVaultContract {
 
     /// Validates the legacy manifest and requires an identical public function
     /// signature fingerprint for the proposed contract.
-    pub fn validate_upgrade_compat_sigs(
+    pub fn validate_upgrade_signed(
         env: Env,
         new_exported_fn_count: u32,
         new_error_code_count: u32,
@@ -1280,7 +1282,7 @@ impl TtlVaultContract {
 
     /// Admin-only. Performs an upgrade after validating the full manifest,
     /// including an exact public function-signature fingerprint.
-    pub fn upgrade_with_manifest_sigs(
+    pub fn upgrade_with_signed_manifest(
         env: Env,
         new_wasm_hash: BytesN<32>,
         new_exported_fn_count: u32,
@@ -1290,7 +1292,7 @@ impl TtlVaultContract {
     ) {
         Self::require_admin(&env);
         Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
-        Self::validate_upgrade_compat_sigs(
+        Self::validate_upgrade_signed(
             env.clone(),
             new_exported_fn_count,
             new_error_code_count,
@@ -1303,7 +1305,7 @@ impl TtlVaultContract {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
 
-        Self::set_manifest_with_signatures(
+        Self::set_upgrade_manifest_signed(
             env,
             new_exported_fn_count,
             new_error_code_count,
@@ -3844,14 +3846,17 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The remaining TTL in seconds (0 if expired)
-    pub fn ping_expiry(env: Env, vault_id: u64) -> u64 {
-        let vault = Self::try_load_vault(&env, vault_id)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+    /// `Ok(ttl)` with remaining TTL in seconds (0 if expired), or
+    /// `Err(ContractError::VaultNotFound)` if the vault does not exist.
+    pub fn ping_expiry(env: Env, vault_id: u64) -> Result<u64, ContractError> {
+        let vault = match Self::try_load_vault(&env, vault_id) {
+            Some(v) => v,
+            None => return Err(ContractError::VaultNotFound),
+        };
 
         // Only emit events for Locked vaults
         if vault.status != ReleaseStatus::Locked {
-            return 0;
+            return Ok(0);
         }
 
         let ttl = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
@@ -3862,7 +3867,7 @@ impl TtlVaultContract {
         // Issue #560: per-passkey expiry warning, additive to the vault-level check above.
         Self::check_passkey_expiry_warnings(&env, vault_id, env.ledger().timestamp());
 
-        ttl
+        Ok(ttl)
     }
 
     /// Emits `pk_expwrn` for every registered passkey on `vault_id` whose
@@ -10247,29 +10252,28 @@ impl TtlVaultContract {
             // generation unambiguously invalid, even when codes are regenerated
             // in the same ledger timestamp.
             let code_number = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
-            // "code" + decimal digits of code_number (at most 4 + 20 bytes)
+            // Render "code" followed by the decimal digits of `code_number`
+            // into a fixed buffer (u64 has at most 20 decimal digits).
             let mut buf = [0u8; 24];
             buf[..4].copy_from_slice(b"code");
             let mut len = 4usize;
             let mut digits = [0u8; 20];
             let mut digit_count = 0usize;
             let mut remaining = code_number;
-            if remaining == 0 {
-                digits[0] = b'0';
-                digit_count = 1;
-            }
-            while remaining > 0 {
+            loop {
                 digits[digit_count] = b'0' + (remaining % 10) as u8;
                 digit_count += 1;
                 remaining /= 10;
+                if remaining == 0 {
+                    break;
+                }
             }
             while digit_count > 0 {
                 digit_count -= 1;
                 buf[len] = digits[digit_count];
                 len += 1;
             }
-            let code_str =
-                String::from_str(&env, core::str::from_utf8(&buf[..len]).unwrap_or("code"));
+            let code_str = String::from_bytes(&env, &buf[..len]);
             codes.push_back(BackupCode {
                 code: code_str.clone(),
                 used: false,

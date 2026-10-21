@@ -70,7 +70,7 @@ fn test_ping_expiry_emits_warning_for_passkey_near_expiry() {
     let expires_at = now + 100;
     client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
 
-    client.ping_expiry(&vault_id);
+    client.ping_expiry(&vault_id).unwrap();
 
     let seconds_remaining = passkey_expiry_warning_seconds(&env, &passkey_hash);
     assert_eq!(seconds_remaining, Some(100));
@@ -90,7 +90,7 @@ fn test_ping_expiry_no_warning_for_passkey_far_from_expiry() {
     let expires_at = now + EXPIRY_WARNING_THRESHOLD + 1_000;
     client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
 
-    client.ping_expiry(&vault_id);
+    client.ping_expiry(&vault_id).unwrap();
 
     assert_eq!(passkey_expiry_warning_seconds(&env, &passkey_hash), None);
 }
@@ -108,7 +108,7 @@ fn test_ping_expiry_seconds_remaining_matches_expiry_delta() {
     let expires_at = now + 42_000;
     client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
 
-    client.ping_expiry(&vault_id);
+    client.ping_expiry(&vault_id).unwrap();
 
     assert_eq!(
         passkey_expiry_warning_seconds(&env, &passkey_hash),
@@ -126,7 +126,7 @@ fn test_ping_expiry_does_not_warn_for_passkey_without_expiry_configured() {
     let passkey_hash = BytesN::<32>::from_array(&env, &[10u8; 32]);
     client.add_passkey(&vault_id, &owner, &passkey_hash);
 
-    client.ping_expiry(&vault_id);
+    client.ping_expiry(&vault_id).unwrap();
 
     assert_eq!(passkey_expiry_warning_seconds(&env, &passkey_hash), None);
 }

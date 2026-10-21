@@ -30,9 +30,9 @@ fn successful_wasm_upgrade_preserves_initialized_state() {
     let storage_hash = BytesN::from_array(&env, &[1; 32]);
     let signature_hash = BytesN::from_array(&env, &[2; 32]);
     let candidate_hash = env.deployer().upload_contract_wasm(wasm.as_slice());
-    client.set_manifest_with_signatures(&10u32, &5u32, &storage_hash, &signature_hash);
+    client.set_upgrade_manifest_signed(&10u32, &5u32, &storage_hash, &signature_hash);
 
-    client.upgrade_with_manifest_sigs(
+    client.upgrade_with_signed_manifest(
         &candidate_hash,
         &10u32,
         &5u32,
@@ -51,8 +51,8 @@ fn successful_wasm_upgrade_preserves_initialized_state() {
     );
 
     // This admin-only call proves initialization state survived the WASM swap.
-    client.set_manifest_with_signatures(&11u32, &6u32, &storage_hash, &signature_hash);
-    client.validate_upgrade_compat_sigs(
+    client.set_upgrade_manifest_signed(&11u32, &6u32, &storage_hash, &signature_hash);
+    client.validate_upgrade_signed(
         &11u32,
         &6u32,
         &storage_hash,

@@ -1,7 +1,7 @@
 # ADR-0005: PostgreSQL for Backend Storage
 
 **Date:** 2024-03-10  
-**Status:** Accepted  
+**Status:** Superseded by [ADR-0006](0006-sqlite-backend-storage.md)  
 **Deciders:** Core team
 
 ---
