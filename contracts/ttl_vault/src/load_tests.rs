@@ -48,7 +48,13 @@ struct LoadEnv {
     client: TtlVaultContractClient<'static>,
 }
 
-fn load_setup(mint_per_owner: i128) -> (LoadEnv, Address /* owner */, Address /* beneficiary */) {
+fn load_setup(
+    mint_per_owner: i128,
+) -> (
+    LoadEnv,
+    Address, /* owner */
+    Address, /* beneficiary */
+) {
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
@@ -68,7 +74,16 @@ fn load_setup(mint_per_owner: i128) -> (LoadEnv, Address /* owner */, Address /*
     client.initialize(&token_address, &admin);
 
     let client: TtlVaultContractClient<'static> = unsafe { core::mem::transmute(client) };
-    (LoadEnv { env, token_address, admin, client }, owner, beneficiary)
+    (
+        LoadEnv {
+            env,
+            token_address,
+            admin,
+            client,
+        },
+        owner,
+        beneficiary,
+    )
 }
 
 // ── Scenario 1: 1 000 concurrent vaults ──────────────────────────────────────
@@ -90,14 +105,21 @@ fn load_1000_concurrent_vaults() {
         // Mint tokens for each owner.
         StellarAssetClient::new(env, &le.token_address).mint(&owner_i, &10_000);
 
-        let id = le.client.create_vault(&owner_i, &beneficiary_i, &3600u64, &None);
+        let id = le
+            .client
+            .create_vault(&owner_i, &beneficiary_i, &3600u64, &None);
         vault_ids.push(id);
     }
 
     // All vault IDs must be unique.
     vault_ids.sort_unstable();
     vault_ids.dedup();
-    assert_eq!(vault_ids.len(), N, "Vault IDs must all be unique for {} vaults", N);
+    assert_eq!(
+        vault_ids.len(),
+        N,
+        "Vault IDs must all be unique for {} vaults",
+        N
+    );
 
     // Spot-check: every vault was created with zero balance.
     for &id in vault_ids.iter().step_by(100) {
@@ -128,7 +150,9 @@ fn load_10000_withdrawal_operations() {
 
     let (le, owner, beneficiary) = load_setup(DEPOSIT_PER_OP * N as i128);
     let env = &le.env;
-    let vault_id = le.client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id = le
+        .client
+        .create_vault(&owner, &beneficiary, &3600u64, &None);
 
     // Fund the vault with enough for all withdrawals.
     le.client
@@ -171,7 +195,9 @@ fn load_vault_check_in_throughput() {
         let owner = Address::generate(env);
         let beneficiary = Address::generate(env);
         StellarAssetClient::new(env, &le.token_address).mint(&owner, &1_000);
-        let id = le.client.create_vault(&owner, &beneficiary, &interval, &None);
+        let id = le
+            .client
+            .create_vault(&owner, &beneficiary, &interval, &None);
         vault_ids.push(id);
         owners.push(owner);
     }
@@ -211,7 +237,9 @@ fn load_deposit_throughput() {
 
     let (le, owner, beneficiary) = load_setup(AMOUNT * N as i128);
     let env = &le.env;
-    let vault_id = le.client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id = le
+        .client
+        .create_vault(&owner, &beneficiary, &3600u64, &None);
 
     for _ in 0..N {
         le.client.deposit(&vault_id, &owner, &AMOUNT);
@@ -222,7 +250,9 @@ fn load_deposit_throughput() {
         le.client.get_vault_balance(&vault_id),
         expected,
         "{} deposits of {} must accumulate to {}",
-        N, AMOUNT, expected
+        N,
+        AMOUNT,
+        expected
     );
 
     print_budget(env, "load_deposit_throughput");
@@ -250,7 +280,9 @@ fn load_release_many_vaults() {
         let beneficiary = Address::generate(env);
         StellarAssetClient::new(env, &le.token_address).mint(&owner, &DEPOSIT);
 
-        let id = le.client.create_vault(&owner, &beneficiary, &interval, &None);
+        let id = le
+            .client
+            .create_vault(&owner, &beneficiary, &interval, &None);
         le.client.deposit(&id, &owner, &DEPOSIT);
 
         vault_ids.push(id);
@@ -280,9 +312,6 @@ fn load_release_many_vaults() {
 fn print_budget(env: &Env, label: &str) -> (u64, u64) {
     let cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let mem = env.cost_estimate().budget().mem_byte_cost();
-    println!(
-        "[load] {}: cpu={} mem={}",
-        label, cpu, mem
-    );
+    println!("[load] {}: cpu={} mem={}", label, cpu, mem);
     (cpu, mem)
 }

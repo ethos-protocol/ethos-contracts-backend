@@ -57,7 +57,10 @@ fn test_risk_score_ranges_from_zero_to_hundred() {
     client.check_in(&vault_id, &owner, &passkey_hash, &0u64);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "passkey should be present for risk calculation");
+    assert!(
+        vault.passkeys.len() > 0,
+        "passkey should be present for risk calculation"
+    );
 }
 
 /// Requirement 507, AC2: Hardware attestation reduces risk score.
@@ -73,7 +76,10 @@ fn test_hardware_attestation_lowers_risk_score() {
     client.check_in(&vault_id, &owner, &hardware_passkey, &0u64);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "hardware-backed passkey registered");
+    assert!(
+        vault.passkeys.len() > 0,
+        "hardware-backed passkey registered"
+    );
 }
 
 /// Requirement 507, AC3: Software attestation increases risk score.
@@ -89,7 +95,10 @@ fn test_software_attestation_increases_risk_score() {
     client.check_in(&vault_id, &owner, &software_passkey, &0u64);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "software-backed passkey registered");
+    assert!(
+        vault.passkeys.len() > 0,
+        "software-backed passkey registered"
+    );
 }
 
 /// Requirement 507, AC4: Failed authentication attempts increase risk score.
@@ -105,7 +114,10 @@ fn test_failed_attempts_increase_risk_score() {
     let _result1 = client.try_check_in(&vault_id, &owner, &passkey_hash, &0u64);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "passkey present for risk tracking");
+    assert!(
+        vault.passkeys.len() > 0,
+        "passkey present for risk tracking"
+    );
 }
 
 /// Requirement 507, AC5: Geolocation anomalies increase risk score.
@@ -122,7 +134,10 @@ fn test_geolocation_anomaly_increases_risk() {
     client.check_in(&vault_id, &owner, &passkey_hash, &0u64);
 
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "passkey registered for geo-risk tracking");
+    assert!(
+        vault.passkeys.len() > 0,
+        "passkey registered for geo-risk tracking"
+    );
 }
 
 /// Requirement 507, AC6: Device age (time since passkey creation) affects risk.
@@ -198,7 +213,10 @@ fn test_overall_passkey_risk_score_calculation() {
     // - Failed attempts
     // - Geolocation
     // - Device age
-    assert!(vault.passkeys.len() > 0, "risk calculation includes all factors");
+    assert!(
+        vault.passkeys.len() > 0,
+        "risk calculation includes all factors"
+    );
 }
 
 /// Requirement 507, AC10: Risk score trends can be analyzed to detect
@@ -239,7 +257,10 @@ fn test_mfa_risk_threshold_is_configurable() {
     // Vault should allow configuration of MFA risk threshold
     // Default threshold might be 70, configurable to other values
     let vault = client.get_vault(&vault_id);
-    assert!(vault.passkeys.len() > 0, "vault supports MFA threshold config");
+    assert!(
+        vault.passkeys.len() > 0,
+        "vault supports MFA threshold config"
+    );
 }
 
 /// Requirement 507, AC12: Risk score calculation is deterministic and
@@ -261,5 +282,8 @@ fn test_risk_score_is_deterministic() {
     // Risk score for same inputs should be deterministic
     let vault = client.get_vault(&vault_id);
     assert!(vault.passkeys.len() > 0, "deterministic risk calculation");
-    assert_eq!(len_1, 1, "usage log should have one entry from first check-in");
+    assert_eq!(
+        len_1, 1,
+        "usage log should have one entry from first check-in"
+    );
 }

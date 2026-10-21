@@ -14,7 +14,13 @@ use soroban_sdk::{
     Env,
 };
 
-fn setup() -> (Env, Address, Address, Address, TtlVaultContractClient<'static>) {
+fn setup() -> (
+    Env,
+    Address,
+    Address,
+    Address,
+    TtlVaultContractClient<'static>,
+) {
     let env = Env::default();
     env.mock_all_auths();
 

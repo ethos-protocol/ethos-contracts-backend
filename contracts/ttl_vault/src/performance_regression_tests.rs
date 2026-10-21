@@ -33,7 +33,7 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, budget::Budget, Ledger},
+    testutils::{budget::Budget, Address as _, Ledger},
     token::StellarAssetClient,
     vec, Address, BytesN, Env,
 };
@@ -54,12 +54,30 @@ struct Baseline {
     mem: u64,
 }
 
-const BASELINE_CREATE_VAULT: Baseline = Baseline { cpu: 500_000, mem: 32_768 };
-const BASELINE_DEPOSIT: Baseline = Baseline { cpu: 300_000, mem: 16_384 };
-const BASELINE_WITHDRAW: Baseline = Baseline { cpu: 350_000, mem: 16_384 };
-const BASELINE_CHECK_IN: Baseline = Baseline { cpu: 400_000, mem: 16_384 };
-const BASELINE_TRIGGER_RELEASE_1: Baseline = Baseline { cpu: 123_456, mem: 4_096 };
-const BASELINE_TRIGGER_RELEASE_5: Baseline = Baseline { cpu: 234_567, mem: 8_192 };
+const BASELINE_CREATE_VAULT: Baseline = Baseline {
+    cpu: 500_000,
+    mem: 32_768,
+};
+const BASELINE_DEPOSIT: Baseline = Baseline {
+    cpu: 300_000,
+    mem: 16_384,
+};
+const BASELINE_WITHDRAW: Baseline = Baseline {
+    cpu: 350_000,
+    mem: 16_384,
+};
+const BASELINE_CHECK_IN: Baseline = Baseline {
+    cpu: 400_000,
+    mem: 16_384,
+};
+const BASELINE_TRIGGER_RELEASE_1: Baseline = Baseline {
+    cpu: 123_456,
+    mem: 4_096,
+};
+const BASELINE_TRIGGER_RELEASE_5: Baseline = Baseline {
+    cpu: 234_567,
+    mem: 8_192,
+};
 
 // ── Assertion helper ──────────────────────────────────────────────────────────
 
@@ -213,11 +231,31 @@ fn perf_regression_trigger_release_5_beneficiaries() {
         &owner,
         &vec![
             &env,
-            BeneficiaryEntry { address: b1.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b2.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b3.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b4.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b5.clone(), bps: 2_000, minimum_threshold: 0 },
+            BeneficiaryEntry {
+                address: b1.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b2.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b3.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b4.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b5.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
         ],
     );
     client.deposit(&vault_id, &owner, &100_000i128);
@@ -257,11 +295,31 @@ fn perf_regression_release_scales_sub_linearly() {
         &owner2,
         &vec![
             &env2,
-            BeneficiaryEntry { address: b2.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b3.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b4.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b5.clone(), bps: 2_000, minimum_threshold: 0 },
-            BeneficiaryEntry { address: b6.clone(), bps: 2_000, minimum_threshold: 0 },
+            BeneficiaryEntry {
+                address: b2.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b3.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b4.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b5.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
+            BeneficiaryEntry {
+                address: b6.clone(),
+                bps: 2_000,
+                minimum_threshold: 0,
+            },
         ],
     );
     client2.deposit(&vault_5, &owner2, &100_000i128);

@@ -177,11 +177,15 @@ fn test_reconstruct_at_timestamp() {
     client.create_incremental_snapshot(&vault_id);
 
     assert_eq!(
-        client.reconstruct_vault_snapshot_at(&vault_id, &1_500).balance,
+        client
+            .reconstruct_vault_snapshot_at(&vault_id, &1_500)
+            .balance,
         100
     );
     assert_eq!(
-        client.reconstruct_vault_snapshot_at(&vault_id, &5_000).balance,
+        client
+            .reconstruct_vault_snapshot_at(&vault_id, &5_000)
+            .balance,
         200
     );
     assert!(client

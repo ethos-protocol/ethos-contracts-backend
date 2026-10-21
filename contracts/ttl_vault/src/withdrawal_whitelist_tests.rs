@@ -23,7 +23,7 @@ fn setup() -> (
     Address, // beneficiary
     Address, // contract address
     TtlVaultContractClient<'static>,
-    u64,     // vault_id
+    u64, // vault_id
 ) {
     let env = Env::default();
     env.mock_all_auths();

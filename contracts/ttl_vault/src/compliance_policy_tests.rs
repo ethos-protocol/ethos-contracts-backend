@@ -73,9 +73,18 @@ fn test_get_policy_version_by_timestamp() {
     client.set_kyc_high_value_threshold(&300);
 
     assert_eq!(client.get_policy_version(&1_000).version, 1);
-    assert_eq!(client.get_policy_version(&1_999).kyc_high_value_threshold, 100);
-    assert_eq!(client.get_policy_version(&2_500).kyc_high_value_threshold, 200);
-    assert_eq!(client.get_policy_version(&9_999).kyc_high_value_threshold, 300);
+    assert_eq!(
+        client.get_policy_version(&1_999).kyc_high_value_threshold,
+        100
+    );
+    assert_eq!(
+        client.get_policy_version(&2_500).kyc_high_value_threshold,
+        200
+    );
+    assert_eq!(
+        client.get_policy_version(&9_999).kyc_high_value_threshold,
+        300
+    );
     assert!(client.try_get_policy_version(&999).is_err());
 }
 

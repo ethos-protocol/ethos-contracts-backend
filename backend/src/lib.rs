@@ -98,6 +98,7 @@ pub mod tracing_sampling;
 pub mod two_factor;
 pub mod uptime;
 pub mod webauthn;
+pub mod vault_assistant;
 pub mod webhook;
 pub mod websocket;
 

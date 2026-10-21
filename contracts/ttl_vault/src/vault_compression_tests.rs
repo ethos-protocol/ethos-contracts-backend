@@ -40,8 +40,7 @@ fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
 }
 
 fn go_idle(env: &Env, days: u64) {
-    env.ledger()
-        .with_mut(|l| l.timestamp = 1_000 + days * DAY);
+    env.ledger().with_mut(|l| l.timestamp = 1_000 + days * DAY);
 }
 
 /// Long interval so the vault is not expired while idle in these tests.

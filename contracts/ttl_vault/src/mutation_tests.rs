@@ -198,14 +198,19 @@ fn mutant_invalid_bps_rejected() {
 
     let bad = soroban_sdk::vec![
         &env,
-        BeneficiaryEntry { address: beneficiary.clone(), bps: 1_000, minimum_threshold: 0 },
-        BeneficiaryEntry { address: b2.clone(), bps: 1_000, minimum_threshold: 0 },
+        BeneficiaryEntry {
+            address: beneficiary.clone(),
+            bps: 1_000,
+            minimum_threshold: 0
+        },
+        BeneficiaryEntry {
+            address: b2.clone(),
+            bps: 1_000,
+            minimum_threshold: 0
+        },
     ];
     let result = client.try_set_beneficiaries(&vault_id, &owner, &bad);
-    assert!(
-        result.is_err(),
-        "Mutant not killed: BPS validation removed"
-    );
+    assert!(result.is_err(), "Mutant not killed: BPS validation removed");
 }
 
 // ── Mutant: delete auth check on owner-only function ──────────────────────────
