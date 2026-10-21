@@ -107,7 +107,7 @@ pub enum SbtError {
     RecoveryRateLimited = 28,
 }
 
-/// Storage key discriminants. All SBT state is keyed by `sbt_id`.
+/// Storage key discriminants. All per-token state is keyed by `sbt_id`.
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -304,12 +304,12 @@ impl SbtContract {
             .instance()
             .set(&DataKey::NextTokenId, &(sbt_id + 1));
 
-        env.storage().instance().set(&DataKey::Owner(sbt_id), &to);
+        env.storage().persistent().set(&DataKey::Owner(sbt_id), &to);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Metadata(sbt_id), &metadata);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::MintedAt(sbt_id), &env.ledger().timestamp());
 
         env.events().publish((MINT_TOPIC,), (sbt_id, to));
@@ -324,14 +324,14 @@ impl SbtContract {
         if !Self::is_sbt_metadata_compressed(env.clone(), sbt_id) {
             return env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Metadata(sbt_id))
                 .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
         }
 
         let compressed: Bytes = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
         let metadata = decompress_metadata_bytes(&env, &compressed)
@@ -362,7 +362,7 @@ impl SbtContract {
 
         let metadata: String = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
         let metadata = Self::string_to_bytes(&env, &metadata);
@@ -376,10 +376,10 @@ impl SbtContract {
         let compressed_size = compressed.len() as u64;
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Metadata(sbt_id), &compressed);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::MetadataCompressed(sbt_id), &true);
 
         env.events().publish(
@@ -395,7 +395,7 @@ impl SbtContract {
         if !Self::is_sbt_metadata_compressed(env.clone(), sbt_id) {
             let metadata: String = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Metadata(sbt_id))
                 .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
             return Self::string_to_bytes(&env, &metadata);
@@ -403,7 +403,7 @@ impl SbtContract {
 
         let metadata: Bytes = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
 
@@ -414,7 +414,7 @@ impl SbtContract {
     /// Check if an SBT's metadata is compressed.
     pub fn is_sbt_metadata_compressed(env: Env, sbt_id: u64) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, bool>(&DataKey::MetadataCompressed(sbt_id))
             .unwrap_or(false)
     }
@@ -454,7 +454,7 @@ impl SbtContract {
         };
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::FractionalOwnership(sbt_id), &fractional);
 
         // Record ownership history
@@ -476,14 +476,14 @@ impl SbtContract {
     /// Get fractional ownership details for an SBT.
     pub fn get_fractional_ownership(env: Env, sbt_id: u64) -> Option<FractionalOwnership> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::FractionalOwnership(sbt_id))
     }
 
     /// Check if an SBT is fractionally owned.
     pub fn is_fractional(env: Env, sbt_id: u64) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .has(&DataKey::FractionalOwnership(sbt_id))
     }
 
@@ -493,7 +493,7 @@ impl SbtContract {
     pub fn escrow_sbt(env: Env, sbt_id: u64, escrow_agent: Address, conditions: Bytes) -> u64 {
         Self::require_owner(&env, sbt_id);
 
-        if env.storage().instance().has(&DataKey::Escrow(sbt_id)) {
+        if env.storage().persistent().has(&DataKey::Escrow(sbt_id)) {
             panic_with_error!(&env, SbtError::AlreadyInEscrow);
         }
 
@@ -516,7 +516,7 @@ impl SbtContract {
         };
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Escrow(sbt_id), &escrow);
 
         env.events()
@@ -529,7 +529,7 @@ impl SbtContract {
     pub fn release_sbt_from_escrow(env: Env, sbt_id: u64, proof: Bytes) {
         let escrow: EscrowRecord = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Escrow(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotInEscrow));
 
@@ -543,7 +543,7 @@ impl SbtContract {
         updated_escrow.released = true;
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Escrow(sbt_id), &updated_escrow);
 
         env.events()
@@ -577,7 +577,7 @@ impl SbtContract {
 
             let escrow: EscrowRecord = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Escrow(credential_id))
                 .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotInEscrow));
 
@@ -599,7 +599,7 @@ impl SbtContract {
             released.released = true;
 
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Escrow(released.sbt_id), &released);
             env.events().publish(
                 (ESCROW_RELEASED_TOPIC,),
@@ -613,7 +613,7 @@ impl SbtContract {
 
     /// Get escrow details for an SBT if it is in escrow.
     pub fn get_escrow_status(env: Env, sbt_id: u64) -> Option<EscrowRecord> {
-        env.storage().instance().get(&DataKey::Escrow(sbt_id))
+        env.storage().persistent().get(&DataKey::Escrow(sbt_id))
     }
 
     // ---- #54: SBT composability with other NFTs ----
@@ -624,7 +624,7 @@ impl SbtContract {
     pub fn compose_sbt_with_nft(env: Env, sbt_id: u64, nft_address: Address, nft_id: u64) {
         let owner = Self::require_owner(&env, sbt_id);
 
-        if env.storage().instance().has(&DataKey::Composition(sbt_id)) {
+        if env.storage().persistent().has(&DataKey::Composition(sbt_id)) {
             panic_with_error!(&env, SbtError::AlreadyComposed);
         }
 
@@ -639,7 +639,7 @@ impl SbtContract {
             composed_at: env.ledger().timestamp(),
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Composition(sbt_id), &record);
 
         env.events()
@@ -651,18 +651,18 @@ impl SbtContract {
     pub fn decompose_sbt(env: Env, sbt_id: u64) {
         Self::require_owner(&env, sbt_id);
 
-        if !env.storage().instance().has(&DataKey::Composition(sbt_id)) {
+        if !env.storage().persistent().has(&DataKey::Composition(sbt_id)) {
             panic_with_error!(&env, SbtError::NotComposed);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Composition(sbt_id));
 
         env.events().publish((DECOMPOSE_TOPIC,), sbt_id);
     }
 
     pub fn get_composition(env: Env, sbt_id: u64) -> Option<CompositionRecord> {
-        env.storage().instance().get(&DataKey::Composition(sbt_id))
+        env.storage().persistent().get(&DataKey::Composition(sbt_id))
     }
 
     /// Sets bounded local SBT components for an existing composition.
@@ -675,7 +675,7 @@ impl SbtContract {
         for component_id in component_ids.iter() {
             Self::load_owner(&env, *component_id);
         }
-        env.storage().instance().set(
+        env.storage().persistent().set(
             &DataKey::CompositionComponents(sbt_id),
             &CompositionComponents { component_ids },
         );
@@ -683,7 +683,7 @@ impl SbtContract {
 
     pub fn get_composition_components(env: Env, sbt_id: u64) -> Option<Vec<u64>> {
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, CompositionComponents>(&DataKey::CompositionComponents(sbt_id))
             .map(|components| components.component_ids)
     }
@@ -701,14 +701,14 @@ impl SbtContract {
     pub fn set_shared_metadata(env: Env, sbt_id: u64, metadata: String) {
         Self::require_owner(&env, sbt_id);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::SharedMetadata(sbt_id), &metadata);
         env.events().publish((SHARED_METADATA_TOPIC,), sbt_id);
     }
 
     pub fn get_shared_metadata(env: Env, sbt_id: u64) -> Option<String> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::SharedMetadata(sbt_id))
     }
 
@@ -741,12 +741,12 @@ impl SbtContract {
 
         for (sbt_id, instruction) in sbt_ids.iter().zip(transfers.iter()) {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Owner(sbt_id), &instruction.to);
             // A delegation granted by the previous owner should not carry
             // over to the new owner.
             env.storage()
-                .instance()
+                .persistent()
                 .remove(&DataKey::Delegation(sbt_id));
 
             env.events()
@@ -781,7 +781,7 @@ impl SbtContract {
             expires_at,
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Delegation(sbt_id), &record);
 
         Self::push_delegation_history(
@@ -805,12 +805,12 @@ impl SbtContract {
 
         let record: DelegationRecord = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Delegation(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::NoActiveDelegation));
 
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Delegation(sbt_id));
 
         let now = env.ledger().timestamp();
@@ -835,7 +835,7 @@ impl SbtContract {
     /// elsewhere in this workspace only while still currently valid.
     pub fn get_active_delegate(env: Env, sbt_id: u64) -> Option<Address> {
         let record: DelegationRecord =
-            env.storage().instance().get(&DataKey::Delegation(sbt_id))?;
+            env.storage().persistent().get(&DataKey::Delegation(sbt_id))?;
         if record.expires_at > env.ledger().timestamp() {
             Some(record.delegate)
         } else {
@@ -888,7 +888,7 @@ impl SbtContract {
         }
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::RecoveryCodes(sbt_id), &hashed_codes);
 
         env.events().publish(
@@ -925,7 +925,7 @@ impl SbtContract {
         let codes_key = DataKey::RecoveryCodes(sbt_id);
         let mut hashed_codes: Vec<BytesN<32>> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&codes_key)
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::NoRecoveryCodes));
 
@@ -935,14 +935,14 @@ impl SbtContract {
         };
 
         hashed_codes.remove(index);
-        env.storage().instance().set(&codes_key, &hashed_codes);
+        env.storage().persistent().set(&codes_key, &hashed_codes);
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Owner(sbt_id), &new_holder);
         // A delegation granted by the previous holder must not carry over to
         // the new holder, mirroring `batch_transfer_sbt_conditional`.
-        env.storage().instance().remove(&DataKey::Delegation(sbt_id));
+        env.storage().persistent().remove(&DataKey::Delegation(sbt_id));
 
         env.events()
             .publish((RECOVERY_SUCCEEDED_TOPIC, sbt_id), new_holder);
@@ -960,7 +960,7 @@ impl SbtContract {
         let key = DataKey::RecoveryAttempts(sbt_id);
         let mut state = env
             .storage()
-            .instance()
+            .persistent()
             .get::<DataKey, RecoveryAttemptState>(&key)
             .unwrap_or(RecoveryAttemptState {
                 attempt_count: 0,
@@ -979,7 +979,7 @@ impl SbtContract {
         }
 
         state.attempt_count += 1;
-        env.storage().instance().set(&key, &state);
+        env.storage().persistent().set(&key, &state);
     }
 
     // ---- helpers ----
@@ -1034,7 +1034,7 @@ impl SbtContract {
             if steps > MAX_COMPOSITION_DEPTH {
                 return true;
             }
-            if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+            if let Some(components) = env.storage().persistent().get::<DataKey, CompositionComponents>(
                 &DataKey::CompositionComponents(current),
             ) {
                 for component in components.component_ids.iter() {
@@ -1056,7 +1056,7 @@ impl SbtContract {
             panic_with_error!(env, SbtError::InvalidCompositionGraph);
         }
         visited.set(current, true);
-        if let Some(components) = env.storage().instance().get::<DataKey, CompositionComponents>(
+        if let Some(components) = env.storage().persistent().get::<DataKey, CompositionComponents>(
             &DataKey::CompositionComponents(current),
         ) {
             for component in components.component_ids.iter() {
@@ -1069,7 +1069,7 @@ impl SbtContract {
 
     fn load_owner(env: &Env, sbt_id: u64) -> Address {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Owner(sbt_id))
             .unwrap_or_else(|| panic_with_error!(env, SbtError::TokenNotFound))
     }
@@ -1082,7 +1082,7 @@ impl SbtContract {
 
     fn has_active_delegation(env: &Env, sbt_id: u64) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .get::<DataKey, DelegationRecord>(&DataKey::Delegation(sbt_id))
             .map(|record| record.expires_at > env.ledger().timestamp())
             .unwrap_or(false)
@@ -1099,7 +1099,7 @@ impl SbtContract {
             TransferCondition::MinHoldSeconds(min_seconds) => {
                 let minted_at: u64 = env
                     .storage()
-                    .instance()
+                    .persistent()
                     .get(&DataKey::MintedAt(sbt_id))
                     .unwrap_or(0);
                 env.ledger().timestamp().saturating_sub(minted_at) >= *min_seconds
@@ -1110,7 +1110,7 @@ impl SbtContract {
 
     fn load_delegation_history(env: &Env, sbt_id: u64) -> Vec<DelegationHistoryEntry> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::DelegationHistory(sbt_id))
             .unwrap_or_else(|| Vec::new(env))
     }
@@ -1119,7 +1119,7 @@ impl SbtContract {
         let mut history = Self::load_delegation_history(env, sbt_id);
         history.push_back(entry);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::DelegationHistory(sbt_id), &history);
     }
 
@@ -1127,7 +1127,7 @@ impl SbtContract {
 
     fn load_ownership_history(env: &Env, sbt_id: u64) -> Vec<OwnershipHistoryEntry> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OwnershipHistory(sbt_id))
             .unwrap_or_else(|| Vec::new(env))
     }
@@ -1169,7 +1169,7 @@ impl SbtContract {
 
         history.push_back(entry);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::OwnershipHistory(sbt_id), &history);
         Ok(())
     }
