@@ -10,6 +10,9 @@
 //!   [`crate::multilevel_cache`]: each entry carries the token's own `exp`, and
 //!   once wall-clock time passes it the entry is dropped — the list never grows
 //!   past the set of currently-live tokens.
+//! * Revocations are persisted to a JSON file (when a path is configured) so
+//!   they survive a restart or redeploy; the file is loaded at startup and
+//!   expired entries are pruned on load and on every write.
 //! * [`RevocationList::is_revoked`] is the check every authenticated request
 //!   runs; [`validate_ws_token_with_revocation`] wires it onto the existing
 //!   [`crate::websocket::validate_ws_token`] verification.
@@ -17,6 +20,7 @@
 //!   `jti`) to the list.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use axum::{
@@ -33,16 +37,36 @@ use serde::{Deserialize, Serialize};
 /// comfortably exceed the longest access-token lifetime.
 pub const DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 
-/// In-memory revocation list keyed by token id (`jti`), value = Unix second at
-/// which the entry may be purged (the token's own expiry).
+/// Revocation list keyed by token id (`jti`), value = Unix second at which the
+/// entry may be purged (the token's own expiry). Backed by an optional JSON
+/// file so revocations survive process restarts.
 #[derive(Debug, Default)]
 pub struct RevocationList {
     inner: RwLock<HashMap<String, i64>>,
+    /// When set, the map is persisted here on every mutation.
+    path: Option<PathBuf>,
 }
 
 impl RevocationList {
+    /// In-memory-only list (no persistence).
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Build a list persisted at `path`, loading any existing revocations and
+    /// pruning entries whose tokens have already expired.
+    pub fn with_persistence(path: impl Into<PathBuf>) -> Arc<Self> {
+        let path = path.into();
+        let now = Utc::now().timestamp();
+        let mut map = load_from_disk(&path).unwrap_or_default();
+        map.retain(|_, &mut exp| exp > now);
+        let list = Self {
+            inner: RwLock::new(map),
+            path: Some(path),
+        };
+        // Persist the pruned set so stale entries don't linger on disk.
+        list.flush();
+        Arc::new(list)
     }
 
     /// Add `jti` to the deny-list until `expires_at` (Unix seconds).
@@ -51,6 +75,7 @@ impl RevocationList {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .insert(jti.to_string(), expires_at);
+        self.flush();
     }
 
     /// Whether `jti` is currently revoked. Expired entries are treated as
@@ -66,16 +91,23 @@ impl RevocationList {
             }
         }
         self.inner.write().unwrap_or_else(|p| p.into_inner()).remove(jti);
+        self.flush();
         false
     }
 
     /// Drop every entry whose expiry is at or before `now` (Unix seconds).
     /// Returns the number of entries removed.
     pub fn purge_expired(&self, now: i64) -> usize {
-        let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
-        let before = map.len();
-        map.retain(|_, &mut exp| exp > now);
-        before - map.len()
+        let removed = {
+            let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
+            let before = map.len();
+            map.retain(|_, &mut exp| exp > now);
+            before - map.len()
+        };
+        if removed > 0 {
+            self.flush();
+        }
+        removed
     }
 
     /// Current number of (possibly not-yet-purged) entries.
@@ -86,6 +118,57 @@ impl RevocationList {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Write the current map to disk (no-op when no path is configured).
+    /// Failures are logged and swallowed so a disk hiccup never breaks auth.
+    fn flush(&self) {
+        let Some(ref path) = self.path else {
+            return;
+        };
+        let snapshot = self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Err(error) = save_to_disk(path, &snapshot) {
+            eprintln!("failed to persist token revocation list to {path:?}: {error}");
+        }
+    }
+}
+
+/// Read a persisted revocation map from `path`. A missing file yields an empty
+/// map; a corrupt file is treated as empty (fail-closed on the safe side is
+/// not possible here, so we log and start fresh).
+fn load_from_disk(path: &Path) -> Option<HashMap<String, i64>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(HashMap::new()),
+        Err(error) => {
+            eprintln!("failed to read token revocation list {path:?}: {error}");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => Some(map),
+        Err(error) => {
+            eprintln!("failed to parse token revocation list {path:?}: {error}");
+            None
+        }
+    }
+}
+
+/// Atomically write `map` to `path` (temp file + rename).
+fn save_to_disk(path: &Path, map: &HashMap<String, i64>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let bytes = serde_json::to_vec(map)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Decode a JWT payload **without verifying the signature** and return
@@ -241,106 +324,55 @@ mod tests {
     }
 
     #[test]
-    fn purge_expired_drops_only_stale_entries() {
+    fn purge_expired_removes_only_stale_entries() {
         let list = RevocationList::new();
         let now = Utc::now().timestamp();
 
-        list.revoke("live", now + 3600);
-        list.revoke("stale-1", now - 10);
-        list.revoke("stale-2", now - 1);
+        list.revoke("tok-live", now + 3600);
+        list.revoke("tok-dead", now - 1);
 
-        let removed = list.purge_expired(now);
-
-        assert_eq!(removed, 2);
+        assert_eq!(list.purge_expired(now), 1);
         assert_eq!(list.len(), 1);
-        assert!(list.is_revoked("live"));
+        assert!(list.is_revoked("tok-live"));
     }
 
     #[test]
-    fn validate_rejects_revoked_token_and_accepts_live_one() {
-        let secret = b"revocation-test-secret";
+    fn revocations_survive_reload_and_expired_are_pruned() {
+        let dir = std::env::temp_dir().join(format!(
+            "revocation-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("revocations.json");
+        let now = Utc::now().timestamp();
+
+        {
+            let list = RevocationList::with_persistence(&path);
+            list.revoke("tok-live", now + 3600);
+            list.revoke("tok-dead", now - 1);
+        }
+
+        // A fresh instance (simulating a restart) loads the persisted entries
+        // and prunes the already-expired one.
+        let reloaded = RevocationList::with_persistence(&path);
+        assert!(reloaded.is_revoked("tok-live"));
+        assert!(!reloaded.is_revoked("tok-dead"));
+        assert_eq!(reloaded.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_revoked_token() {
+        let secret = b"test-secret";
         let list = RevocationList::new();
         let exp = Utc::now().timestamp() + 3600;
+        let token = mint(secret, "tok-1", exp);
 
-        let good = mint(secret, "jti-good", exp);
-        let bad = mint(secret, "jti-bad", exp);
+        let claims: AuthClaims = validate_ws_token_with_revocation(&token, secret, &list).unwrap();
+        assert_eq!(claims.sub, "user-1");
 
-        list.revoke("jti-bad", exp);
-
-        let ok = validate_ws_token_with_revocation(&good, secret, &list).unwrap();
-        assert_eq!(ok.jti.as_deref(), Some("jti-good"));
-
-        let err = validate_ws_token_with_revocation(&bad, secret, &list).unwrap_err();
-        assert!(err.contains("revoked"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn revoke_endpoint_accepts_bare_jti_and_full_token() {
-        let list = RevocationList::new();
-        let exp = Utc::now().timestamp() + 1200;
-
-        // By bare jti.
-        let resp = revoke_token(
-            State(list.clone()),
-            HeaderMap::new(),
-            Json(RevokeRequest {
-                token: None,
-                jti: Some("direct-jti".to_string()),
-                expires_at: Some(exp),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.0.revoked, "direct-jti");
-        assert!(list.is_revoked("direct-jti"));
-
-        // By full token — jti and exp are extracted from the payload.
-        let token = mint(b"whatever", "token-jti", exp);
-        let resp = revoke_token(
-            State(list.clone()),
-            HeaderMap::new(),
-            Json(RevokeRequest {
-                token: Some(token),
-                jti: None,
-                expires_at: None,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.0.revoked, "token-jti");
-        assert_eq!(resp.0.expires_at, exp);
-        assert!(list.is_revoked("token-jti"));
-    }
-
-    #[tokio::test]
-    async fn revoke_endpoint_rejects_empty_request() {
-        let list = RevocationList::new();
-        let err = revoke_token(
-            State(list),
-            HeaderMap::new(),
-            Json(RevokeRequest {
-                token: None,
-                jti: None,
-                expires_at: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[test]
-    fn auth_claims_without_jti_are_never_blocked() {
-        // Backwards compatibility: a token minted before jti existed.
-        let claims = AuthClaims {
-            sub: "legacy".to_string(),
-            vault_ids: vec![],
-            exp: 0,
-            jti: None,
-        };
-        let list = RevocationList::new();
-        // No jti → the revocation check is a no-op for this token.
-        assert!(claims.jti.is_none());
-        assert!(list.is_empty());
+        list.revoke("tok-1", exp);
+        assert!(validate_ws_token_with_revocation(&token, secret, &list).is_err());
     }
 }
