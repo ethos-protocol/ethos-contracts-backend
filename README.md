@@ -327,3 +327,15 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-596 -->
 - #596: Add Infrastructure as Code (IaC)
+
+<!-- handsoff-issue-848 -->
+- #848: A Corrupt `last_check_in` Timestamp Silently Becomes "Now"
+
+<!-- handsoff-issue-849 -->
+- #849: A Corrupt `created_at` Timestamp Silently Becomes "Now"
+
+<!-- handsoff-issue-850 -->
+- #850: An Unparseable Balance Silently Becomes Zero
+
+<!-- handsoff-issue-851 -->
+- #851: An Unknown or Corrupt Vault Status Reads as `Active`
