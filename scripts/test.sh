@@ -21,6 +21,12 @@ COVERAGE_DIR="target/coverage"
 
 echo "Running Ethos-Protocol tests..."
 
+# Verify the environment-variable documentation gate itself, then enforce it:
+# every variable read by the code must be documented in .env.example.
+echo "Checking environment-variable documentation..."
+python3 scripts/check_env_vars.py --self-test
+python3 scripts/check_env_vars.py
+
 if [ "${COVERAGE:-0}" = "1" ]; then
   if ! command -v cargo-llvm-cov &> /dev/null; then
     echo "cargo-llvm-cov not found — installing..."

@@ -11,8 +11,9 @@
 #   DB_POOL_TIMEOUT_SECS, NOTIFICATION_SCHEDULER_INTERVAL_SECS,
 #   FCM_SERVER_KEY, FCM_PROJECT_ID, REMINDER_EMAIL_API_KEY, REMINDER_SMS_API_KEY,
 #   REMINDER_ENCRYPTION_SECRET
-# Additional vars read by the backend but not yet documented in .env.example:
-#   NODE_ID, CONSENSUS_STRATEGY, REDIS_URL, ADMIN_API_KEY
+# The full, authoritative list of variables read by the backend lives in
+# .env.example (kept in sync with the code by CI) and is described in
+# docs/configuration-reference.md.
 # Database: the backend opens the SQLite file at DB_PATH (default
 # /var/lib/ethos-protocol/ethos-protocol.db, a mounted volume). It refuses to
 # start with DB_PATH=:memory: unless ALLOW_EPHEMERAL_DB=true is set (#690).
