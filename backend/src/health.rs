@@ -107,6 +107,27 @@ pub async fn check_rpc_reachability_with_timeout(
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// Reduce an RPC URL to `host[:port]` for the public health response (#901).
+///
+/// Providers often carry an API key in the path, query or userinfo, so only the
+/// host is returned. Anything after the authority is dropped.
+fn redact_endpoint(raw: &str) -> String {
+    if raw.is_empty() {
+        return "<not configured>".to_string();
+    }
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// `GET /health` — process liveness + RPC dependency health.
 ///
 /// Always returns HTTP 200 so that load-balancer probes continue to route
@@ -131,7 +152,7 @@ pub async fn health_handler() -> Json<serde_json::Value> {
         "status": overall_status,
         "version": env!("CARGO_PKG_VERSION"),
         "rpc": {
-            "endpoint": if rpc_endpoint.is_empty() { "<not configured>".to_string() } else { rpc_endpoint },
+            "endpoint": redact_endpoint(&rpc_endpoint),
             "status": rpc.status,
             "reachable": rpc.reachable,
         }
@@ -292,5 +313,34 @@ mod tests {
         );
         assert_eq!(body["rpc"]["reachable"], false);
         assert_eq!(body["rpc"]["status"], "unreachable");
+    }
+}
+
+#[cfg(test)]
+mod endpoint_redaction_tests {
+    use super::redact_endpoint;
+
+    #[test]
+    fn api_key_in_query_is_not_returned() {
+        let out = redact_endpoint("https://rpc.example.com/v1?api_key=sekret123");
+        assert_eq!(out, "rpc.example.com");
+        assert!(!out.contains("sekret"));
+    }
+
+    #[test]
+    fn api_key_in_path_is_not_returned() {
+        let out = redact_endpoint("https://rpc.example.com:8443/abc/sekret123");
+        assert_eq!(out, "rpc.example.com:8443");
+    }
+
+    #[test]
+    fn userinfo_is_not_returned() {
+        let out = redact_endpoint("https://user:pw@rpc.example.com/path");
+        assert_eq!(out, "rpc.example.com");
+    }
+
+    #[test]
+    fn empty_endpoint_reports_not_configured() {
+        assert_eq!(redact_endpoint(""), "<not configured>");
     }
 }

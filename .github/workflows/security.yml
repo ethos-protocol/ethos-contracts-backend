@@ -145,3 +145,26 @@ jobs:
             fi
           done
           exit $FAILED
+
+  allowlist-expiry-check:
+    name: Allowlist Expiry Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Fails when any advisory exception in .cargo/audit.toml is past its
+      # `expires = "YYYY-MM-DD"` date (#900). ISO dates compare correctly as text.
+      - name: Fail on expired advisory exceptions
+        run: |
+          today=$(date -u +%F)
+          status=0
+          for expires in $(grep -oE 'expires = "[0-9]{4}-[0-9]{2}-[0-9]{2}"' .cargo/audit.toml | sed -E 's/.*"([^"]+)"/\1/'); do
+            if [[ "$expires" < "$today" ]]; then
+              echo "::error::advisory exception expired on $expires; re-justify it or remove it"
+              status=1
+            fi
+          done
+          exit $status

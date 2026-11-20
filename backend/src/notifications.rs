@@ -108,7 +108,12 @@ pub struct FcmClient {
 impl FcmClient {
     pub fn new(server_key: String, project_id: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Bounded so a stalled provider cannot hold a worker open (#903).
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("FCM HTTP client with timeouts"),
             server_key,
             project_id,
             base_url: "https://fcm.googleapis.com".to_string(),

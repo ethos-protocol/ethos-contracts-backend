@@ -253,6 +253,19 @@ pub fn generate_challenge(_state: &AppState) -> CaptchaChallenge {
     challenge
 }
 
+/// Shared reCAPTCHA client with timeouts, so a stalled verifier cannot hold a
+/// request open indefinitely (#902).
+fn captcha_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reCAPTCHA HTTP client with timeouts")
+    })
+}
+
 fn recaptcha_secret_key() -> Result<String, String> {
     std::env::var("RECAPTCHA_SECRET_KEY")
         .map_err(|_| "RECAPTCHA_SECRET_KEY is not configured".to_string())
@@ -296,7 +309,7 @@ pub async fn verify_captcha(
     let secret_key = recaptcha_secret_key()?;
 
     // 3. Real reCAPTCHA verification via reqwest.
-    let client = reqwest::Client::new();
+    let client = captcha_http_client();
     let params = [
         ("secret", secret_key.as_str()),
         ("response", req.captcha_token.as_str()),
