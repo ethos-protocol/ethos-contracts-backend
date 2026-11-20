@@ -49,9 +49,13 @@ pub fn compress_proof(env: &Env, input: &Bytes) -> Result<Bytes, CompressionErro
 
     let mut i: u32 = 0;
     while i < len {
-        let current = input.get(i).unwrap();
+        let current = input.get(i).ok_or(CompressionError::InvalidData)?;
         let mut run: u32 = 1;
-        while run < 255 && (i + run) < len && input.get(i + run).unwrap() == current {
+        while run < 255 && (i + run) < len {
+            let next = input.get(i + run).ok_or(CompressionError::InvalidData)?;
+            if next != current {
+                break;
+            }
             run += 1;
         }
         out.push_back(run as u8);
@@ -74,7 +78,7 @@ pub fn decompress_proof(
     if input.is_empty() {
         return Err(CompressionError::EmptyInput);
     }
-    if input.get(0).unwrap() != MAGIC {
+    if input.get(0).ok_or(CompressionError::InvalidData)? != MAGIC {
         return Err(CompressionError::InvalidData);
     }
 
@@ -87,11 +91,11 @@ pub fn decompress_proof(
         if i + 1 >= compressed_len {
             return Err(CompressionError::InvalidData);
         }
-        let count = input.get(i).unwrap();
+        let count = input.get(i).ok_or(CompressionError::InvalidData)?;
         if count == 0 {
             return Err(CompressionError::InvalidData);
         }
-        let byte = input.get(i + 1).unwrap();
+        let byte = input.get(i + 1).ok_or(CompressionError::InvalidData)?;
         for _ in 0..count {
             if out.len() >= max_output_size {
                 return Err(CompressionError::OutputTooLarge);

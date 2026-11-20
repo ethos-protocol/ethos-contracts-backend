@@ -159,7 +159,9 @@ impl Position {
     }
 
     fn earned_since(&self, index: u128) -> Result<u128, YieldError> {
-        let delta = index - self.index_snapshot;
+        let delta = index
+            .checked_sub(self.index_snapshot)
+            .ok_or(YieldError::Overflow)?;
         Ok(self
             .principal
             .checked_mul(delta)
@@ -237,8 +239,14 @@ impl<P: YieldProtocol> YieldManager<P> {
         position.settle(index)?;
         self.protocol.withdraw(now, amount)?;
 
-        position.principal -= amount;
-        self.total_principal -= amount;
+        position.principal = position
+            .principal
+            .checked_sub(amount)
+            .ok_or(YieldError::InsufficientPrincipal)?;
+        self.total_principal = self
+            .total_principal
+            .checked_sub(amount)
+            .ok_or(YieldError::InsufficientPrincipal)?;
         self.positions.insert(vault_id, position);
         Ok(())
     }
@@ -308,7 +316,10 @@ impl<P: YieldProtocol> YieldManager<P> {
         }
         self.protocol.withdraw(now, amount)?;
 
-        position.accrued -= amount;
+        position.accrued = position
+            .accrued
+            .checked_sub(amount)
+            .ok_or(YieldError::InsufficientYield)?;
         position.claimed = position
             .claimed
             .checked_add(amount)
@@ -376,7 +387,7 @@ mod tests {
 
     impl YieldProtocol for StaticProtocol {
         fn deposit(&mut self, _now: u64, amount: u128) -> Result<(), YieldError> {
-            self.value += amount;
+            self.value = self.value.checked_add(amount).ok_or(YieldError::Overflow)?;
             Ok(())
         }
 
@@ -394,130 +405,146 @@ mod tests {
     }
 
     #[test]
-    fn deposit_moves_principal_into_protocol() {
+    fn deposit_moves_principal_into_protocol() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
 
         assert_eq!(m.total_principal(), 1_000);
-        assert_eq!(m.position(1).unwrap().principal, 1_000);
+        assert_eq!(
+            m.position(1).expect("position must exist after deposit").principal,
+            1_000
+        );
         assert_eq!(m.protocol().value, 1_000);
+        Ok(())
     }
 
     #[test]
-    fn zero_amounts_are_rejected() {
+    fn zero_amounts_are_rejected() -> Result<(), YieldError> {
         let mut m = manager(500);
         assert_eq!(m.deposit(1, 0, 0), Err(YieldError::ZeroAmount));
 
-        m.deposit(1, 100, 0).unwrap();
+        m.deposit(1, 100, 0)?;
         assert_eq!(m.withdraw(1, 0, 0), Err(YieldError::ZeroAmount));
         assert_eq!(m.claim_yield(1, 0, 0), Err(YieldError::ZeroAmount));
+        Ok(())
     }
 
     #[test]
-    fn yield_accrues_pro_rata_to_principal() {
+    fn yield_accrues_pro_rata_to_principal() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
-        m.deposit(2, 3_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
+        m.deposit(2, 3_000, 0)?;
 
         // 4_000 at 5% for a year earns 200.
-        assert_eq!(m.harvest(YEAR).unwrap(), 200);
-        assert_eq!(m.pending_yield(1).unwrap(), 50);
-        assert_eq!(m.pending_yield(2).unwrap(), 150);
+        assert_eq!(m.harvest(YEAR)?, 200);
+        assert_eq!(m.pending_yield(1)?, 50);
+        assert_eq!(m.pending_yield(2)?, 150);
         assert_eq!(m.outstanding_yield(), 200);
+        Ok(())
     }
 
     #[test]
-    fn late_depositor_does_not_earn_earlier_yield() {
+    fn late_depositor_does_not_earn_earlier_yield() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
 
         // Vault 2 joins after the first year's yield has accrued.
-        m.deposit(2, 1_000, YEAR).unwrap();
-        assert_eq!(m.pending_yield(2).unwrap(), 0);
-        assert_eq!(m.pending_yield(1).unwrap(), 50);
+        m.deposit(2, 1_000, YEAR)?;
+        assert_eq!(m.pending_yield(2)?, 0);
+        assert_eq!(m.pending_yield(1)?, 50);
 
         // Second year: 2_050 earns 102 (rounded down), split 51 and 51.
-        m.harvest(2 * YEAR).unwrap();
-        assert_eq!(m.pending_yield(1).unwrap(), 101);
-        assert_eq!(m.pending_yield(2).unwrap(), 51);
+        m.harvest(2 * YEAR)?;
+        assert_eq!(m.pending_yield(1)?, 101);
+        assert_eq!(m.pending_yield(2)?, 51);
+        Ok(())
     }
 
     #[test]
-    fn withdraw_settles_yield_before_reducing_principal() {
+    fn withdraw_settles_yield_before_reducing_principal() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
 
-        m.withdraw(1, 600, YEAR).unwrap();
-        let position = m.position(1).unwrap();
+        m.withdraw(1, 600, YEAR)?;
+        let position = m.position(1).expect("position must exist after withdraw");
         assert_eq!(position.principal, 400);
         assert_eq!(position.accrued, 50);
 
         // Later yield is earned on the reduced principal only: 450 earns 22.
-        m.harvest(2 * YEAR).unwrap();
-        assert_eq!(m.pending_yield(1).unwrap(), 50 + 22);
+        m.harvest(2 * YEAR)?;
+        assert_eq!(m.pending_yield(1)?, 50 + 22);
+        Ok(())
     }
 
     #[test]
-    fn withdraw_rejects_unknown_vault_and_excess_principal() {
+    fn withdraw_rejects_unknown_vault_and_excess_principal() -> Result<(), YieldError> {
         let mut m = manager(500);
         assert_eq!(m.withdraw(9, 1, 0), Err(YieldError::UnknownVault));
 
-        m.deposit(1, 100, 0).unwrap();
+        m.deposit(1, 100, 0)?;
         assert_eq!(
             m.withdraw(1, 101, 0),
             Err(YieldError::InsufficientPrincipal)
         );
-        assert_eq!(m.position(1).unwrap().principal, 100);
+        assert_eq!(
+            m.position(1).expect("position must exist after deposit").principal,
+            100
+        );
+        Ok(())
     }
 
     #[test]
-    fn claim_pays_out_and_updates_per_vault_totals() {
+    fn claim_pays_out_and_updates_per_vault_totals() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
-        m.harvest(YEAR).unwrap();
+        m.deposit(1, 1_000, 0)?;
+        m.harvest(YEAR)?;
 
-        assert_eq!(m.claim_yield(1, 30, YEAR).unwrap(), 30);
-        let position = m.position(1).unwrap();
+        assert_eq!(m.claim_yield(1, 30, YEAR)?, 30);
+        let position = m.position(1).expect("position must exist after claim");
         assert_eq!(position.accrued, 20);
         assert_eq!(position.claimed, 30);
         assert_eq!(m.outstanding_yield(), 20);
         assert_eq!(m.protocol().value, 1_020);
+        Ok(())
     }
 
     #[test]
-    fn claim_rejects_more_than_accrued() {
+    fn claim_rejects_more_than_accrued() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
 
         assert_eq!(
             m.claim_yield(1, 51, YEAR),
             Err(YieldError::InsufficientYield)
         );
         assert_eq!(m.claim_yield(9, 1, YEAR), Err(YieldError::UnknownVault));
-        assert_eq!(m.pending_yield(1).unwrap(), 50);
+        assert_eq!(m.pending_yield(1)?, 50);
+        Ok(())
     }
 
     #[test]
-    fn protocol_loss_credits_nothing_and_recovery_credits_only_new_gain() {
+    fn protocol_loss_credits_nothing_and_recovery_credits_only_new_gain() -> Result<(), YieldError>
+    {
         let mut m = YieldManager::new(StaticProtocol::default());
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
 
         m.protocol.value = 900;
-        assert_eq!(m.harvest(1).unwrap(), 0);
+        assert_eq!(m.harvest(1)?, 0);
         assert_eq!(m.outstanding_yield(), 0);
 
         // Value must climb back above principal before anything is credited.
         m.protocol.value = 1_100;
-        assert_eq!(m.harvest(2).unwrap(), 100);
-        assert_eq!(m.pending_yield(1).unwrap(), 100);
+        assert_eq!(m.harvest(2)?, 100);
+        assert_eq!(m.pending_yield(1)?, 100);
+        Ok(())
     }
 
     #[test]
-    fn claim_fails_when_protocol_cannot_pay() {
+    fn claim_fails_when_protocol_cannot_pay() -> Result<(), YieldError> {
         let mut m = YieldManager::new(StaticProtocol::default());
-        m.deposit(1, 1_000, 0).unwrap();
+        m.deposit(1, 1_000, 0)?;
         m.protocol.value = 1_050;
-        m.harvest(1).unwrap();
+        m.harvest(1)?;
 
         m.protocol.value = 30;
         assert_eq!(
@@ -525,49 +552,96 @@ mod tests {
             Err(YieldError::InsufficientLiquidity)
         );
         // The failed claim leaves the position and the outstanding total alone.
-        assert_eq!(m.pending_yield(1).unwrap(), 50);
-        assert_eq!(m.position(1).unwrap().claimed, 0);
+        assert_eq!(m.pending_yield(1)?, 50);
+        assert_eq!(
+            m.position(1).expect("position must exist after deposit").claimed,
+            0
+        );
         assert_eq!(m.outstanding_yield(), 50);
+        Ok(())
     }
 
     #[test]
-    fn value_arriving_with_no_principal_is_not_credited_to_later_depositors() {
+    fn value_arriving_with_no_principal_is_not_credited_to_later_depositors(
+    ) -> Result<(), YieldError> {
         let mut m = YieldManager::new(StaticProtocol::default());
         m.protocol.value = 100;
-        assert_eq!(m.harvest(1).unwrap(), 0);
+        assert_eq!(m.harvest(1)?, 0);
         assert_eq!(m.unallocated(), 100);
 
-        m.deposit(1, 1_000, 2).unwrap();
-        assert_eq!(m.harvest(3).unwrap(), 0);
-        assert_eq!(m.pending_yield(1).unwrap(), 0);
+        m.deposit(1, 1_000, 2)?;
+        assert_eq!(m.harvest(3)?, 0);
+        assert_eq!(m.pending_yield(1)?, 0);
         assert_eq!(m.unallocated(), 100);
+        Ok(())
     }
 
     #[test]
-    fn rounding_dust_never_exceeds_outstanding_yield() {
+    fn rounding_dust_never_exceeds_outstanding_yield() -> Result<(), YieldError> {
         let mut m = manager(333);
-        m.deposit(1, 333, 0).unwrap();
-        m.deposit(2, 333, 0).unwrap();
-        m.deposit(3, 334, 0).unwrap();
-        m.harvest(YEAR / 3).unwrap();
-        m.deposit(4, 7, YEAR / 2).unwrap();
-        m.harvest(YEAR).unwrap();
+        m.deposit(1, 333, 0)?;
+        m.deposit(2, 333, 0)?;
+        m.deposit(3, 334, 0)?;
+        m.harvest(YEAR / 3)?;
+        m.deposit(4, 7, YEAR / 2)?;
+        m.harvest(YEAR)?;
 
-        let sum: u128 = (1..=4).map(|id| m.pending_yield(id).unwrap()).sum();
+        let mut sum: u128 = 0;
+        for id in 1..=4 {
+            sum = sum
+                .checked_add(m.pending_yield(id)?)
+                .ok_or(YieldError::Overflow)?;
+        }
         let outstanding = m.outstanding_yield();
         assert!(sum <= outstanding);
         // Each vault can lose less than one unit per harvest (3 harvests, 4 vaults).
         assert!(outstanding - sum <= 12);
+        Ok(())
     }
 
     #[test]
-    fn yield_is_claimable_after_principal_is_fully_withdrawn() {
+    fn yield_is_claimable_after_principal_is_fully_withdrawn() -> Result<(), YieldError> {
         let mut m = manager(500);
-        m.deposit(1, 1_000, 0).unwrap();
-        m.withdraw(1, 1_000, YEAR).unwrap();
+        m.deposit(1, 1_000, 0)?;
+        m.withdraw(1, 1_000, YEAR)?;
 
-        assert_eq!(m.claim_yield(1, 50, YEAR).unwrap(), 50);
-        assert_eq!(m.position(1).unwrap().principal, 0);
+        assert_eq!(m.claim_yield(1, 50, YEAR)?, 50);
+        assert_eq!(
+            m.position(1).expect("position must exist after claim").principal,
+            0
+        );
         assert_eq!(m.total_principal(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_yield_rejects_unknown_vault() {
+        let m = manager(500);
+        assert_eq!(m.pending_yield(42), Err(YieldError::UnknownVault));
+    }
+
+    #[test]
+    fn fixed_rate_protocol_reports_overflow() {
+        let mut protocol = FixedRateProtocol::new(u32::MAX, 0);
+        protocol.value = u128::MAX;
+        assert_eq!(protocol.value(YEAR), Err(YieldError::Overflow));
+    }
+
+    #[test]
+    fn fixed_rate_protocol_rejects_over_withdrawal() {
+        let mut protocol = FixedRateProtocol::new(0, 0);
+        assert_eq!(
+            protocol.withdraw(0, 1),
+            Err(YieldError::InsufficientLiquidity)
+        );
+    }
+
+    #[test]
+    fn harvest_reports_overflow_when_index_delta_overflows() {
+        let mut m = YieldManager::new(StaticProtocol::default());
+        m.deposit(1, 1, 0)?;
+        m.protocol.value = u128::MAX;
+        assert_eq!(m.harvest(1), Err(YieldError::Overflow));
+        Ok::<(), YieldError>(())
     }
 }

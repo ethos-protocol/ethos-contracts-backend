@@ -23,12 +23,10 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// `true` if the vault has expired, `false` otherwise
-    ///
-    /// # Panics
-    /// Panics if the vault does not exist
-    pub fn is_expired(env: Env, vault_id: u64) -> bool {
-        let vault = Self::load_vault(&env, vault_id);
+    /// `Some(true)` if the vault has expired, `Some(false)` otherwise,
+    /// `None` if the vault does not exist
+    pub fn is_expired(env: Env, vault_id: u64) -> Option<bool> {
+        let vault = Self::try_load_vault(&env, vault_id)?;
         let now = env.ledger().timestamp();
         // Compute how many seconds of hibernation have elapsed (capped at duration).
         let hibernated = if let Some(h) = env
@@ -39,13 +37,13 @@ impl TtlVaultContract {
             let elapsed = now.saturating_sub(h.started_at).min(h.duration_seconds);
             // If still inside the hibernation window, vault cannot expire.
             if elapsed < h.duration_seconds {
-                return false;
+                return Some(false);
             }
             h.duration_seconds
         } else {
             0u64
         };
-        now >= vault.last_check_in + vault.check_in_interval + hibernated
+        Some(now >= vault.last_check_in + vault.check_in_interval + hibernated)
     }
 
     /// Retrieves a vault by its unique identifier.
@@ -64,18 +62,18 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The `Vault` struct containing all vault data
-    ///
-    /// # Panics
-    /// Panics if the vault does not exist (use `vault_exists` to check first)
-    pub fn get_vault(env: Env, vault_id: u64) -> Vault {
-        Self::load_vault(&env, vault_id)
+    /// `Some(Vault)` containing all vault data, or `None` if the vault does not exist
+    pub fn get_vault(env: Env, vault_id: u64) -> Option<Vault> {
+        Self::try_load_vault(&env, vault_id)
     }
 
     /// Captures the state of a vault at a specific point in time.
     /// Anyone can call this function.
-    pub fn create_vault_snapshot(env: Env, vault_id: u64) -> Bytes {
-        let vault = Self::load_vault(&env, vault_id);
+    ///
+    /// # Returns
+    /// `Some(content_hash)` on success, `None` if the vault does not exist
+    pub fn create_vault_snapshot(env: Env, vault_id: u64) -> Option<Bytes> {
+        let vault = Self::try_load_vault(&env, vault_id)?;
         let timestamp = env.ledger().timestamp();
         let vault_bytes = vault.clone().to_xdr(&env);
         let content_hash: BytesN<32> = env.crypto().sha256(&vault_bytes).into();
@@ -113,17 +111,18 @@ impl TtlVaultContract {
             .persistent()
             .set(&DataKey::VaultSnapshotTimestamps(vault_id), &timestamps);
 
-        content_hash.into()
+        Some(content_hash.into())
     }
 
     /// Retrieves a captured vault state at a specific timestamp.
-    pub fn get_vault_snapshot(env: Env, vault_id: u64, timestamp: u64) -> Vault {
-        let snapshot: VaultSnapshot = env
-            .storage()
+    ///
+    /// # Returns
+    /// `Some(Vault)` if a snapshot exists at `timestamp`, `None` otherwise
+    pub fn get_vault_snapshot(env: Env, vault_id: u64, timestamp: u64) -> Option<Vault> {
+        env.storage()
             .persistent()
-            .get(&DataKey::VaultSnapshot(vault_id, timestamp))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
-        snapshot.vault
+            .get::<DataKey, VaultSnapshot>(&DataKey::VaultSnapshot(vault_id, timestamp))
+            .map(|snapshot| snapshot.vault)
     }
 
     /// Returns the last check-in timestamp for a vault.
@@ -133,9 +132,9 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The Unix timestamp of the last check-in
-    pub fn get_vault_last_check_in(env: Env, vault_id: u64) -> u64 {
-        Self::load_vault(&env, vault_id).last_check_in
+    /// `Some(timestamp)` of the last check-in, or `None` if the vault does not exist
+    pub fn get_vault_last_check_in(env: Env, vault_id: u64) -> Option<u64> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.last_check_in)
     }
 
     /// Returns the balance of a vault.
@@ -145,9 +144,9 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The vault balance in stroops
-    pub fn get_vault_balance(env: Env, vault_id: u64) -> i128 {
-        Self::load_vault(&env, vault_id).balance
+    /// `Some(balance)` in stroops, or `None` if the vault does not exist
+    pub fn get_vault_balance(env: Env, vault_id: u64) -> Option<i128> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.balance)
     }
 
     /// Returns the owner address of a vault.
@@ -157,9 +156,9 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The owner `Address`
-    pub fn get_vault_owner(env: Env, vault_id: u64) -> Address {
-        Self::load_vault(&env, vault_id).owner
+    /// `Some(owner)` address, or `None` if the vault does not exist
+    pub fn get_vault_owner(env: Env, vault_id: u64) -> Option<Address> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.owner)
     }
 
     /// Returns the creation timestamp of a vault.
@@ -169,22 +168,23 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The Unix timestamp when the vault was created
-    pub fn get_vault_created_at(env: Env, vault_id: u64) -> u64 {
-        Self::load_vault(&env, vault_id).created_at
+    /// `Some(timestamp)` when the vault was created, or `None` if the vault does not exist
+    pub fn get_vault_created_at(env: Env, vault_id: u64) -> Option<u64> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.created_at)
     }
 
     /// Returns the unconditional release time for a vault.
     ///
     /// This is the earliest time the vault will automatically release funds
     /// if no further check-ins occur. Computed as last_check_in + check_in_interval.
-    /// Returns 0 if vault is already expired or released.
-    pub fn get_unconditional_release_time(env: Env, vault_id: u64) -> u64 {
-        let vault = Self::load_vault(&env, vault_id);
+    /// Returns 0 if vault is already expired or released, or `None` if the
+    /// vault does not exist.
+    pub fn get_unconditional_release_time(env: Env, vault_id: u64) -> Option<u64> {
+        let vault = Self::try_load_vault(&env, vault_id)?;
         if vault.status != ReleaseStatus::Locked {
-            return 0;
+            return Some(0);
         }
-        vault.last_check_in + vault.check_in_interval
+        Some(vault.last_check_in + vault.check_in_interval)
     }
 
     /// Sets a spending limit on a vault, capping the amount released per `trigger_release` call.
@@ -375,12 +375,10 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The `ReleaseStatus` enum value (Locked, Released, or Cancelled)
-    ///
-    /// # Panics
-    /// Panics if the vault does not exist
-    pub fn get_release_status(env: Env, vault_id: u64) -> ReleaseStatus {
-        Self::load_vault(&env, vault_id).status
+    /// `Some(ReleaseStatus)` enum value (Locked, Released, or Cancelled),
+    /// or `None` if the vault does not exist
+    pub fn get_release_status(env: Env, vault_id: u64) -> Option<ReleaseStatus> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.status)
     }
 
     /// Returns the total number of vaults created.
@@ -457,7 +455,7 @@ impl TtlVaultContract {
             return Err(ContractError::NotBeneficiary);
         }
         // Only before expiry
-        if Self::is_expired(env.clone(), vault_id) {
+        if Self::is_expired(env.clone(), vault_id).unwrap_or(true) {
             return Err(ContractError::NotExpired);
         }
         env.storage()
@@ -1563,7 +1561,7 @@ impl TtlVaultContract {
             .storage()
             .persistent()
             .get::<DataKey, OwnershipTransferRequest>(&key)
-            .expect("just checked has(&key) above");
+            .ok_or(ContractError::NoPendingOwnershipTransfer)?;
 
         let reason = if caller == vault.owner {
             String::from_str(&env, "cancelled")
@@ -1726,10 +1724,9 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The custom metadata bytes
-    pub fn get_vault_metadata(env: Env, vault_id: u64) -> Bytes {
-        let vault = Self::load_vault(&env, vault_id);
-        vault.custom_metadata
+    /// `Some(metadata)` bytes, or `None` if the vault does not exist
+    pub fn get_vault_metadata(env: Env, vault_id: u64) -> Option<Bytes> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.custom_metadata)
     }
 
     // --- Issue #380: Vault Pause/Freeze ---
@@ -1857,10 +1854,9 @@ impl TtlVaultContract {
     /// * `vault_id` - The unique identifier of the vault
     ///
     /// # Returns
-    /// The release condition
-    pub fn get_release_condition(env: Env, vault_id: u64) -> ReleaseCondition {
-        let vault = Self::load_vault(&env, vault_id);
-        vault.release_condition
+    /// `Some(ReleaseCondition)`, or `None` if the vault does not exist
+    pub fn get_release_condition(env: Env, vault_id: u64) -> Option<ReleaseCondition> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.release_condition)
     }
 
     /// Sets multiple release conditions for a vault.
@@ -1906,9 +1902,10 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::ReleaseConditions(vault_id))
             .unwrap_or_else(|| {
-                let vault = Self::load_vault(env, vault_id);
                 let mut conditions = Vec::new(env);
-                conditions.push_back(vault.release_condition);
+                if let Some(vault) = Self::try_load_vault(env, vault_id) {
+                    conditions.push_back(vault.release_condition);
+                }
                 conditions
             })
     }
@@ -2227,7 +2224,7 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::BeneficiaryAlreadyRevealed);
         }
-        if !Self::is_expired(env.clone(), vault_id) {
+        if !Self::is_expired(env.clone(), vault_id).unwrap_or(false) {
             return Err(ContractError::NotExpired);
         }
         if vault.balance == 0 {
