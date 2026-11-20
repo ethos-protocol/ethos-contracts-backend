@@ -213,7 +213,7 @@ mod tests {
             },
             &EncodingKey::from_secret(secret),
         )
-        .unwrap()
+        .expect("test JWT should encode")
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_revoked_token_and_accepts_live_one() {
+    fn validate_rejects_revoked_token_and_accepts_live_one() -> Result<(), String> {
         let secret = b"revocation-test-secret";
         let list = RevocationList::new();
         let exp = Utc::now().timestamp() + 3600;
@@ -267,11 +267,13 @@ mod tests {
 
         list.revoke("jti-bad", exp);
 
-        let ok = validate_ws_token_with_revocation(&good, secret, &list).unwrap();
+        let ok = validate_ws_token_with_revocation(&good, secret, &list)?;
         assert_eq!(ok.jti.as_deref(), Some("jti-good"));
 
-        let err = validate_ws_token_with_revocation(&bad, secret, &list).unwrap_err();
+        let err = validate_ws_token_with_revocation(&bad, secret, &list)
+            .expect_err("revoked token must be rejected");
         assert!(err.contains("revoked"), "unexpected error: {err}");
+        Ok(())
     }
 
     #[tokio::test]
@@ -290,7 +292,7 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
+        .expect("revoke by bare jti should succeed");
         assert_eq!(resp.0.revoked, "direct-jti");
         assert!(list.is_revoked("direct-jti"));
 
@@ -306,7 +308,7 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
+        .expect("revoke by full token should succeed");
         assert_eq!(resp.0.revoked, "token-jti");
         assert_eq!(resp.0.expires_at, exp);
         assert!(list.is_revoked("token-jti"));
@@ -325,7 +327,7 @@ mod tests {
             }),
         )
         .await
-        .unwrap_err();
+        .expect_err("empty revoke request must be rejected");
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 

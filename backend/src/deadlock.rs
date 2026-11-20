@@ -342,15 +342,19 @@ mod tests {
     #[test]
     fn test_second_holder_gets_timeout() {
         let d = DeadlockDetector::new();
-        d.acquire_lock("vaults", "req1").unwrap();
-        let err = d.acquire_lock("vaults", "req2").unwrap_err();
+        d.acquire_lock("vaults", "req1")
+            .expect("first acquisition should succeed");
+        let err = d
+            .acquire_lock("vaults", "req2")
+            .expect_err("second holder should not acquire the lock");
         assert!(matches!(err, DeadlockError::Timeout { .. }));
     }
 
     #[test]
     fn test_reentrant_acquire_is_ok() {
         let d = DeadlockDetector::new();
-        d.acquire_lock("vaults", "req1").unwrap();
+        d.acquire_lock("vaults", "req1")
+            .expect("first acquisition should succeed");
         assert!(d.acquire_lock("vaults", "req1").is_ok());
     }
 
@@ -358,7 +362,7 @@ mod tests {
     fn test_with_retry_succeeds_on_first_try() {
         let cfg = RetryConfig::default();
         let result = DeadlockDetector::with_retry(&cfg, || Ok::<i32, DeadlockError>(42));
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.expect("retry should succeed on first try"), 42);
     }
 
     #[test]
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn test_enforce_query_timeout_ok() {
         let result = DeadlockDetector::enforce_query_timeout(1_000, || 99_u32);
-        assert_eq!(result.unwrap(), 99);
+        assert_eq!(result.expect("query should complete within timeout"), 99);
     }
 
     #[test]

@@ -408,7 +408,9 @@ impl OptimizedConnectionPool {
                 }
             };
 
-            let (mut inner, timeout_result) = cvar.wait_timeout(inner, remaining).unwrap();
+            let (mut inner, timeout_result) = cvar
+                .wait_timeout(inner, remaining)
+                .map_err(|_| PoolError::Timeout)?;
             if timeout_result.timed_out() {
                 inner.acquire_timeouts += 1;
                 return Err(PoolError::Timeout);
@@ -493,8 +495,17 @@ pub struct PoolGuard<'a> {
 
 impl<'a> PoolGuard<'a> {
     /// Access the underlying [`Connection`].
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the guard has already been dropped (its connection
+    /// taken), which cannot happen while `&self` is held.
     pub fn conn(&self) -> &Connection {
-        &self.conn.as_ref().unwrap().conn
+        &self
+            .conn
+            .as_ref()
+            .expect("pool guard connection is present until drop")
+            .conn
     }
 }
 
@@ -725,7 +736,7 @@ mod tests {
         let pool = make_pool(2, 10);
         for _ in 0..20 {
             let guard = pool.acquire().expect("acquire");
-            guard.conn().execute_batch("SELECT 1").unwrap();
+            guard.conn().execute_batch("SELECT 1").expect("query");
         }
         // All connections returned, idle >= min.
         assert!(pool.idle_count() >= 2);

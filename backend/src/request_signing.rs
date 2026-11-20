@@ -98,7 +98,15 @@ impl SignatureVerifier {
 
         // 3. Verify signature
         let algorithm = parse_algorithm(&req.algorithm);
-        let expected_sig = sign_request(&req.body, secret, algorithm);
+        let expected_sig = match sign_request(&req.body, secret, algorithm) {
+            Ok(sig) => sig,
+            Err(e) => {
+                return VerificationResult {
+                    valid: false,
+                    reason: Some(e),
+                };
+            }
+        };
 
         let valid = constant_time_eq(req.signature.as_bytes(), expected_sig.as_bytes());
 
@@ -131,32 +139,40 @@ pub struct VerificationResult {
 
 // ── Signature computation ─────────────────────────────────────────────────────
 
-pub fn sign_request(body: &str, secret: &str, algorithm: SigningAlgorithm) -> String {
+pub fn sign_request(
+    body: &str,
+    secret: &str,
+    algorithm: SigningAlgorithm,
+) -> Result<String, String> {
     match algorithm {
         SigningAlgorithm::Sha256 => {
             type H = Hmac<Sha256>;
-            let mut mac = H::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+            let mut mac = H::new_from_slice(secret.as_bytes())
+                .map_err(|_| "invalid HMAC key".to_string())?;
             mac.update(body.as_bytes());
-            mac.finalize()
+            Ok(mac
+                .finalize()
                 .into_bytes()
                 .iter()
                 .map(|b| format!("{b:02x}"))
-                .collect()
+                .collect())
         }
         SigningAlgorithm::Sha512 => {
             type H = Hmac<Sha512>;
-            let mut mac = H::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+            let mut mac = H::new_from_slice(secret.as_bytes())
+                .map_err(|_| "invalid HMAC key".to_string())?;
             mac.update(body.as_bytes());
-            mac.finalize()
+            Ok(mac
+                .finalize()
                 .into_bytes()
                 .iter()
                 .map(|b| format!("{b:02x}"))
-                .collect()
+                .collect())
         }
         SigningAlgorithm::Ed25519 => {
             // For Ed25519, we'd use ed25519_dalek in production
             // For now, return a placeholder
-            format!("ed25519_{}", uuid::Uuid::new_v4())
+            Ok(format!("ed25519_{}", uuid::Uuid::new_v4()))
         }
     }
 }
@@ -217,7 +233,7 @@ mod tests {
     fn sign_and_verify_sha256() {
         let body = r#"{"action":"transfer","amount":100}"#;
         let secret = "test-secret-key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -236,7 +252,7 @@ mod tests {
     fn sign_and_verify_sha512() {
         let body = r#"{"action":"withdraw","amount":500}"#;
         let secret = "another-secret-key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha512);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha512).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -256,7 +272,7 @@ mod tests {
         let body = r#"{"action":"transfer"}"#;
         let secret_a = "secret-a";
         let secret_b = "secret-b";
-        let sig = sign_request(body, secret_a, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret_a, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -270,7 +286,11 @@ mod tests {
         let result = verifier.verify(&req, secret_b);
         assert!(!result.valid, "signature should not verify with wrong secret");
         assert!(
-            result.reason.as_ref().unwrap().contains("failed"),
+            result
+                .reason
+                .as_ref()
+                .expect("reason should be present")
+                .contains("failed"),
             "error reason should indicate verification failure"
         );
     }
@@ -280,7 +300,7 @@ mod tests {
         let original_body = r#"{"amount":100}"#;
         let tampered_body = r#"{"amount":999}"#;
         let secret = "key";
-        let sig = sign_request(original_body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(original_body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         let req = SignedRequest {
             body: tampered_body.to_string(),
@@ -299,7 +319,7 @@ mod tests {
     fn stale_timestamp_is_rejected() {
         let body = r#"{"action":"test"}"#;
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         // 10 minutes in the past
         let old_timestamp = (Utc::now().timestamp() - 600).to_string();
@@ -316,7 +336,11 @@ mod tests {
         let result = verifier.verify(&req, secret);
         assert!(!result.valid, "stale timestamp should be rejected");
         assert!(
-            result.reason.as_ref().unwrap().contains("drift"),
+            result
+                .reason
+                .as_ref()
+                .expect("reason should be present")
+                .contains("drift"),
             "error should mention timestamp drift"
         );
     }
@@ -325,7 +349,7 @@ mod tests {
     fn replay_attack_is_prevented() {
         let body = r#"{"action":"transfer"}"#;
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
         let nonce = uuid::Uuid::new_v4().to_string();
 
         let req = SignedRequest {
@@ -344,7 +368,7 @@ mod tests {
         // Second verification with same nonce should fail
         let req2 = SignedRequest {
             body: body.to_string(),
-            signature: sign_request(body, secret, SigningAlgorithm::Sha256),
+            signature: sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed"),
             timestamp: current_timestamp_str(),
             nonce: nonce.clone(),
             algorithm: None,
@@ -352,7 +376,11 @@ mod tests {
         let result2 = verifier.verify(&req2, secret);
         assert!(!result2.valid, "replay attack should be detected");
         assert!(
-            result2.reason.as_ref().unwrap().contains("replay"),
+            result2
+                .reason
+                .as_ref()
+                .expect("reason should be present")
+                .contains("replay"),
             "error should mention replay attack"
         );
     }
@@ -364,7 +392,7 @@ mod tests {
         let verifier = SignatureVerifier::new();
 
         for i in 0..5 {
-            let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+            let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
             let req = SignedRequest {
                 body: body.to_string(),
                 signature: sig,
@@ -385,7 +413,7 @@ mod tests {
     fn future_timestamp_within_tolerance_is_accepted() {
         let body = r#"{"action":"test"}"#;
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         // 1 minute in the future (within tolerance)
         let future_timestamp = (Utc::now().timestamp() + 60).to_string();
@@ -407,7 +435,7 @@ mod tests {
     fn invalid_timestamp_format_is_rejected() {
         let body = r#"{"action":"test"}"#;
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -421,7 +449,11 @@ mod tests {
         let result = verifier.verify(&req, secret);
         assert!(!result.valid, "invalid timestamp should be rejected");
         assert!(
-            result.reason.as_ref().unwrap().contains("invalid"),
+            result
+                .reason
+                .as_ref()
+                .expect("reason should be present")
+                .contains("invalid"),
             "error should indicate invalid timestamp"
         );
     }
@@ -430,7 +462,7 @@ mod tests {
     fn empty_body_can_be_signed() {
         let body = "";
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha256);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha256).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -449,7 +481,7 @@ mod tests {
     fn large_body_is_signed_correctly() {
         let body = &"x".repeat(100_000); // 100KB body
         let secret = "key";
-        let sig = sign_request(body, secret, SigningAlgorithm::Sha512);
+        let sig = sign_request(body, secret, SigningAlgorithm::Sha512).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
@@ -470,7 +502,7 @@ mod tests {
         let secret = "key";
 
         // Sign without specifying algorithm (defaults to SHA256)
-        let sig = sign_request(body, secret, SigningAlgorithm::default());
+        let sig = sign_request(body, secret, SigningAlgorithm::default()).expect("signing should succeed");
 
         let req = SignedRequest {
             body: body.to_string(),
