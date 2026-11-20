@@ -122,6 +122,46 @@ pub struct MetricDefinition {
     pub unit: Option<String>,
 }
 
+/// Why a metric definition or data point was rejected.
+///
+/// Registration and recording return this instead of panicking, so a
+/// duplicate or malformed metric name surfaces as an error the caller can
+/// handle (or report as an HTTP status) rather than crashing at startup.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetricError {
+    /// The name does not match the Prometheus metric name grammar.
+    #[error("invalid metric name '{0}'")]
+    InvalidName(String),
+    /// The value is NaN or infinite, which Prometheus cannot represent.
+    #[error("value for '{name}' must be finite")]
+    NonFiniteValue { name: String },
+    /// A tag key is not a valid Prometheus label name.
+    #[error("invalid label name '{label}' on '{name}'")]
+    InvalidLabel { name: String, label: String },
+    /// The metric is already registered with a different kind.
+    #[error("metric '{name}' is already defined as a {}", .existing.prometheus_type())]
+    KindConflict { name: String, existing: MetricKind },
+}
+
+impl MetricError {
+    /// HTTP status for this error: **409 Conflict** when a metric name is
+    /// already registered as another kind, **400 Bad Request** otherwise.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::KindConflict { .. } => StatusCode::CONFLICT,
+            Self::InvalidName(_) | Self::NonFiniteValue { .. } | Self::InvalidLabel { .. } => {
+                StatusCode::BAD_REQUEST
+            }
+        }
+    }
+}
+
+impl IntoResponse for MetricError {
+    fn into_response(self) -> axum::response::Response {
+        (self.status_code(), self.to_string()).into_response()
+    }
+}
+
 /// Prometheus metric name: `[a-zA-Z_:][a-zA-Z0-9_:]*`.
 pub fn is_valid_metric_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -143,15 +183,20 @@ pub fn validate_point(
     name: &str,
     value: f64,
     tags: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<(), MetricError> {
     if !is_valid_metric_name(name) {
-        return Err(format!("invalid metric name '{name}'"));
+        return Err(MetricError::InvalidName(name.to_string()));
     }
     if !value.is_finite() {
-        return Err(format!("value for '{name}' must be finite"));
+        return Err(MetricError::NonFiniteValue {
+            name: name.to_string(),
+        });
     }
     if let Some(bad) = tags.keys().find(|k| !is_valid_label_name(k)) {
-        return Err(format!("invalid label name '{bad}' on '{name}'"));
+        return Err(MetricError::InvalidLabel {
+            name: name.to_string(),
+            label: bad.clone(),
+        });
     }
     Ok(())
 }
@@ -230,18 +275,17 @@ impl CustomMetricsStore {
     /// Declare a metric. Redefining an existing metric updates its metadata,
     /// but its kind is fixed once declared, since changing it would make the
     /// exported time series ambiguous.
-    pub fn define_metric(&self, def: MetricDefinition) -> Result<MetricDefinition, String> {
+    pub fn define_metric(&self, def: MetricDefinition) -> Result<MetricDefinition, MetricError> {
         if !is_valid_metric_name(&def.name) {
-            return Err(format!("invalid metric name '{}'", def.name));
+            return Err(MetricError::InvalidName(def.name));
         }
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = inner.definitions.get(&def.name) {
             if existing.kind != def.kind {
-                return Err(format!(
-                    "metric '{}' is already defined as a {}",
-                    def.name,
-                    existing.kind.prometheus_type()
-                ));
+                return Err(MetricError::KindConflict {
+                    name: def.name,
+                    existing: existing.kind,
+                });
             }
         }
         inner.definitions.insert(def.name.clone(), def.clone());
@@ -253,7 +297,7 @@ impl CustomMetricsStore {
         let mut defs: Vec<MetricDefinition> = self
             .inner
             .read()
-            .expect("metrics lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .definitions
             .values()
             .cloned()
@@ -268,7 +312,7 @@ impl CustomMetricsStore {
     /// their values; gauges export the value of the newest point. Metrics that
     /// were recorded without a definition are exported as `untyped`.
     pub fn export_prometheus(&self) -> String {
-        let inner = self.inner.read().expect("metrics lock poisoned");
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let names: BTreeSet<&String> = inner
             .series
             .keys()
@@ -410,8 +454,8 @@ pub async fn record_custom_metric(
     State(store): State<Arc<CustomMetricsStore>>,
     Json(req): Json<RecordMetricRequest>,
 ) -> impl IntoResponse {
-    if let Err(msg) = validate_point(&req.name, req.value, &req.tags) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+    if let Err(err) = validate_point(&req.name, req.value, &req.tags) {
+        return err.into_response();
     }
     store.record(&req.name, req.value, req.tags);
     StatusCode::ACCEPTED.into_response()
@@ -425,13 +469,16 @@ pub async fn list_custom_metrics(
 }
 
 /// `POST /metrics/custom/definitions` - declare a counter or gauge.
+///
+/// Returns 400 for an invalid name and 409 when the name is already
+/// registered with a different kind.
 pub async fn define_custom_metric(
     State(store): State<Arc<CustomMetricsStore>>,
     Json(def): Json<MetricDefinition>,
 ) -> impl IntoResponse {
     match store.define_metric(def) {
         Ok(saved) => (StatusCode::CREATED, Json(saved)).into_response(),
-        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
@@ -495,48 +542,32 @@ pub async fn get_shared_dashboard(
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn aggregate(
+        store: &CustomMetricsStore,
+        name: &str,
+        agg: Aggregation,
+    ) -> Result<AggregateResponse, String> {
+        store
+            .aggregate(name, agg)
+            .ok_or_else(|| format!("no series recorded for '{name}'"))
+    }
+
     #[test]
-    fn aggregates_sum_avg_min_max_count() {
+    fn aggregates_sum_avg_min_max_count() -> TestResult {
         let store = CustomMetricsStore::default();
         for v in [1.0, 2.0, 3.0, 4.0] {
             store.record("checkout_latency_ms", v, HashMap::new());
         }
 
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Sum)
-                .unwrap()
-                .value,
-            10.0
-        );
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Avg)
-                .unwrap()
-                .value,
-            2.5
-        );
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Min)
-                .unwrap()
-                .value,
-            1.0
-        );
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Max)
-                .unwrap()
-                .value,
-            4.0
-        );
-        assert_eq!(
-            store
-                .aggregate("checkout_latency_ms", Aggregation::Count)
-                .unwrap()
-                .sample_count,
-            4
-        );
+        let name = "checkout_latency_ms";
+        assert_eq!(aggregate(&store, name, Aggregation::Sum)?.value, 10.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Avg)?.value, 2.5);
+        assert_eq!(aggregate(&store, name, Aggregation::Min)?.value, 1.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Max)?.value, 4.0);
+        assert_eq!(aggregate(&store, name, Aggregation::Count)?.sample_count, 4);
+        Ok(())
     }
 
     #[test]
@@ -555,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_share_round_trips() {
+    fn dashboard_share_round_trips() -> TestResult {
         let store = CustomMetricsStore::default();
         let share = store.create_share(CreateShareRequest {
             dashboard: "vault-lifecycle".to_string(),
@@ -563,8 +594,9 @@ mod tests {
         });
         let resolved = store
             .resolve_share(&share.token)
-            .expect("share should resolve");
+            .ok_or("share should resolve")?;
         assert_eq!(resolved.dashboard, "vault-lifecycle");
+        Ok(())
     }
 
     fn definition(name: &str, kind: MetricKind) -> MetricDefinition {
@@ -599,60 +631,103 @@ mod tests {
     #[test]
     fn validate_point_rejects_non_finite_values_and_bad_labels() {
         assert!(validate_point("ok_metric", 1.0, &HashMap::new()).is_ok());
-        assert!(validate_point("ok_metric", f64::NAN, &HashMap::new()).is_err());
-        assert!(validate_point("ok_metric", f64::INFINITY, &HashMap::new()).is_err());
-        assert!(validate_point("ok_metric", 1.0, &tags(&[("bad-key", "x")])).is_err());
-        assert!(validate_point("bad name", 1.0, &HashMap::new()).is_err());
+        assert!(matches!(
+            validate_point("ok_metric", f64::NAN, &HashMap::new()),
+            Err(MetricError::NonFiniteValue { .. })
+        ));
+        assert!(matches!(
+            validate_point("ok_metric", f64::INFINITY, &HashMap::new()),
+            Err(MetricError::NonFiniteValue { .. })
+        ));
+        assert!(matches!(
+            validate_point("ok_metric", 1.0, &tags(&[("bad-key", "x")])),
+            Err(MetricError::InvalidLabel { .. })
+        ));
+        assert!(matches!(
+            validate_point("bad name", 1.0, &HashMap::new()),
+            Err(MetricError::InvalidName(_))
+        ));
     }
 
     #[test]
-    fn defined_metric_round_trips_and_lists_sorted() {
+    fn defined_metric_round_trips_and_lists_sorted() -> TestResult {
         let store = CustomMetricsStore::default();
-        store
-            .define_metric(definition("zeta_gauge", MetricKind::Gauge))
-            .unwrap();
-        store
-            .define_metric(definition("alpha_total", MetricKind::Counter))
-            .unwrap();
+        store.define_metric(definition("zeta_gauge", MetricKind::Gauge))?;
+        store.define_metric(definition("alpha_total", MetricKind::Counter))?;
 
         let names: Vec<String> = store.definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["alpha_total", "zeta_gauge"]);
+        Ok(())
     }
 
     #[test]
-    fn redefining_with_a_different_kind_is_rejected() {
+    fn redefining_with_the_same_kind_updates_metadata() -> TestResult {
         let store = CustomMetricsStore::default();
-        store
-            .define_metric(definition("payouts", MetricKind::Counter))
-            .unwrap();
+        store.define_metric(definition("payouts", MetricKind::Counter))?;
+        store.define_metric(MetricDefinition {
+            description: Some("Payouts processed".to_string()),
+            ..definition("payouts", MetricKind::Counter)
+        })?;
+
+        let defs = store.definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].description.as_deref(), Some("Payouts processed"));
+        Ok(())
+    }
+
+    #[test]
+    fn redefining_with_a_different_kind_is_rejected() -> TestResult {
+        let store = CustomMetricsStore::default();
+        store.define_metric(definition("payouts", MetricKind::Counter))?;
         let err = store
             .define_metric(definition("payouts", MetricKind::Gauge))
-            .unwrap_err();
-        assert!(err.contains("already defined as a counter"));
+            .err()
+            .ok_or("duplicate name with a different kind must be rejected")?;
+        assert_eq!(
+            err,
+            MetricError::KindConflict {
+                name: "payouts".to_string(),
+                existing: MetricKind::Counter,
+            }
+        );
+        assert!(err.to_string().contains("already defined as a counter"));
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        Ok(())
     }
 
     #[test]
     fn invalid_definition_name_is_rejected() {
         let store = CustomMetricsStore::default();
-        assert!(store
-            .define_metric(definition("not valid", MetricKind::Gauge))
-            .is_err());
+        let result = store.define_metric(definition("not valid", MetricKind::Gauge));
+        assert_eq!(result, Err(MetricError::InvalidName("not valid".to_string())));
+        assert!(store.definitions().is_empty());
     }
 
     #[test]
-    fn export_renders_counter_sum_and_gauge_latest_per_label_set() {
+    fn metric_errors_map_to_http_statuses() {
+        let invalid = MetricError::InvalidName("x y".to_string());
+        assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+
+        let non_finite = MetricError::NonFiniteValue { name: "m".to_string() };
+        assert_eq!(non_finite.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let conflict = MetricError::KindConflict {
+            name: "m".to_string(),
+            existing: MetricKind::Gauge,
+        };
+        assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn export_renders_counter_sum_and_gauge_latest_per_label_set() -> TestResult {
         let store = CustomMetricsStore::default();
-        store
-            .define_metric(MetricDefinition {
-                name: "vault_releases_total".to_string(),
-                kind: MetricKind::Counter,
-                description: Some("Releases per region".to_string()),
-                unit: None,
-            })
-            .unwrap();
-        store
-            .define_metric(definition("vault_balance", MetricKind::Gauge))
-            .unwrap();
+        store.define_metric(MetricDefinition {
+            name: "vault_releases_total".to_string(),
+            kind: MetricKind::Counter,
+            description: Some("Releases per region".to_string()),
+            unit: None,
+        })?;
+        store.define_metric(definition("vault_balance", MetricKind::Gauge))?;
 
         store.record("vault_releases_total", 2.0, tags(&[("region", "eu")]));
         store.record("vault_releases_total", 3.0, tags(&[("region", "eu")]));
@@ -667,6 +742,7 @@ mod tests {
         assert!(text.contains("vault_releases_total{region=\"us\"} 1\n"));
         assert!(text.contains("# TYPE vault_balance gauge\n"));
         assert!(text.contains("vault_balance 42\n"));
+        Ok(())
     }
 
     #[test]
