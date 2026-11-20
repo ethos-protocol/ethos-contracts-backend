@@ -30,15 +30,15 @@ too_many_lines = "allow"
 unused_self = "allow"
 
 # Integer conversions common in on-chain ledger/time math
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_precision_loss = "allow"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
 cast_lossless = "allow"
 unnecessary_cast = "allow"
 
 # Documentation style; enforced selectively as the codebase matures
 missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+missing_panics_doc = "warn"
 doc_markdown = "allow"
 
 # Large domain models and error enums

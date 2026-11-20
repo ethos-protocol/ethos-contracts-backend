@@ -5,13 +5,36 @@
 //! `STELLAR_INTEGRATION_TESTS` environment variable so they do not run in
 //! normal `cargo test` CI (which has no live testnet access).
 //!
+//! ## Running in CI
+//!
+//! A scheduled GitHub Actions workflow (`.github/workflows/stellar-integration.yml`)
+//! runs these tests against the public Stellar testnet on a cron schedule. It
+//! exports the required environment variables and invokes:
+//!
+//! ```sh
+//! cargo test -p backend -- --ignored
+//! ```
+//!
+//! The `--ignored` flag selects every `#[ignore]`-tagged test in this file;
+//! each test then additionally checks `integration_enabled()` so a missing
+//! `STELLAR_INTEGRATION_TESTS=1` causes it to skip rather than fail.
+//!
+//! ## Required environment variables
+//!
+//! - `STELLAR_INTEGRATION_TESTS=1` — enables the tests (checked by
+//!   [`integration_enabled`]). Without it every test returns early.
+//! - `STELLAR_RPC_URL` — Soroban RPC endpoint; defaults to the public testnet
+//!   endpoint `https://soroban-testnet.stellar.org` when unset.
+//! - `CONTRACT_TTL_VAULT` — deployed TTL vault contract id. Tests that need a
+//!   live contract skip themselves when this is absent.
+//!
 //! ## Running manually
 //!
 //! ```sh
 //! STELLAR_INTEGRATION_TESTS=1 \
 //! STELLAR_RPC_URL=https://soroban-testnet.stellar.org \
 //! CONTRACT_TTL_VAULT=<deployed-contract-id> \
-//! cargo test -p backend stellar_integration
+//! cargo test -p backend -- --ignored
 //! ```
 //!
 //! All tests in this file are tagged `#[ignore]` and additionally check
@@ -25,6 +48,10 @@ use std::collections::HashMap;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Returns true when the `STELLAR_INTEGRATION_TESTS` env var is set to `"1"`.
+///
+/// The scheduled CI workflow sets this variable before running
+/// `cargo test -p backend -- --ignored`, so the `#[ignore]`-tagged tests in
+/// this file are selected and then proceed past their early-return guard.
 fn integration_enabled() -> bool {
     std::env::var("STELLAR_INTEGRATION_TESTS")
         .map(|v| v == "1")
