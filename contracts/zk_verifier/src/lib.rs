@@ -247,7 +247,9 @@ mod keys {
     pub struct VerificationRecord {
         pub timestamp: u64,
         pub verified: bool,
-        pub oracle: Address,
+        /// The attesting oracle, or `None` when the verification entrypoint
+        /// did not receive one. Never a placeholder address (#896).
+        pub oracle: Option<Address>,
     }
 
     /// Records which fields of a proof were redacted by
@@ -598,7 +600,7 @@ impl ZkVerifierContract {
             .publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
 
         if result {
-            Self::record_verification(&env, &proof_hash, true);
+            Self::record_verification(&env, &proof_hash, true, None);
         }
 
         result
@@ -661,7 +663,7 @@ impl ZkVerifierContract {
             .publish((VERIFY_LATTICE_TOPIC,), (result, proof_hash.clone()));
 
         if result {
-            Self::record_verification(&env, &proof_hash, true);
+            Self::record_verification(&env, &proof_hash, true, None);
         }
 
         result
@@ -972,7 +974,12 @@ impl ZkVerifierContract {
         digest.slice(0..CHECKSUM_LEN) == checksum
     }
 
-    fn record_verification(env: &Env, proof_hash: &BytesN<32>, verified: bool) {
+    fn record_verification(
+        env: &Env,
+        proof_hash: &BytesN<32>,
+        verified: bool,
+        oracle: Option<Address>,
+    ) {
         let mut history = env
             .storage()
             .instance()
@@ -986,10 +993,7 @@ impl ZkVerifierContract {
         history.push_back(VerificationRecord {
             timestamp: current_time,
             verified,
-            // `record_verification` isn't handed the attesting oracle (its
-            // callers only have a bool result), so this logs the contract's
-            // own address as a placeholder rather than a real oracle.
-            oracle: env.current_contract_address(),
+            oracle,
         });
 
         env.storage()

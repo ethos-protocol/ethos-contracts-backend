@@ -249,6 +249,17 @@ fn execute_step(step: DrStep, vault_id: Option<u64>) -> DrActionResult {
     let network = std::env::var("STELLAR_NETWORK").unwrap_or_default();
     let source = std::env::var("DEPLOYER_IDENTITY").unwrap_or_default();
 
+    // Never run the CLI with an empty contract, network or identity (#898).
+    if contract_id.trim().is_empty() || network.trim().is_empty() || source.trim().is_empty() {
+        return DrActionResult {
+            step,
+            success: false,
+            output: "CONTRACT_TTL_VAULT, STELLAR_NETWORK and DEPLOYER_IDENTITY must all be set"
+                .to_string(),
+            executed_at,
+        };
+    }
+
     let output = Command::new("stellar")
         .arg("contract")
         .arg("invoke")

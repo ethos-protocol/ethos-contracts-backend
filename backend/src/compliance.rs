@@ -288,7 +288,7 @@ fn soc2_checks() -> Vec<ComplianceCheck> {
                 ""
             } else {
                 "Set ALLOWED_ORIGINS to a comma-separated list of trusted frontend origins. \
-                 Leaving it empty permits all origins in the current CorsLayer configuration."
+                 Leaving it empty blocks all cross-origin requests, because build_cors_layer returns an empty CorsLayer."
             },
         ),
     ]
