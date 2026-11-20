@@ -12,15 +12,45 @@
 ///   cheaply `Clone` because both inner types are `Arc`-wrapped.
 /// * The in-memory cache uses a configurable TTL so stale entries are not
 ///   served indefinitely.
+/// * Loads never panic: database failures and corrupt rows are returned to
+///   the caller as a [`MetadataLoadError`].
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Why vault metadata could not be loaded.
+///
+/// A missing row is not an error (loads return `Ok(None)`); this type covers
+/// the cases where a row may exist but cannot be read.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataLoadError {
+    /// The SQLite query failed.
+    #[error("failed to load vault metadata: {0}")]
+    Db(#[from] rusqlite::Error),
+    /// The stored `fields` column is not valid JSON.
+    #[error("vault metadata for '{vault_id}' has invalid fields JSON: {source}")]
+    InvalidFields {
+        vault_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The stored `updated_at` column is not an RFC 3339 timestamp.
+    #[error("vault metadata for '{vault_id}' has invalid updated_at: {source}")]
+    InvalidTimestamp {
+        vault_id: String,
+        #[source]
+        source: chrono::ParseError,
+    },
+}
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -183,16 +213,20 @@ impl LazyMetadataLoader {
 
     /// Fetch metadata for `vault_id`, using the cache when possible.
     ///
-    /// Returns `None` when no metadata row exists for the vault.
-    pub fn get(&self, vault_id: &str) -> Option<VaultMetadata> {
+    /// Returns `Ok(None)` when no metadata row exists for the vault, and a
+    /// [`MetadataLoadError`] when the row cannot be read. Failed loads are
+    /// not cached.
+    pub fn get(&self, vault_id: &str) -> Result<Option<VaultMetadata>, MetadataLoadError> {
         if let Some(cached) = self.cache.get(vault_id) {
-            return Some(cached);
+            return Ok(Some(cached));
         }
 
         // Cache miss — load from SQLite.
-        let loaded = self.db.get_vault_metadata(vault_id)?;
+        let Some(loaded) = self.db.get_vault_metadata(vault_id)? else {
+            return Ok(None);
+        };
         self.cache.insert(loaded.clone());
-        Some(loaded)
+        Ok(Some(loaded))
     }
 
     /// Write (upsert) metadata for `vault_id` and invalidate the cache entry.
@@ -239,32 +273,52 @@ impl Db {
         Ok(())
     }
 
-    /// Retrieve a vault metadata row, or `None` if no row exists.
-    pub fn get_vault_metadata(&self, vault_id: &str) -> Option<VaultMetadata> {
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = binding
-            .prepare(
+    /// Retrieve a vault metadata row.
+    ///
+    /// Returns `Ok(None)` if no row exists. Query failures and rows whose
+    /// `fields` or `updated_at` columns cannot be parsed are returned as a
+    /// [`MetadataLoadError`] instead of being silently replaced with
+    /// placeholder values.
+    pub fn get_vault_metadata(
+        &self,
+        vault_id: &str,
+    ) -> Result<Option<VaultMetadata>, MetadataLoadError> {
+        let row = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
                 r"SELECT vault_id, fields, updated_at
                   FROM vault_metadata
                   WHERE vault_id = ?1",
+                rusqlite::params![vault_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
-            .ok()?;
+            .optional()?
+        };
 
-        stmt.query_row(rusqlite::params![vault_id], |row| {
-            let fields_str: String = row.get(1)?;
-            let updated_at_str: String = row.get(2)?;
-            let fields: serde_json::Value =
-                serde_json::from_str(&fields_str).unwrap_or(serde_json::Value::Null);
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-            Ok(VaultMetadata {
-                vault_id: row.get(0)?,
-                fields,
-                updated_at,
-            })
-        })
-        .ok()
+        let Some((vault_id, fields_str, updated_at_str)) = row else {
+            return Ok(None);
+        };
+
+        let fields = match serde_json::from_str(&fields_str) {
+            Ok(fields) => fields,
+            Err(source) => return Err(MetadataLoadError::InvalidFields { vault_id, source }),
+        };
+        let updated_at = match chrono::DateTime::parse_from_rfc3339(&updated_at_str) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(source) => return Err(MetadataLoadError::InvalidTimestamp { vault_id, source }),
+        };
+
+        Ok(Some(VaultMetadata {
+            vault_id,
+            fields,
+            updated_at,
+        }))
     }
 
     /// Delete the metadata row for `vault_id`.
@@ -282,6 +336,8 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn make_metadata(vault_id: &str) -> VaultMetadata {
         VaultMetadata {
@@ -303,14 +359,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_after_insert() {
+    fn cache_hit_after_insert() -> TestResult {
         let cache = MetadataCache::new(MetadataCacheConfig::default());
         let m = make_metadata("vault-1");
         cache.insert(m.clone());
-        let result = cache.get("vault-1").unwrap();
+        let result = cache.get("vault-1").ok_or("expected a cache hit")?;
         assert_eq!(result.vault_id, "vault-1");
         let (hits, _) = cache.stats();
         assert_eq!(hits, 1);
+        Ok(())
     }
 
     #[test]
@@ -363,65 +420,133 @@ mod tests {
 
     // ── LazyMetadataLoader integration tests ────────────────────────────────
 
-    fn make_db() -> Arc<Db> {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        db
+    fn make_db() -> Result<Arc<Db>, rusqlite::Error> {
+        let db = Arc::new(Db::open(":memory:")?);
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Write a raw row, bypassing `VaultMetadata` serialisation, so tests can
+    /// store values the loader must reject.
+    fn insert_raw_row(
+        db: &Db,
+        vault_id: &str,
+        fields: &str,
+        updated_at: &str,
+    ) -> Result<(), rusqlite::Error> {
+        db.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "INSERT INTO vault_metadata (vault_id, fields, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![vault_id, fields, updated_at],
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn loader_returns_none_for_missing_vault() {
-        let loader = LazyMetadataLoader::new(make_db());
-        assert!(loader.get("no-such-vault").is_none());
+    fn loader_returns_none_for_missing_vault() -> TestResult {
+        let loader = LazyMetadataLoader::new(make_db()?);
+        assert!(loader.get("no-such-vault")?.is_none());
+        Ok(())
     }
 
     #[test]
-    fn loader_set_then_get_roundtrip() {
-        let loader = LazyMetadataLoader::new(make_db());
+    fn loader_set_then_get_roundtrip() -> TestResult {
+        let loader = LazyMetadataLoader::new(make_db()?);
         let m = make_metadata("vault-rt");
-        loader.set(m.clone()).unwrap();
-        let loaded = loader.get("vault-rt").unwrap();
+        loader.set(m.clone())?;
+        let loaded = loader.get("vault-rt")?.ok_or("metadata should exist")?;
         assert_eq!(loaded.vault_id, "vault-rt");
         assert_eq!(loaded.fields["note"], "test");
+        Ok(())
     }
 
     #[test]
-    fn loader_caches_after_first_db_hit() {
-        let loader = LazyMetadataLoader::new(make_db());
-        loader.set(make_metadata("vault-c")).unwrap();
+    fn loader_caches_after_first_db_hit() -> TestResult {
+        let loader = LazyMetadataLoader::new(make_db()?);
+        loader.set(make_metadata("vault-c"))?;
 
         // First get populates the cache (cache was invalidated on set).
-        let _ = loader.get("vault-c");
+        loader.get("vault-c")?;
         // Second get should be served from cache.
-        let _ = loader.get("vault-c");
+        loader.get("vault-c")?;
 
         let (hits, _) = loader.cache().stats();
         assert!(hits >= 1, "at least one cache hit expected");
+        Ok(())
     }
 
     #[test]
-    fn loader_delete_removes_from_db_and_cache() {
-        let loader = LazyMetadataLoader::new(make_db());
-        loader.set(make_metadata("vault-del")).unwrap();
+    fn loader_delete_removes_from_db_and_cache() -> TestResult {
+        let loader = LazyMetadataLoader::new(make_db()?);
+        loader.set(make_metadata("vault-del"))?;
         // Populate the cache.
-        let _ = loader.get("vault-del");
-        loader.delete("vault-del").unwrap();
-        assert!(loader.get("vault-del").is_none());
+        loader.get("vault-del")?;
+        loader.delete("vault-del")?;
+        assert!(loader.get("vault-del")?.is_none());
+        Ok(())
     }
 
     #[test]
-    fn loader_set_overwrites_previous_metadata() {
-        let loader = LazyMetadataLoader::new(make_db());
-        loader.set(make_metadata("vault-ow")).unwrap();
+    fn loader_set_overwrites_previous_metadata() -> TestResult {
+        let loader = LazyMetadataLoader::new(make_db()?);
+        loader.set(make_metadata("vault-ow"))?;
 
         let updated = VaultMetadata {
             vault_id: "vault-ow".to_string(),
             fields: serde_json::json!({"note": "updated"}),
             updated_at: chrono::Utc::now(),
         };
-        loader.set(updated).unwrap();
+        loader.set(updated)?;
 
-        let loaded = loader.get("vault-ow").unwrap();
+        let loaded = loader.get("vault-ow")?.ok_or("metadata should exist")?;
         assert_eq!(loaded.fields["note"], "updated");
+        Ok(())
+    }
+
+    #[test]
+    fn loader_returns_error_for_corrupt_fields_json() -> TestResult {
+        let db = make_db()?;
+        insert_raw_row(&db, "vault-bad-json", "{not json", "2026-01-01T00:00:00Z")?;
+        let loader = LazyMetadataLoader::new(db);
+
+        match loader.get("vault-bad-json") {
+            Err(MetadataLoadError::InvalidFields { vault_id, .. }) => {
+                assert_eq!(vault_id, "vault-bad-json");
+            }
+            other => panic!("expected InvalidFields, got {other:?}"),
+        }
+        assert!(loader.cache().is_empty(), "failed loads must not be cached");
+        Ok(())
+    }
+
+    #[test]
+    fn loader_returns_error_for_corrupt_timestamp() -> TestResult {
+        let db = make_db()?;
+        insert_raw_row(&db, "vault-bad-ts", "{}", "yesterday-ish")?;
+        let loader = LazyMetadataLoader::new(db);
+
+        match loader.get("vault-bad-ts") {
+            Err(MetadataLoadError::InvalidTimestamp { vault_id, .. }) => {
+                assert_eq!(vault_id, "vault-bad-ts");
+            }
+            other => panic!("expected InvalidTimestamp, got {other:?}"),
+        }
+        assert!(loader.cache().is_empty(), "failed loads must not be cached");
+        Ok(())
+    }
+
+    #[test]
+    fn loader_returns_db_error_when_table_is_missing() -> TestResult {
+        let db = make_db()?;
+        db.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute("DROP TABLE vault_metadata", [])?;
+        let loader = LazyMetadataLoader::new(db);
+
+        assert!(matches!(
+            loader.get("vault-any"),
+            Err(MetadataLoadError::Db(_))
+        ));
+        Ok(())
     }
 }

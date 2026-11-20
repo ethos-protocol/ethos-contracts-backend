@@ -388,7 +388,10 @@ mod tests {
             };
 
             loader.set(m.clone()).unwrap();
-            let loaded = loader.get(&vault_id).unwrap();
+            let loaded = loader
+                .get(&vault_id)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+                .ok_or_else(|| TestCaseError::fail("metadata should exist after set"))?;
 
             prop_assert_eq!(
                 loaded.fields["note"].as_str().unwrap_or(""),
@@ -421,7 +424,10 @@ mod tests {
             loader.delete(&vault_id).unwrap();
 
             prop_assert!(
-                loader.get(&vault_id).is_none(),
+                loader
+                    .get(&vault_id)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?
+                    .is_none(),
                 "deleted metadata should not be retrievable"
             );
         }
@@ -550,7 +556,10 @@ mod tests {
     fn regression_lazy_loader_empty_vault_id() {
         let db = open_db();
         let loader = LazyMetadataLoader::new(db);
-        assert!(loader.get("").is_none(), "empty vault_id should return None");
+        assert!(
+            matches!(loader.get(""), Ok(None)),
+            "empty vault_id should return Ok(None)"
+        );
     }
 
     /// Edge case: materialized view with zero vaults should return all zeros.
