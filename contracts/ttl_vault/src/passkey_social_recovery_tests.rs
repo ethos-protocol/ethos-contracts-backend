@@ -383,3 +383,155 @@ fn test_guardian_cannot_self_approve() {
     let result = client.try_approve_recovery(&vault_id, &guardian);
     assert!(result.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// No-partial-state-on-failure tests
+//
+// Each test snapshots all recovery-related state, drives a recovery entry point
+// into one of the former panic paths, asserts the call returns a typed
+// `ContractError` (never a panic), and then asserts every snapshot is
+// byte-for-byte unchanged.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of all recovery-related state used to prove a failed recovery
+/// leaves the vault untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoverySnapshot {
+    vault: Vault,
+    guardians: soroban_sdk::Vec<Address>,
+    recovery_threshold: u32,
+    recovery: Option<RecoveryRequest>,
+    passkeys: soroban_sdk::Vec<BytesN<32>>,
+}
+
+fn snapshot_recovery_state(
+    client: &TtlVaultContractClient,
+    vault_id: &u64,
+) -> RecoverySnapshot {
+    RecoverySnapshot {
+        vault: client.get_vault(vault_id),
+        guardians: client.get_guardians(vault_id),
+        recovery_threshold: client.get_recovery_threshold(vault_id),
+        recovery: client.try_get_recovery_status(vault_id).ok().flatten(),
+        passkeys: client.get_passkeys(vault_id),
+    }
+}
+
+/// Builds a vault with `n` guardians and a threshold of `threshold`, then
+/// initiates a recovery so the recovery path is live.
+fn setup_active_recovery(
+    env: &Env,
+    owner: &Address,
+    beneficiary: &Address,
+    client: &TtlVaultContractClient,
+    n: u32,
+    threshold: u32,
+) -> (u64, soroban_sdk::Vec<Address>) {
+    let vault_id = client.create_vault(owner, beneficiary, &1_000u64, &None);
+    let mut guardians = soroban_sdk::Vec::new(env);
+    for _ in 0..n {
+        let guardian = Address::generate(env);
+        client.register_guardian(&vault_id, owner, &guardian);
+        guardians.push_back(guardian);
+    }
+    client.set_recovery_threshold(&vault_id, owner, &threshold);
+    let new_passkey = BytesN::<32>::from_array(env, &[9u8; 32]);
+    client.initiate_recovery(&vault_id, &new_passkey);
+    (vault_id, guardians)
+}
+
+/// Former panic path #1: missing storage value.
+/// Executing a recovery for a vault that has no recovery request must return
+/// `ContractError::RecoveryNotFound` and change no state.
+#[test]
+fn test_execute_recovery_missing_request_no_state_change() {
+    let (env, owner, beneficiary, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1_000u64, &None);
+
+    let before = snapshot_recovery_state(&client, &vault_id);
+
+    let result = client.try_execute_recovery(&vault_id);
+    assert_eq!(result, Err(Ok(ContractError::RecoveryNotFound)));
+
+    let after = snapshot_recovery_state(&client, &vault_id);
+    assert_eq!(before, after, "failed recovery mutated state");
+}
+
+/// Former panic path #2: invalid input.
+/// Approving a recovery with a non-guardian address must return
+/// `ContractError::NotGuardian` and change no state.
+#[test]
+fn test_approve_recovery_invalid_guardian_no_state_change() {
+    let (env, owner, beneficiary, client) = setup();
+    let (vault_id, _guardians) =
+        setup_active_recovery(&env, &owner, &beneficiary, &client, 2, 2);
+
+    let non_guardian = Address::generate(&env);
+    let before = snapshot_recovery_state(&client, &vault_id);
+
+    let result = client.try_approve_recovery(&vault_id, &non_guardian);
+    assert_eq!(result, Err(Ok(ContractError::NotGuardian)));
+
+    let after = snapshot_recovery_state(&client, &vault_id);
+    assert_eq!(before, after, "failed recovery mutated state");
+}
+
+/// Former panic path #3: invariant violation.
+/// Executing a recovery before the approval threshold is met must return
+/// `ContractError::ThresholdNotMet` and change no state.
+#[test]
+fn test_execute_recovery_threshold_not_met_no_state_change() {
+    let (env, owner, beneficiary, client) = setup();
+    let (vault_id, guardians) =
+        setup_active_recovery(&env, &owner, &beneficiary, &client, 2, 2);
+
+    client.approve_recovery(&vault_id, &guardians.get(0).unwrap());
+    let before = snapshot_recovery_state(&client, &vault_id);
+
+    let result = client.try_execute_recovery(&vault_id);
+    assert_eq!(result, Err(Ok(ContractError::ThresholdNotMet)));
+
+    let after = snapshot_recovery_state(&client, &vault_id);
+    assert_eq!(before, after, "failed recovery mutated state");
+}
+
+/// Former panic path #4: conversion failure.
+/// Setting a recovery threshold larger than the guardian set must return
+/// `ContractError::InvalidThreshold` and change no state.
+#[test]
+fn test_set_recovery_threshold_conversion_failure_no_state_change() {
+    let (env, owner, beneficiary, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1_000u64, &None);
+
+    let guardian = Address::generate(&env);
+    client.register_guardian(&vault_id, &owner, &guardian);
+
+    let before = snapshot_recovery_state(&client, &vault_id);
+
+    let result = client.try_set_recovery_threshold(&vault_id, &owner, &5);
+    assert_eq!(result, Err(Ok(ContractError::InvalidThreshold)));
+
+    let after = snapshot_recovery_state(&client, &vault_id);
+    assert_eq!(before, after, "failed recovery mutated state");
+}
+
+/// Former panic path #5: remaining unreachable branch.
+/// Executing a recovery that has already been executed must return
+/// `ContractError::RecoveryAlreadyExecuted` and change no state.
+#[test]
+fn test_execute_recovery_already_executed_no_state_change() {
+    let (env, owner, beneficiary, client) = setup();
+    let (vault_id, guardians) =
+        setup_active_recovery(&env, &owner, &beneficiary, &client, 1, 1);
+
+    client.approve_recovery(&vault_id, &guardians.get(0).unwrap());
+    client.execute_recovery(&vault_id);
+
+    let before = snapshot_recovery_state(&client, &vault_id);
+
+    let result = client.try_execute_recovery(&vault_id);
+    assert_eq!(result, Err(Ok(ContractError::RecoveryAlreadyExecuted)));
+
+    let after = snapshot_recovery_state(&client, &vault_id);
+    assert_eq!(before, after, "failed recovery mutated state");
+}

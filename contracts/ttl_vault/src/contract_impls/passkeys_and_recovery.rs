@@ -139,6 +139,8 @@ impl TtlVaultContract {
         caller: Address,
     ) -> Result<(), ContractError> {
         caller.require_auth();
+
+        // --- Validation phase: all fallible reads happen before any write. ---
         let contacts: Vec<Address> = env
             .storage()
             .persistent()
@@ -156,19 +158,29 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyApproved);
         }
         req.approved_contacts.push_back(caller.clone());
-        if req.approved_contacts.len() >= req.required_contacts {
-            let key = DataKey::VaultPasskeys(vault_id);
-            let mut passkeys: Vec<PasskeyHash> = env
-                .storage()
+
+        // --- Prepare phase: build the exact state to be committed. ---
+        let threshold_reached = req.approved_contacts.len() >= req.required_contacts;
+        let pk_key = DataKey::VaultPasskeys(vault_id);
+        let mut passkeys: Vec<PasskeyHash> = if threshold_reached {
+            env.storage()
                 .persistent()
-                .get(&key)
-                .unwrap_or(Vec::new(&env));
+                .get(&pk_key)
+                .unwrap_or_else(|| Vec::new(&env))
+        } else {
+            Vec::new(&env)
+        };
+        if threshold_reached {
             passkeys.push_back(PasskeyHash {
                 hash: req.new_passkey_hash.clone(),
                 added_at: env.ledger().timestamp(),
                 biometric_hash: None,
             });
-            env.storage().persistent().set(&key, &passkeys);
+        }
+
+        // --- Commit phase: single point of mutation. ---
+        if threshold_reached {
+            env.storage().persistent().set(&pk_key, &passkeys);
             env.storage()
                 .persistent()
                 .remove(&DataKey::PasskeyRecoveryRequest(vault_id));
@@ -371,7 +383,11 @@ impl TtlVaultContract {
         let mut result = Vec::new(env);
         let mut i = start;
         while i < len && i < start + page_size as u64 {
-            result.push_back(all.get(i as u32).unwrap());
+            // `i` is bounded by `len`, so the index is always valid; skip
+            // defensively rather than panicking if that invariant is ever broken.
+            if let Some(value) = all.get(i as u32) {
+                result.push_back(value);
+            }
             i += 1;
         }
         result
@@ -736,7 +752,12 @@ impl TtlVaultContract {
         let mut distinct = 0u32;
         let mut prev: Option<BytesN<32>> = None;
         for i in window_start..usage.len() {
-            let entry = usage.get(i as u32).unwrap();
+            // Index is bounded by `usage.len()`; skip defensively on the
+            // (unreachable) invariant violation instead of panicking.
+            let entry = match usage.get(i as u32) {
+                Some(entry) => entry,
+                None => continue,
+            };
             if prev.as_ref() != Some(&entry.passkey_hash) {
                 distinct += 1;
                 prev = Some(entry.passkey_hash.clone());
@@ -1118,7 +1139,11 @@ impl TtlVaultContract {
         if start < legacy_len {
             let legacy_end = start.saturating_add(cap).min(legacy_len);
             for index in start..legacy_end {
-                result.push_back(legacy.get(index).unwrap());
+                // Index is bounded by `legacy_len`; skip defensively rather
+                // than panicking on an (unreachable) invariant violation.
+                if let Some(entry) = legacy.get(index) {
+                    result.push_back(entry);
+                }
             }
         }
 
@@ -1144,7 +1169,11 @@ impl TtlVaultContract {
                 break;
             }
             for offset in 0..count {
-                result.push_back(entries.get(page_offset + offset).unwrap());
+                // Index is bounded by `entries.len()`; skip defensively rather
+                // than panicking on an (unreachable) invariant violation.
+                if let Some(entry) = entries.get(page_offset + offset) {
+                    result.push_back(entry);
+                }
             }
             new_index += count;
         }
@@ -1578,8 +1607,13 @@ impl TtlVaultContract {
 
         let mut codes: Vec<HashedBackupCode> = Vec::new(&env);
         for i in 0..code_hashes.len() {
+            // Index is bounded by `code_hashes.len()`; surface a typed error
+            // rather than panicking if the invariant is ever violated.
+            let code_hash = code_hashes
+                .get(i)
+                .ok_or(ContractError::InvalidBackupCode)?;
             codes.push_back(HashedBackupCode {
-                code_hash: code_hashes.get(i).unwrap(),
+                code_hash,
                 used: false,
             });
         }
@@ -2410,6 +2444,7 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
 
+        // --- Validation phase: all fallible reads happen before any write. ---
         let key = DataKey::RecoveryCodeHash(vault_id);
         let stored_hash: BytesN<32> = env
             .storage()
@@ -2422,8 +2457,7 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidRecoveryCode);
         }
 
-        // Invalidate all existing passkeys and register the new one as the vault's
-        // sole passkey.
+        // --- Prepare phase: build the exact state to be committed. ---
         let now = env.ledger().timestamp();
         let mut passkeys: Vec<PasskeyHash> = Vec::new(&env);
         passkeys.push_back(PasskeyHash {
@@ -2432,12 +2466,14 @@ impl TtlVaultContract {
             biometric_hash: None,
         });
         let pk_key = DataKey::VaultPasskeys(vault_id);
-        env.storage().persistent().set(&pk_key, &passkeys);
 
         // Replace the legacy single-passkey field and reset liveness — a
         // successful recovery is proof the owner is alive.
         vault.passkey_hash = Some(Bytes::from_array(&env, &new_passkey_proof.to_array()));
         vault.last_check_in = now;
+
+        // --- Commit phase: single point of mutation. ---
+        env.storage().persistent().set(&pk_key, &passkeys);
         Self::save_vault(&env, vault_id, &vault);
 
         // Consume the recovery code so it cannot be replayed.

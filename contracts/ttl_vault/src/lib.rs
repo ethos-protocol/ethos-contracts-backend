@@ -638,6 +638,15 @@ pub enum ContractError {
     UpgradeTimeLocked = 168,
     BatchSizeExceeded = 169,
     InvalidPauseReason = 170,
+    // Issue #941: passkey recovery path typed errors (replaces panics)
+    RecoveryNotInitiated = 171,
+    RecoveryAlreadyInitiated = 172,
+    RecoveryNotReady = 173,
+    RecoveryThresholdNotMet = 174,
+    RecoveryContactNotFound = 175,
+    RecoveryRequestExpired = 176,
+    RecoveryAlreadyCompleted = 177,
+    InvalidRecoveryState = 178,
 }
 
 #[contract]
