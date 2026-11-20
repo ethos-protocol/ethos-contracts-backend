@@ -691,7 +691,10 @@ pub fn bootstrap_replica(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS replication_lag_ms (
             lag_ms INTEGER NOT NULL
         );
-        INSERT OR REPLACE INTO replication_lag_ms (lag_ms) VALUES (0);
+        -- The table has no primary key, so INSERT OR REPLACE never replaced and
+        -- every startup added a row (#878). Keep one row, and seed it only if empty.
+        DELETE FROM replication_lag_ms WHERE rowid NOT IN (SELECT MIN(rowid) FROM replication_lag_ms);
+        INSERT INTO replication_lag_ms (lag_ms) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM replication_lag_ms);
         ",
     )
 }

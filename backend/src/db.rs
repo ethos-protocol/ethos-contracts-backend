@@ -2195,6 +2195,32 @@ impl Db {
         )?;
         Ok(count as u64)
     }
+
+    /// Delete feature flag history older than `retention_days` (#879).
+    pub fn purge_feature_flag_history(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM feature_flag_history WHERE updated_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Erase a user's personal activity rows in one transaction (#876).
+    ///
+    /// Removes credential updates, collaboration transforms and presence. Audit
+    /// logs are kept on purpose: they are the record compliance requires. Vault
+    /// and user identity rows are not covered here.
+    pub fn erase_user_activity(&self, user_id: &str) -> Result<u64, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        count += tx.execute("DELETE FROM credential_updates WHERE user_id = ?1", params![user_id])?;
+        count += tx.execute("DELETE FROM operational_transforms WHERE user_id = ?1", params![user_id])?;
+        count += tx.execute("DELETE FROM user_presence WHERE user_id = ?1", params![user_id])?;
+        tx.commit()?;
+        Ok(count as u64)
+    }
 }
 
 // ── Cache-aware vault accessors ───────────────────────────────────────────────
