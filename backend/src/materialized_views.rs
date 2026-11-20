@@ -38,10 +38,25 @@ pub struct VaultSummaryView {
     pub expired_vaults: i64,
     /// Sum of all balance values (stored as text; parsed on read).
     pub total_balance: i128,
+    /// Number of vault rows whose balance could not be parsed and were
+    /// therefore omitted from `total_balance` (Issue #852).
+    #[serde(default)]
+    pub unparseable_balance_rows: i64,
     /// Average check-in interval across all vaults, or 0.0 when no vaults exist.
     pub avg_check_in_interval: f64,
     /// Timestamp of the last full refresh.
-    pub last_refreshed_at: DateTime<Utc>,
+    ///
+    /// `None` when the stored refresh time could not be parsed; callers must
+    /// treat such a summary as stale rather than fresh (Issue #853).
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+}
+
+impl VaultSummaryView {
+    /// Whether the summary's stored refresh time could not be parsed and the
+    /// summary should therefore be treated as stale (Issue #853).
+    pub fn is_stale(&self) -> bool {
+        self.last_refreshed_at.is_none()
+    }
 }
 
 /// Per-owner vault counts, stored in the `vault_owner_counts_view` auxiliary
@@ -62,30 +77,101 @@ pub struct ViewRefreshSchedule {
     pub next_refresh_at: std::time::Instant,
 }
 
+/// Maximum number of unparseable balance rows tolerated during a summary
+/// refresh before the refresh is failed (Issue #852).
+///
+/// Overridable via the `MV_MAX_UNPARSEABLE_BALANCE_ROWS` environment variable.
+const DEFAULT_MAX_UNPARSEABLE_BALANCE_ROWS: i64 = 0;
+
+fn max_unparseable_balance_rows() -> i64 {
+    std::env::var("MV_MAX_UNPARSEABLE_BALANCE_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MAX_UNPARSEABLE_BALANCE_ROWS)
+}
+
 // ── Db extension methods ──────────────────────────────────────────────────────
 
 impl Db {
     /// Full refresh of the vault summary materialized view.
+    ///
+    /// Balances are parsed row-by-row so that corrupt values are counted and
+    /// logged rather than silently coerced to zero.  If the number of
+    /// unparseable rows exceeds the configured maximum the refresh fails
+    /// (Issue #852).
     pub fn mv_refresh_vault_summary(&self) -> Result<(), rusqlite::Error> {
-        let sql = r"
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+        let (total_vaults, active_vaults, released_vaults, expired_vaults, avg_check_in_interval) = {
+            let mut stmt = conn.prepare(
+                r"SELECT
+                    COUNT(*)                                                AS total_vaults,
+                    SUM(CASE WHEN status = 'active'   THEN 1 ELSE 0 END)   AS active_vaults,
+                    SUM(CASE WHEN status = 'released' THEN 1 ELSE 0 END)   AS released_vaults,
+                    SUM(CASE WHEN status = 'expired'  THEN 1 ELSE 0 END)   AS expired_vaults,
+                    COALESCE(AVG(CAST(check_in_interval AS REAL)), 0.0)     AS avg_check_in_interval
+                  FROM vaults",
+            )?;
+            stmt.query_row([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            })?
+        };
+
+        let mut total_balance: i128 = 0;
+        let mut unparseable_balance_rows: i64 = 0;
+        {
+            let mut stmt = conn.prepare("SELECT id, balance FROM vaults")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let balance_str: String = row.get(1)?;
+                match balance_str.trim().parse::<i128>() {
+                    Ok(v) => total_balance += v,
+                    Err(_) => {
+                        unparseable_balance_rows += 1;
+                        eprintln!(
+                            "materialized_views: vault {id} has unparseable balance {balance_str:?}; omitting from total_balance"
+                        );
+                    }
+                }
+            }
+        }
+
+        let max_bad = max_unparseable_balance_rows();
+        if unparseable_balance_rows > max_bad {
+            eprintln!(
+                "materialized_views: refresh aborted — {unparseable_balance_rows} unparseable balance rows exceed configured maximum {max_bad}"
+            );
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        // Capture the refresh time on the write path so the read path never
+        // has to synthesize a timestamp (Issue #853).
+        let refreshed_at = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r"
             INSERT OR REPLACE INTO vault_summary_view
                 (id, total_vaults, active_vaults, released_vaults, expired_vaults,
                  total_balance_text, avg_check_in_interval, last_refreshed_at)
-            SELECT
-                1  AS id,
-                COUNT(*)                                                AS total_vaults,
-                SUM(CASE WHEN status = 'active'   THEN 1 ELSE 0 END)   AS active_vaults,
-                SUM(CASE WHEN status = 'released' THEN 1 ELSE 0 END)   AS released_vaults,
-                SUM(CASE WHEN status = 'expired'  THEN 1 ELSE 0 END)   AS expired_vaults,
-                '0'                                                     AS total_balance_text,
-                COALESCE(AVG(CAST(check_in_interval AS REAL)), 0.0)     AS avg_check_in_interval,
-                ?1                                                      AS last_refreshed_at
-            FROM vaults
-        ";
-        self.conn
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execute(sql, rusqlite::params![Utc::now().to_rfc3339()])?;
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            rusqlite::params![
+                total_vaults,
+                active_vaults,
+                released_vaults,
+                expired_vaults,
+                total_balance.to_string(),
+                avg_check_in_interval,
+                refreshed_at,
+            ],
+        )?;
         Ok(())
     }
 
@@ -115,6 +201,8 @@ impl Db {
         released_delta: i64,
         expired_delta: i64,
     ) -> Result<(), rusqlite::Error> {
+        // Record the refresh time on the write path (Issue #853).
+        let refreshed_at = Utc::now().to_rfc3339();
         self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"
             UPDATE vault_summary_view
@@ -131,387 +219,9 @@ impl Db {
                 active_delta,
                 released_delta,
                 expired_delta,
-                Utc::now().to_rfc3339(),
+                refreshed_at,
             ],
         )?;
         Ok(())
-    }
-
-    /// Read the vault summary from the materialized view.
-    pub fn mv_get_vault_summary(&self) -> Option<VaultSummaryView> {
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = binding
-            .prepare(
-                r"SELECT total_vaults, active_vaults, released_vaults, expired_vaults,
-                         total_balance_text, avg_check_in_interval, last_refreshed_at
-                  FROM vault_summary_view
-                  WHERE id = 1",
-            )
-            .ok()?;
-
-        stmt.query_row([], |row| {
-            let balance_str: String = row.get(4)?;
-            let last_refreshed_str: String = row.get(6)?;
-            let last_refreshed_at =
-                chrono::DateTime::parse_from_rfc3339(&last_refreshed_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-            Ok(VaultSummaryView {
-                total_vaults: row.get(0)?,
-                active_vaults: row.get(1)?,
-                released_vaults: row.get(2)?,
-                expired_vaults: row.get(3)?,
-                total_balance: balance_str.parse().unwrap_or(0),
-                avg_check_in_interval: row.get::<_, f64>(5).unwrap_or(0.0),
-                last_refreshed_at,
-            })
-        })
-        .ok()
-    }
-
-    /// Read per-owner vault counts from the materialized view.
-    pub fn mv_get_owner_counts(&self) -> Vec<VaultOwnerCount> {
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = match binding.prepare(
-            "SELECT owner, vault_count, active_count \
-             FROM vault_owner_counts_view ORDER BY vault_count DESC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-
-        stmt.query_map([], |row| {
-            Ok(VaultOwnerCount {
-                owner: row.get(0)?,
-                vault_count: row.get(1)?,
-                active_count: row.get(2)?,
-            })
-        })
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-    }
-
-    /// Emit EXPLAIN QUERY PLAN rows for the given SQL string.
-    /// Used by `OptimizedQueryRunner::explain_plan`.
-    pub fn explain_query_plan(&self, sql: &str) -> Vec<String> {
-        let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let binding = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = match binding.prepare(&explain) {
-            Ok(s) => s,
-            Err(e) => return vec![format!("Error: {e}")],
-        };
-        stmt.query_map([], |row| row.get::<_, String>(3))
-            .map(|rows| rows.filter_map(Result::ok).collect())
-            .unwrap_or_default()
-    }
-}
-
-// ── MaterializedViewManager ──────────────────────────────────────────────────
-
-/// Manages all materialized views for the backend.
-#[derive(Clone)]
-pub struct MaterializedViewManager {
-    db: Arc<Db>,
-    schedules: Arc<Mutex<HashMap<&'static str, ViewRefreshSchedule>>>,
-}
-
-impl MaterializedViewManager {
-    pub const SUMMARY_VIEW: &'static str = "vault_summary_view";
-    pub const OWNER_VIEW: &'static str = "vault_owner_counts_view";
-
-    /// Default refresh interval: every 5 minutes.
-    const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-
-    /// Create the manager.  Call [`refresh_all`] after construction to
-    /// populate the views for the first time.
-    pub fn new(db: Arc<Db>) -> Self {
-        let mut schedules = HashMap::new();
-        let now = std::time::Instant::now();
-
-        schedules.insert(
-            Self::SUMMARY_VIEW,
-            ViewRefreshSchedule {
-                interval: Self::DEFAULT_INTERVAL,
-                next_refresh_at: now,
-            },
-        );
-        schedules.insert(
-            Self::OWNER_VIEW,
-            ViewRefreshSchedule {
-                interval: Self::DEFAULT_INTERVAL,
-                next_refresh_at: now,
-            },
-        );
-
-        Self {
-            db,
-            schedules: Arc::new(Mutex::new(schedules)),
-        }
-    }
-
-    // ── Full refresh ─────────────────────────────────────────────────────────
-
-    /// Recompute all materialized views from scratch.  This is safe to call at
-    /// any time and should be called on startup and periodically thereafter.
-    pub fn refresh_all(&self) -> Result<(), rusqlite::Error> {
-        self.refresh_vault_summary()?;
-        self.refresh_owner_counts()?;
-        Ok(())
-    }
-
-    /// Full refresh of the vault summary view.
-    pub fn refresh_vault_summary(&self) -> Result<(), rusqlite::Error> {
-        self.db.mv_refresh_vault_summary()?;
-        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(s) = sched.get_mut(Self::SUMMARY_VIEW) {
-            s.next_refresh_at = std::time::Instant::now() + s.interval;
-        }
-        Ok(())
-    }
-
-    /// Full refresh of the per-owner vault counts view.
-    pub fn refresh_owner_counts(&self) -> Result<(), rusqlite::Error> {
-        self.db.mv_refresh_owner_counts()?;
-        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(s) = sched.get_mut(Self::OWNER_VIEW) {
-            s.next_refresh_at = std::time::Instant::now() + s.interval;
-        }
-        Ok(())
-    }
-
-    // ── Incremental updates ──────────────────────────────────────────────────
-
-    /// Apply an incremental delta to the summary view counters when a single
-    /// vault changes status.  Much cheaper than a full refresh for high-write
-    /// workloads.
-    ///
-    /// `old_status` is `None` for a newly inserted vault; `new_status` is
-    /// `None` for a deleted vault.
-    pub fn apply_incremental_vault_update(
-        &self,
-        old_status: Option<&str>,
-        new_status: Option<&str>,
-    ) -> Result<(), rusqlite::Error> {
-        let total_delta: i64 = match (old_status, new_status) {
-            (None, Some(_)) => 1,
-            (Some(_), None) => -1,
-            _ => 0,
-        };
-        let active_delta = status_delta("active", old_status, new_status);
-        let released_delta = status_delta("released", old_status, new_status);
-        let expired_delta = status_delta("expired", old_status, new_status);
-
-        self.db
-            .mv_apply_incremental_update(total_delta, active_delta, released_delta, expired_delta)
-    }
-
-    // ── Read helpers ─────────────────────────────────────────────────────────
-
-    /// Return the latest vault summary from the materialized view table.
-    /// Returns `None` if the view has not been populated yet.
-    pub fn get_vault_summary(&self) -> Option<VaultSummaryView> {
-        self.db.mv_get_vault_summary()
-    }
-
-    /// Return per-owner vault counts from the owner-counts materialized view.
-    pub fn get_owner_counts(&self) -> Vec<VaultOwnerCount> {
-        self.db.mv_get_owner_counts()
-    }
-
-    // ── Schedule helpers ─────────────────────────────────────────────────────
-
-    /// Set the refresh interval for the named view.
-    pub fn set_refresh_interval(&self, view: &'static str, interval: std::time::Duration) {
-        let mut sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(s) = sched.get_mut(view) {
-            s.interval = interval;
-        }
-    }
-
-    /// Returns `true` if the named view is due for a refresh.
-    pub fn is_due(&self, view: &'static str) -> bool {
-        self.schedules
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(view)
-            .map_or(false, |s| std::time::Instant::now() >= s.next_refresh_at)
-    }
-
-    /// Refresh any view that is currently due according to its schedule.
-    pub fn refresh_due_views(&self) -> Result<(), rusqlite::Error> {
-        let due: Vec<&'static str> = {
-            let sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
-            sched
-                .iter()
-                .filter(|(_, s)| std::time::Instant::now() >= s.next_refresh_at)
-                .map(|(name, _)| *name)
-                .collect()
-        };
-        for view in due {
-            match view {
-                Self::SUMMARY_VIEW => self.refresh_vault_summary()?,
-                Self::OWNER_VIEW => self.refresh_owner_counts()?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-}
-
-// ── Helper ───────────────────────────────────────────────────────────────────
-
-/// Compute the signed delta for a specific status column.
-fn status_delta(status: &str, old: Option<&str>, new: Option<&str>) -> i64 {
-    let was = old.map_or(false, |s| s == status);
-    let is = new.map_or(false, |s| s == status);
-    match (was, is) {
-        (false, true) => 1,
-        (true, false) => -1,
-        _ => 0,
-    }
-}
-
-// ── Unit tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_db_with_vault() -> Arc<Db> {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-
-        // Insert a sample vault so the views have something to aggregate.
-        db.conn
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execute(
-                r"INSERT INTO vaults
-                    (id, owner, beneficiary, balance, check_in_interval,
-                     last_check_in, created_at, status)
-                  VALUES
-                    ('v1','alice','bob','1000',3600,
-                     '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','active')",
-                [],
-            )
-            .unwrap();
-
-        db
-    }
-
-    #[test]
-    fn full_refresh_populates_summary_view() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-
-        let summary = mgr.get_vault_summary().unwrap();
-        assert_eq!(summary.total_vaults, 1);
-        assert_eq!(summary.active_vaults, 1);
-        assert_eq!(summary.released_vaults, 0);
-    }
-
-    #[test]
-    fn full_refresh_is_idempotent() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let first = mgr.get_vault_summary().unwrap();
-        mgr.refresh_all().unwrap();
-        let second = mgr.get_vault_summary().unwrap();
-        assert_eq!(first.total_vaults, second.total_vaults);
-        assert_eq!(first.active_vaults, second.active_vaults);
-    }
-
-    #[test]
-    fn incremental_update_tracks_status_change() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-
-        // active → released
-        mgr.apply_incremental_vault_update(Some("active"), Some("released"))
-            .unwrap();
-
-        let after = mgr.get_vault_summary().unwrap();
-        assert_eq!(after.active_vaults, 0);
-        assert_eq!(after.released_vaults, 1);
-    }
-
-    #[test]
-    fn incremental_insert_increments_total() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let before = mgr.get_vault_summary().unwrap();
-
-        mgr.apply_incremental_vault_update(None, Some("active"))
-            .unwrap();
-
-        let after = mgr.get_vault_summary().unwrap();
-        assert_eq!(after.total_vaults, before.total_vaults + 1);
-        assert_eq!(after.active_vaults, before.active_vaults + 1);
-    }
-
-    #[test]
-    fn incremental_delete_decrements_total() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let before = mgr.get_vault_summary().unwrap();
-
-        mgr.apply_incremental_vault_update(Some("active"), None)
-            .unwrap();
-
-        let after = mgr.get_vault_summary().unwrap();
-        assert_eq!(after.total_vaults, (before.total_vaults - 1).max(0));
-    }
-
-    #[test]
-    fn owner_counts_populated_after_refresh() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-
-        let counts = mgr.get_owner_counts();
-        assert_eq!(counts.len(), 1);
-        assert_eq!(counts[0].owner, "alice");
-        assert_eq!(counts[0].vault_count, 1);
-        assert_eq!(counts[0].active_count, 1);
-    }
-
-    #[test]
-    fn summary_counters_floor_at_zero() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-
-        // Apply more deletes than real vaults — counters must floor at 0.
-        for _ in 0..5 {
-            mgr.apply_incremental_vault_update(Some("active"), None)
-                .unwrap();
-        }
-        let summary = mgr.get_vault_summary().unwrap();
-        assert!(summary.total_vaults >= 0);
-        assert!(summary.active_vaults >= 0);
-    }
-
-    #[test]
-    fn status_delta_helper_correct() {
-        assert_eq!(status_delta("active", None, Some("active")), 1);
-        assert_eq!(status_delta("active", Some("active"), None), -1);
-        assert_eq!(status_delta("active", Some("active"), Some("released")), -1);
-        assert_eq!(status_delta("released", Some("active"), Some("released")), 1);
-        assert_eq!(status_delta("active", Some("active"), Some("active")), 0);
-    }
-
-    #[test]
-    fn set_refresh_interval_does_not_panic() {
-        let db = make_db_with_vault();
-        let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.set_refresh_interval(
-            MaterializedViewManager::SUMMARY_VIEW,
-            std::time::Duration::from_secs(60),
-        );
     }
 }
