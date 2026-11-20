@@ -1273,7 +1273,7 @@ mod simulator_tests {
         db.migrate().unwrap();
 
         // Pre-populate the in-memory vault store
-        db.insert_vault(make_vault("vault-http-1", 86_400, Some(3600)));
+        db.insert_vault(make_vault("vault-http-1", 86_400, Some(3600))).unwrap();
 
         Router::new()
             .route(

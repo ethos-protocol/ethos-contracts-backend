@@ -332,11 +332,11 @@ mod tests {
             // Insert some vaults directly.
             for i in 0..n_active {
                 let v = make_vault(&format!("va{i}"), "owner", 100, VaultStatus::Active);
-                db.insert_vault(v);
+                db.insert_vault(v).unwrap();
             }
             for i in 0..n_released {
                 let v = make_vault(&format!("vr{i}"), "owner", 100, VaultStatus::Released);
-                db.insert_vault(v);
+                db.insert_vault(v).unwrap();
             }
 
             // Full refresh.

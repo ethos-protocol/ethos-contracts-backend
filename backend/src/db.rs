@@ -994,8 +994,8 @@ impl Db {
     /// survives process restarts and is visible to every instance sharing the
     /// same SQLite file, then mirrors the write into the in-memory
     /// `vault_store` cache.
-    pub fn insert_vault(&self, vault: crate::models::Vault) {
-        let _ = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+    pub fn insert_vault(&self, vault: crate::models::Vault) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
             r"INSERT OR REPLACE INTO vaults
                 (id, owner, beneficiary, balance, check_in_interval, last_check_in, created_at, status, ttl_remaining)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1010,11 +1010,12 @@ impl Db {
                 vault_status_to_str(&vault.status),
                 vault.ttl_remaining.map(u64::cast_signed),
             ],
-        );
+        )?;
         self.vault_store
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(vault.id.clone(), vault);
+        Ok(())
     }
 
     /// Retrieve a vault by string ID from the `vaults` table.
@@ -3828,7 +3829,7 @@ mod tests {
         {
             let db = Db::open(path_str).unwrap();
             db.migrate().unwrap();
-            db.insert_vault(vault.clone());
+            db.insert_vault(vault.clone()).unwrap();
         }
 
         // Re-open against the same file, simulating a process restart.
@@ -3862,7 +3863,7 @@ mod tests {
         db_b.migrate().unwrap();
 
         let vault = make_test_vault("shared-vault");
-        db_a.insert_vault(vault.clone());
+        db_a.insert_vault(vault.clone()).unwrap();
         let seen_by_b = db_b
             .get_vault(&vault.id)
             .expect("handle B should see a vault inserted through handle A");
@@ -3870,13 +3871,57 @@ mod tests {
 
         let mut vault2 = vault.clone();
         vault2.id = "shared-vault-2".to_string();
-        db_b.insert_vault(vault2.clone());
+        db_b.insert_vault(vault2.clone()).unwrap();
         let seen_by_a = db_a
             .get_vault(&vault2.id)
             .expect("handle A should see a vault inserted through handle B");
         assert_eq!(seen_by_a.id, vault2.id);
 
         let _ = std::fs::remove_file(path_str);
+    }
+
+    /// insert_vault must return an error when the SQLite write fails (e.g.
+    /// the database file is read-only) and must NOT update the in-memory
+    /// store in that case.
+    #[test]
+    fn test_insert_vault_returns_error_on_write_failure() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_readonly_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        // Create the database and schema while we still have write access.
+        {
+            let db = Db::open(path_str).unwrap();
+            db.migrate().unwrap();
+        }
+
+        // Remove write permission so the next execute() fails at the OS level.
+        std::fs::set_permissions(path_str, Permissions::from_mode(0o444)).unwrap();
+
+        let db = Db::open(path_str).unwrap();
+        let vault = make_test_vault("readonly-vault");
+
+        let result = db.insert_vault(vault.clone());
+
+        // Restore permissions before asserting so cleanup always runs.
+        let _ = std::fs::set_permissions(path_str, Permissions::from_mode(0o644));
+        let _ = std::fs::remove_file(path_str);
+
+        assert!(
+            result.is_err(),
+            "insert_vault should propagate the SQLite write error"
+        );
+
+        // The in-memory store must not have been updated.
+        assert!(
+            db.get_vault(&vault.id).is_none(),
+            "vault must not appear in memory when the DB write failed"
+        );
     }
 
     #[test]
@@ -3926,7 +3971,7 @@ mod tests {
         {
             let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
             db.migrate().unwrap();
-            db.insert_vault(vault.clone());
+            db.insert_vault(vault.clone()).unwrap();
         }
 
         let db = Db::open_with_pool_config(&path, &PoolConfig::default()).unwrap();
