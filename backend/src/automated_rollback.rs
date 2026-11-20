@@ -37,8 +37,23 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use prometheus::{register_int_counter, IntCounter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+/// Total number of deployment rollbacks (automated and manual).
+///
+/// Backs the `EthosDeploymentAutoRolledBack` alert rule in `alert_rules.yml`.
+pub static DEPLOYMENT_ROLLBACKS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "ethos_protocol_deployment_rollbacks_total",
+        "Total number of deployment rollbacks (automated or manual)"
+    )
+    .expect("failed to register ethos_protocol_deployment_rollbacks_total")
+});
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
@@ -461,6 +476,8 @@ pub async fn run_post_deployment_tests(
             alert_sent: true,
         };
 
+        DEPLOYMENT_ROLLBACKS_TOTAL.inc();
+
         tracing::error!(
             plan_id = %plan.id,
             deployment_id = %plan.deployment_id,
@@ -544,6 +561,8 @@ pub async fn trigger_rollback(
         rolled_back_at: Utc::now(),
         alert_sent: true,
     };
+
+    DEPLOYMENT_ROLLBACKS_TOTAL.inc();
 
     tracing::warn!(
         plan_id = %plan.id,
@@ -715,8 +734,8 @@ mod tests {
 
         // Verify history record was stored.
         let Json(history) = list_rollback_history(State(Arc::clone(&state))).await;
-        assert!(!history.is_empty());
-        assert_eq!(history[0].reason, RollbackReason::PostDeploymentTestFailure);
+        let first = history.first().expect("expected a rollback history record");
+        assert_eq!(first.reason, RollbackReason::PostDeploymentTestFailure);
     }
 
     #[tokio::test]
@@ -763,8 +782,9 @@ mod tests {
         assert_eq!(updated.status, RollbackPlanStatus::ManualRollback);
 
         let Json(history) = list_rollback_history(State(Arc::clone(&state))).await;
-        assert_eq!(history[0].reason, RollbackReason::OperatorRequest);
-        assert!(history[0].reason_detail.contains("memory leak"));
+        let first = history.first().expect("expected a rollback history record");
+        assert_eq!(first.reason, RollbackReason::OperatorRequest);
+        assert!(first.reason_detail.contains("memory leak"));
     }
 
     #[tokio::test]
