@@ -111,13 +111,15 @@ export class EthosApiClient {
   }
 
   private request(url: string, method: string, body: unknown, init?: RequestInit): Promise<Response> {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (this.token) headers["authorization"] = \`Bearer \${this.token}\`;
+    const { headers: callerHeaders, ...rest } = init ?? {};
+    const headers = new Headers({ "content-type": "application/json" });
+    if (this.token) headers.set("authorization", \`Bearer \${this.token}\`);
+    new Headers(callerHeaders).forEach((value, key) => headers.set(key, value));
     return fetch(url, {
+      ...rest,
       method,
-      headers: { ...headers, ...(init?.headers as Record<string, string>) },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      ...init,
     });
   }
 

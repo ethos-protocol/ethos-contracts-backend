@@ -514,6 +514,9 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // #905: never start with admin auth disabled outside a development machine.
+    backend::audit::refuse_insecure_admin_outside_development();
+
     // Check contract version before proceeding with server startup
     let min_contract_version =
         parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());

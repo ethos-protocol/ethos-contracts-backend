@@ -1,0 +1,8 @@
+# Opt-in only: lets admin routes run without ADMIN_API_KEY (#700, #905).
+# This file is NOT loaded by `docker compose up`. Use it explicitly on a dev machine:
+#   docker compose -f docker-compose.yml -f docker-compose.insecure-admin.yml up
+# The backend refuses to start with this flag unless RUST_ENV=development.
+services:
+  backend:
+    environment:
+      ALLOW_INSECURE_ADMIN: "true"

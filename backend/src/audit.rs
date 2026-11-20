@@ -105,6 +105,19 @@ pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     check_admin_access(&api_key, allow_insecure, headers)
 }
 
+/// Refuse to start when the insecure admin opt-in is set outside development (#905).
+///
+/// Call once at startup, before the server binds.
+pub fn refuse_insecure_admin_outside_development() {
+    let allow_insecure = std::env::var("ALLOW_INSECURE_ADMIN")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let rust_env = std::env::var("RUST_ENV").unwrap_or_default();
+    if allow_insecure && !rust_env.trim().eq_ignore_ascii_case("development") {
+        panic!("ALLOW_INSECURE_ADMIN=true is only allowed when RUST_ENV=development");
+    }
+}
+
 /// Decide admin access from an explicit key and opt-in flag (#700).
 ///
 /// Separated from [`authorize_admin`] so the rules can be tested without
