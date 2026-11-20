@@ -360,7 +360,7 @@ mod tests {
         cache.set("k1", "v1".to_string());
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |_| Ok(None));
-        assert_eq!(result.unwrap(), Some("v1".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("v1".to_string()));
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
         let cache = make_cache();
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("missing_key", |k| Ok(Some(format!("source:{k}"))));
-        assert_eq!(result.unwrap(), Some("source:missing_key".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("source:missing_key".to_string()));
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
             source_called = true;
             Ok(None)
         });
-        assert_eq!(result.unwrap(), Some("from_source".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("from_source".to_string()));
         assert!(!source_called, "source should not have been called on second get");
     }
 
@@ -393,7 +393,7 @@ mod tests {
         cache.simulate_backend_failure("backend down");
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |k| Ok(Some(format!("fallback:{k}"))));
-        assert_eq!(result.unwrap(), Some("fallback:k1".to_string()));
+        assert_eq!(result.expect("operation should succeed"), Some("fallback:k1".to_string()));
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod tests {
             },
         );
 
-        assert_eq!(result.unwrap(), "fallback:cache-hit");
+        assert_eq!(result.expect("operation should succeed"), "fallback:cache-hit");
         assert!(fallback_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -462,7 +462,7 @@ mod tests {
         let keys = ["k1", "k2", "k3"];
         let loaded = cache
             .rebuild(&keys, |k| Ok::<Option<String>, ()>(Some(k.to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(loaded, 3);
         assert_eq!(cache.entry_count(), 3);
     }
@@ -475,7 +475,7 @@ mod tests {
 
         cache
             .rebuild(&["k1"], |_| Ok::<Option<String>, ()>(Some("v".to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(cache.health(), CacheHealth::Healthy);
     }
 
@@ -484,9 +484,9 @@ mod tests {
         let cache = make_cache();
         cache
             .rebuild(&["k1"], |_| Ok::<Option<String>, ()>(Some("v".to_string())))
-            .unwrap();
+            .expect("operation should succeed");
         let events = cache.tracker.events();
-        assert!(events.last().unwrap().description.contains("rebuilt"));
+        assert!(events.last().expect("at least one recovery event").description.contains("rebuilt"));
     }
 
     #[test]
@@ -501,7 +501,7 @@ mod tests {
                     Ok(None) // k2 not found in source
                 }
             })
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(loaded, 1);
     }
 
@@ -514,7 +514,7 @@ mod tests {
         cache.remove("k1");
         let result: Result<Option<String>, ()> =
             cache.get_or_fallback("k1", |_| Ok(None));
-        assert_eq!(result.unwrap(), None);
+        assert_eq!(result.expect("operation should succeed"), None);
     }
 
     // ── entry_count ───────────────────────────────────────────────────────────

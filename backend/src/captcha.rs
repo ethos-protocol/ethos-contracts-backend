@@ -309,10 +309,17 @@ pub async fn verify_captcha(
         .await
         .map_err(|e| format!("reCAPTCHA HTTP request failed: {e}"))?;
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse reCAPTCHA response: {e}"))?;
+    let body: serde_json::Value = match response.json().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(error = %e, "malformed reCAPTCHA response");
+            return Ok(CaptchaVerifyResponse {
+                verified: false,
+                session_token: None,
+                message: "CAPTCHA verification failed: malformed response".to_string(),
+            });
+        }
+    };
 
     let success = body
         .get("success")
@@ -642,7 +649,7 @@ mod tests {
     fn not_suspicious_below_threshold() {
         let state = dummy_state();
         // Use a unique IP to avoid interference from other tests.
-        assert!(!is_suspicious("192.0.2.1", &state).unwrap());
+        assert!(!is_suspicious("192.0.2.1", &state).expect("suspicion check"));
     }
 
     #[test]
@@ -651,11 +658,11 @@ mod tests {
         let ip = "192.0.2.2";
         // Default threshold is 10.
         for _ in 0..10 {
-            record_event_for_ip(ip, &state).unwrap();
+            record_event_for_ip(ip, &state).expect("counter update");
         }
-        assert!(is_suspicious(ip, &state).unwrap());
-        reset_event_counter_for_ip(ip, &state).unwrap();
-        assert!(!is_suspicious(ip, &state).unwrap());
+        assert!(is_suspicious(ip, &state).expect("suspicion check"));
+        reset_event_counter_for_ip(ip, &state).expect("counter update");
+        assert!(!is_suspicious(ip, &state).expect("suspicion check"));
     }
 
     #[test]
@@ -693,7 +700,7 @@ mod tests {
         let state = Arc::new(dummy_state());
         let ip = "203.0.113.16";
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", ip.parse().unwrap());
+        headers.insert("x-forwarded-for", ip.parse().expect("valid test literal"));
         let req = CaptchaVerifyRequest {
             challenge_id: "unneeded".to_string(),
             captcha_token: "unneeded".to_string(),
@@ -703,7 +710,7 @@ mod tests {
         let result = post_verify_handler(
             State(state),
             headers,
-            ConnectInfo("203.0.113.16:3000".parse().unwrap()),
+            ConnectInfo("203.0.113.16:3000".parse().expect("valid test literal")),
             Json(req),
         )
         .await;
@@ -778,13 +785,13 @@ mod tests {
         }
         let blocked_until_first = {
             let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
-            store.get(ip).and_then(|r| r.blocked_until).unwrap()
+            store.get(ip).and_then(|r| r.blocked_until).expect("ip should be blocked")
         };
 
         record_captcha_failure(ip);
         let blocked_until_second = {
             let store = CAPTCHA_FAILURE_STORE.lock().unwrap_or_else(|p| p.into_inner());
-            store.get(ip).and_then(|r| r.blocked_until).unwrap()
+            store.get(ip).and_then(|r| r.blocked_until).expect("ip should be blocked")
         };
 
         assert!(blocked_until_second > blocked_until_first);
@@ -824,7 +831,7 @@ mod tests {
 
         let state = Arc::new(dummy_state());
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", ip.parse().unwrap());
+        headers.insert("x-forwarded-for", ip.parse().expect("valid test literal"));
 
         let req = CaptchaVerifyRequest {
             challenge_id: "irrelevant".to_string(),
@@ -832,7 +839,7 @@ mod tests {
             user_token: "irrelevant".to_string(),
         };
 
-        let peer = ConnectInfo("203.0.113.15:3000".parse().unwrap());
+        let peer = ConnectInfo("203.0.113.15:3000".parse().expect("valid test literal"));
         let result = post_verify_handler(State(state), headers, peer, Json(req)).await;
         match result {
             Err(AppError::TooManyRequests(_)) => {}

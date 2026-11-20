@@ -210,7 +210,7 @@ impl NodeCache {
         let backend: Arc<dyn CacheBackend> = if let Ok(redis_url) = std::env::var("REDIS_URL") {
             Arc::new(
                 RedisBackend::new(&redis_url)
-                    .unwrap_or_else(|e| panic!("failed to connect to Redis: {e}")),
+                    .map_err(|e| format!("failed to connect to Redis: {e}"))?,
             )
         } else {
             Arc::new(InMemoryBackend::new())
@@ -373,7 +373,7 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
             node_id: node.to_string(),
-            updated_at: Utc.timestamp_millis_opt(millis).unwrap(),
+            updated_at: Utc.timestamp_millis_opt(millis).single().expect("valid timestamp"),
             version: millis as u64,
         }
     }
@@ -387,7 +387,7 @@ mod tests {
         let older = sample_entry("k", "old", "node-a", 1_000);
         let newer = sample_entry("k", "new", "node-b", 2_000);
         let winner =
-            resolve_conflict(Some(&older), Some(&newer), ConflictStrategy::LastWriteWins).unwrap();
+            resolve_conflict(Some(&older), Some(&newer), ConflictStrategy::LastWriteWins).expect("a winner");
         assert_eq!(winner.value, "new");
     }
 
@@ -395,7 +395,7 @@ mod tests {
     fn voting_prefers_higher_version() {
         let low = sample_entry("k", "low", "node-a", 1_000);
         let high = sample_entry("k", "high", "node-b", 2_000);
-        let winner = resolve_conflict(Some(&low), Some(&high), ConflictStrategy::Voting).unwrap();
+        let winner = resolve_conflict(Some(&low), Some(&high), ConflictStrategy::Voting).expect("a winner");
         assert_eq!(winner.value, "high");
     }
 
@@ -413,16 +413,16 @@ mod tests {
             ConflictStrategy::LastWriteWins,
         );
 
-        node_a.put("vault:1", "prefs-a").unwrap();
-        let remote = node_b.get("vault:1").unwrap().expect("remote entry");
+        node_a.put("vault:1", "prefs-a").expect("put should succeed");
+        let remote = node_b.get("vault:1").expect("backend read").expect("remote entry");
         let stale = sample_entry("vault:1", "stale-local", "node-b", 1);
         node_b.set_local_entry(stale);
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert!(!report.consistent);
         assert_eq!(report.conflicts_resolved, 1);
 
-        let resolved = node_b.get("vault:1").unwrap().expect("resolved entry");
+        let resolved = node_b.get("vault:1").expect("backend read").expect("resolved entry");
         assert_eq!(resolved.value, remote.value);
     }
 
@@ -440,12 +440,12 @@ mod tests {
             ConflictStrategy::LastWriteWins,
         );
 
-        node_a.put("vault:2", "shared").unwrap();
-        node_b.sync_local_from_remote().unwrap();
+        node_a.put("vault:2", "shared").expect("put should succeed");
+        node_b.sync_local_from_remote().expect("sync should succeed");
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert!(report.consistent);
-        assert_eq!(node_b.get("vault:2").unwrap().unwrap().value, "shared");
+        assert_eq!(node_b.get("vault:2").expect("backend read").expect("entry present").value, "shared");
     }
 
     #[test]
@@ -455,13 +455,13 @@ mod tests {
         let node_b = NodeCache::new("node-b", Arc::clone(&backend), ConflictStrategy::Voting);
 
         let newer = sample_entry("vault:3", "winner", "node-a", 5_000);
-        backend.set_entry(&newer).unwrap();
+        backend.set_entry(&newer).expect("set should succeed");
         node_a.set_local_entry(newer.clone());
         node_b.set_local_entry(sample_entry("vault:3", "loser", "node-b", 2_000));
 
-        let report = node_b.check_and_resolve().unwrap();
+        let report = node_b.check_and_resolve().expect("resolve should succeed");
         assert_eq!(report.conflicts_resolved, 1);
-        assert_eq!(node_b.get("vault:3").unwrap().unwrap().value, "winner");
+        assert_eq!(node_b.get("vault:3").expect("backend read").expect("entry present").value, "winner");
     }
 
     #[test]

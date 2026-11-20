@@ -137,7 +137,10 @@ enum MaybeCompressed {
 impl MaybeCompressed {
     /// Encode `value` and decide whether to compress based on the threshold.
     fn encode<T: Serialize>(value: &T, threshold: usize, metrics: &mut CacheMetrics) -> Self {
-        let raw = serde_json::to_vec(value).unwrap_or_default();
+        let raw = serde_json::to_vec(value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cache serialization failed; entry will read as a miss");
+            Vec::new()
+        });
         if raw.len() >= threshold {
             let compressed = compress(&raw);
             metrics.compressed_entries += 1;
@@ -156,7 +159,9 @@ impl MaybeCompressed {
                 decompress(b)?
             }
         };
-        serde_json::from_slice(&raw).ok()
+        serde_json::from_slice(&raw)
+            .map_err(|e| tracing::warn!(error = %e, "cache decode failed; treating as miss"))
+            .ok()
     }
 
     /// Whether this entry is stored compressed.
@@ -773,7 +778,7 @@ mod tests {
         cache.set_vault("v1", vault.clone());
         let result = cache.get_vault("v1");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, "v1");
+        assert_eq!(result.expect("operation should succeed").id, "v1");
     }
 
     #[test]
@@ -791,7 +796,7 @@ mod tests {
         cache.set_vault("v1", vault.clone());
         vault.balance = 9999;
         cache.set_vault("v1", vault.clone());
-        let result = cache.get_vault("v1").unwrap();
+        let result = cache.get_vault("v1").expect("vault cached");
         assert_eq!(result.balance, 9999);
     }
 
@@ -842,7 +847,7 @@ mod tests {
         cache.set_vault_summary("v1", summary.clone());
         let result = cache.get_vault_summary("v1");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().vault_id, "v1");
+        assert_eq!(result.expect("operation should succeed").vault_id, "v1");
     }
 
     #[test]
@@ -901,9 +906,9 @@ mod tests {
         updated_vault.ttl_remaining = Some(86400 * 2);
         cache.set_vault("v1", updated_vault.clone());
         cache.set_ttl_remaining("v1", Some(86400 * 2));
-        let cached = cache.get_vault("v1").unwrap();
+        let cached = cache.get_vault("v1").expect("vault cached");
         assert_eq!(cached.ttl_remaining, Some(86400 * 2));
-        let cached_ttl = cache.get_ttl_remaining("v1").unwrap();
+        let cached_ttl = cache.get_ttl_remaining("v1").expect("ttl present");
         assert_eq!(cached_ttl, Some(86400 * 2));
     }
 
@@ -1093,16 +1098,16 @@ mod tests {
         cache.set_vault("v1", make_vault("v1"));
         let token = cache.get_coherence_token("v1");
         assert!(token.is_some());
-        assert_eq!(token.unwrap().vault_id, "v1");
+        assert_eq!(token.expect("coherence token present").vault_id, "v1");
     }
 
     #[test]
     fn test_coherence_token_version_increments() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let v1 = cache.get_coherence_token("v1").unwrap().version;
+        let v1 = cache.get_coherence_token("v1").expect("coherence token present").version;
         cache.set_vault("v1", make_vault("v1")); // overwrite → new version
-        let v2 = cache.get_coherence_token("v1").unwrap().version;
+        let v2 = cache.get_coherence_token("v1").expect("coherence token present").version;
         assert!(v2 > v1);
     }
 
@@ -1112,7 +1117,7 @@ mod tests {
     fn test_invalidate_if_older_removes_stale_entry() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let local_version = cache.get_coherence_token("v1").unwrap().version;
+        let local_version = cache.get_coherence_token("v1").expect("coherence token present").version;
         // Remote version is newer → invalidate.
         let evicted = cache.invalidate_if_older("v1", local_version + 1);
         assert!(evicted);
@@ -1123,7 +1128,7 @@ mod tests {
     fn test_invalidate_if_older_keeps_newer_entry() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let local_version = cache.get_coherence_token("v1").unwrap().version;
+        let local_version = cache.get_coherence_token("v1").expect("coherence token present").version;
         // Remote version is older → do NOT invalidate.
         let evicted = cache.invalidate_if_older("v1", local_version - 1);
         assert!(!evicted);
@@ -1136,7 +1141,7 @@ mod tests {
     fn test_quorum_consistent_when_versions_match() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let version = cache.get_coherence_token("v1").unwrap().version;
+        let version = cache.get_coherence_token("v1").expect("coherence token present").version;
         let remote_tokens = vec![
             CoherenceToken {
                 vault_id: "v1".to_string(),
@@ -1157,7 +1162,7 @@ mod tests {
     fn test_quorum_inconsistent_when_versions_differ() {
         let cache = VaultCache::new();
         cache.set_vault("v1", make_vault("v1"));
-        let version = cache.get_coherence_token("v1").unwrap().version;
+        let version = cache.get_coherence_token("v1").expect("coherence token present").version;
         let remote_tokens = vec![CoherenceToken {
             vault_id: "v1".to_string(),
             version: version + 99,
@@ -1245,7 +1250,7 @@ mod tests {
     fn test_compress_decompress_roundtrip() {
         let original = b"hello, cache compression!";
         let compressed = compress(original);
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed).expect("valid compressed data");
         assert_eq!(decompressed, original);
     }
 
@@ -1253,7 +1258,7 @@ mod tests {
     fn test_compress_decompress_empty() {
         let original: &[u8] = b"";
         let compressed = compress(original);
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed).expect("valid compressed data");
         assert_eq!(decompressed, original);
     }
 
@@ -1295,7 +1300,7 @@ mod tests {
         });
         let vault = make_vault("v1");
         cache.set_vault("v1", vault.clone());
-        let retrieved = cache.get_vault("v1").unwrap();
+        let retrieved = cache.get_vault("v1").expect("vault cached");
         assert_eq!(retrieved.id, vault.id);
         assert_eq!(retrieved.balance, vault.balance);
     }
