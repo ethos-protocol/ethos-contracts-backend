@@ -10,7 +10,8 @@ services:
       dockerfile: backend/Dockerfile
     container_name: ethos-protocol-backend
     environment:
-      REDIS_URL: redis://redis:6379
+      # Redis requires a password (#910). Set REDIS_PASSWORD in .env.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
       NODE_ID: backend-primary
       CONSENSUS_STRATEGY: last_write_wins
       RUST_LOG: info
@@ -31,22 +32,26 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ethos-protocol-redis
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    # Loopback only, so the cache is not reachable from other hosts (#910).
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   stellar-quickstart:
+    # Not pinned by digest yet: the digest must be taken from a registry that
+    # can be reached, then written here (#911).
     image: stellar/quickstart:latest
     container_name: stellar-quickstart
     environment:
       NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
-    ports:
-      - "8000:8000"
-      - "11626:11626"
+    # No host ports are published. Other containers reach it on the compose network.
     volumes:
       - quickstart_data:/var/lib/stellar
 

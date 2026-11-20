@@ -55,14 +55,19 @@ jobs:
       # Generate per-run key names so parallel runs don't collide in the
       # local stellar-cli config store.
       - name: Set up test accounts
+        # Secrets go through env, not into the script text, so they never show
+        # up in the step's written commands or in `set -x` output (#909).
+        env:
+          TESTNET_ADMIN_SECRET: ${{ secrets.TESTNET_ADMIN_SECRET }}
+          TESTNET_OWNER_SECRET: ${{ secrets.TESTNET_OWNER_SECRET }}
         run: |
           set -euo pipefail
           SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           # --- Admin: deploys and initializes the contract ---
-          if [ -n "${{ secrets.TESTNET_ADMIN_SECRET }}" ]; then
+          if [ -n "${TESTNET_ADMIN_SECRET:-}" ]; then
             stellar keys add "smoke-admin-${SUFFIX}" \
-              --secret-key "${{ secrets.TESTNET_ADMIN_SECRET }}"
+              --secret-key "$TESTNET_ADMIN_SECRET"
           else
             stellar keys generate "smoke-admin-${SUFFIX}" --network testnet
           fi
@@ -71,9 +76,9 @@ jobs:
           sleep 5
 
           # --- Owner: create_vault / deposit / check_in / cancel_vault ---
-          if [ -n "${{ secrets.TESTNET_OWNER_SECRET }}" ]; then
+          if [ -n "${TESTNET_OWNER_SECRET:-}" ]; then
             stellar keys add "smoke-owner-${SUFFIX}" \
-              --secret-key "${{ secrets.TESTNET_OWNER_SECRET }}"
+              --secret-key "$TESTNET_OWNER_SECRET"
           else
             stellar keys generate "smoke-owner-${SUFFIX}" --network testnet
           fi

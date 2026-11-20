@@ -24,7 +24,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -88,23 +87,6 @@ impl RevocationList {
     }
 }
 
-/// Decode a JWT payload **without verifying the signature** and return
-/// `(jti, exp)`. Used only to learn which token id to revoke; the token's
-/// authenticity is irrelevant when the intent is to deny it.
-fn decode_unverified(token: &str) -> Option<(Option<String>, Option<i64>)> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let jti = value
-        .get("jti")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let exp = value.get("exp").and_then(serde_json::Value::as_i64);
-    Some((jti, exp))
-}
-
 /// Verify `token` against `secret` and then reject it if its `jti` is on
 /// `list`. This is the entry point authenticated request handlers should call
 /// instead of [`crate::websocket::validate_ws_token`].
@@ -124,15 +106,18 @@ pub fn validate_ws_token_with_revocation(
 
 // ── HTTP handler ─────────────────────────────────────────────────────────────
 
-/// Request body for `POST /auth/revoke`. Supply either a full `token` (its
-/// `jti`/`exp` are extracted) or a bare `jti`.
+/// Request body for `POST /auth/revoke`. Supply the `jti` to revoke.
+///
+/// `token` is still accepted by the schema so old clients get a clear error
+/// instead of an unknown-field error. Its claims are never read: they are
+/// unverified, so an admin could add arbitrary entries from a forged payload (#908).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeRequest {
     pub token: Option<String>,
     pub jti: Option<String>,
-    /// Unix seconds after which the entry may be purged. Defaults to the
-    /// token's `exp`, else `now + DEFAULT_TTL_SECONDS`.
+    /// Unix seconds after which the entry may be purged. Defaults to
+    /// `now + DEFAULT_TTL_SECONDS`.
     pub expires_at: Option<i64>,
 }
 
@@ -164,21 +149,17 @@ pub async fn revoke_token(
 
     let now = Utc::now().timestamp();
 
-    let (jti, token_exp) = match (body.jti.clone(), body.token.as_deref()) {
-        (Some(jti), _) => (jti, None),
-        (None, Some(token)) => {
-            let (jti, exp) =
-                decode_unverified(token).ok_or_else(|| bad_request("token is not a decodable JWT"))?;
-            let jti = jti.ok_or_else(|| bad_request("token has no `jti` claim to revoke"))?;
-            (jti, exp)
+    let jti = match (body.jti.clone(), body.token.as_deref()) {
+        (Some(jti), None) => jti,
+        (_, Some(_)) => {
+            return Err(bad_request(
+                "submit the `jti` to revoke; full tokens are not accepted",
+            ))
         }
-        (None, None) => return Err(bad_request("provide `token` or `jti`")),
+        (None, None) => return Err(bad_request("provide `jti`")),
     };
 
-    let expires_at = body
-        .expires_at
-        .or(token_exp)
-        .unwrap_or(now + DEFAULT_TTL_SECONDS);
+    let expires_at = body.expires_at.unwrap_or(now + DEFAULT_TTL_SECONDS);
 
     list.revoke(&jti, expires_at);
 
@@ -294,9 +275,16 @@ mod tests {
         assert_eq!(resp.0.revoked, "direct-jti");
         assert!(list.is_revoked("direct-jti"));
 
-        // By full token — jti and exp are extracted from the payload.
+    }
+
+    #[tokio::test]
+    async fn revoke_endpoint_rejects_full_token_without_reading_claims() {
+        let list = RevocationList::new();
+        let exp = Utc::now().timestamp() + 1200;
+
+        // A forged payload must not add an entry (#908).
         let token = mint(b"whatever", "token-jti", exp);
-        let resp = revoke_token(
+        let err = revoke_token(
             State(list.clone()),
             HeaderMap::new(),
             Json(RevokeRequest {
@@ -306,10 +294,9 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
-        assert_eq!(resp.0.revoked, "token-jti");
-        assert_eq!(resp.0.expires_at, exp);
-        assert!(list.is_revoked("token-jti"));
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!list.is_revoked("token-jti"));
     }
 
     #[tokio::test]
