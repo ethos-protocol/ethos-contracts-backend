@@ -39,7 +39,7 @@
 //! HTTP 429 response.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -66,6 +66,8 @@ pub enum QueueError {
     /// The queue worker has stopped and the sending half of the channel was
     /// closed unexpectedly.
     Closed,
+    /// A lock guarding queue state was poisoned by a panicking thread.
+    LockPoisoned,
 }
 
 impl std::fmt::Display for QueueError {
@@ -73,6 +75,7 @@ impl std::fmt::Display for QueueError {
         match self {
             QueueError::Full => write!(f, "request queue full (backpressure active)"),
             QueueError::Closed => write!(f, "request queue worker stopped"),
+            QueueError::LockPoisoned => write!(f, "request queue lock poisoned"),
         }
     }
 }
@@ -169,6 +172,9 @@ pub struct QueueItem {
 pub struct RequestQueue {
     sender: mpsc::Sender<QueueItem>,
     pub metrics: Arc<QueueMetrics>,
+    /// Guards the enqueue path so that a poisoned lock is surfaced as an
+    /// error instead of panicking under load.
+    lock: Arc<Mutex<()>>,
 }
 
 impl RequestQueue {
@@ -185,6 +191,7 @@ impl RequestQueue {
         let queue = Self {
             sender,
             metrics: Arc::clone(&metrics),
+            lock: Arc::new(Mutex::new(())),
         };
         // Spawn the worker immediately so the receiver is consumed.
         spawn_worker(receiver, metrics);
@@ -196,6 +203,7 @@ impl RequestQueue {
     /// Returns `Err(QueueError::Full)` when the channel is at capacity (the
     /// number of items already queued equals the configured bound).
     pub fn try_enqueue(&self, item: QueueItem) -> Result<(), QueueError> {
+        let _guard = self.lock()?;
         match self.sender.try_send(item) {
             Ok(()) => {
                 self.metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
@@ -213,14 +221,25 @@ impl RequestQueue {
     }
 
     /// Current number of items waiting to be processed (approximate).
-    pub fn depth(&self) -> usize {
+    ///
+    /// Returns `Err(QueueError::LockPoisoned)` if the queue lock was poisoned.
+    pub fn depth(&self) -> Result<usize, QueueError> {
+        let _guard = self.lock()?;
         // `mpsc::Sender::max_capacity` - `capacity` gives pending items.
-        self.sender.max_capacity() - self.sender.capacity()
+        Ok(self.sender.max_capacity() - self.sender.capacity())
     }
 
     /// The configured maximum queue depth.
-    pub fn max_depth(&self) -> usize {
-        self.sender.max_capacity()
+    ///
+    /// Returns `Err(QueueError::LockPoisoned)` if the queue lock was poisoned.
+    pub fn max_depth(&self) -> Result<usize, QueueError> {
+        let _guard = self.lock()?;
+        Ok(self.sender.max_capacity())
+    }
+
+    /// Acquire the queue lock, mapping a poisoned mutex to `QueueError`.
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, QueueError> {
+        self.lock.lock().map_err(|_| QueueError::LockPoisoned)
     }
 }
 
@@ -287,7 +306,9 @@ mod tests {
         let queue = RequestQueue::with_capacity(1);
 
         // Fill the slot.
-        queue.try_enqueue(item(1, 5_000)).unwrap();
+        queue
+            .try_enqueue(item(1, 5_000))
+            .expect("first item should be accepted");
         // Overflow — should be rejected.
         let _ = queue.try_enqueue(item(2, 5_000));
         let _ = queue.try_enqueue(item(3, 5_000));
@@ -304,7 +325,9 @@ mod tests {
     async fn test_enqueue_counter_increments() {
         let queue = RequestQueue::with_capacity(10);
         for id in 0..5 {
-            queue.try_enqueue(item(id, 0)).unwrap();
+            queue
+                .try_enqueue(item(id, 0))
+                .expect("item should be accepted into a non-full queue");
         }
         assert_eq!(
             queue.metrics.enqueued_total.load(Ordering::Relaxed),
@@ -321,8 +344,12 @@ mod tests {
     async fn test_processes_items_at_min_rpc_latency() {
         let queue = RequestQueue::with_capacity(8);
 
-        queue.try_enqueue(item(1, MIN_RPC_LATENCY_MS)).unwrap();
-        queue.try_enqueue(item(2, MIN_RPC_LATENCY_MS)).unwrap();
+        queue
+            .try_enqueue(item(1, MIN_RPC_LATENCY_MS))
+            .expect("first item should be accepted");
+        queue
+            .try_enqueue(item(2, MIN_RPC_LATENCY_MS))
+            .expect("second item should be accepted");
 
         // Wait long enough for both items to clear the 200 ms worker delay.
         tokio::time::sleep(Duration::from_millis(MIN_RPC_LATENCY_MS + 100)).await;
@@ -349,7 +376,9 @@ mod tests {
 
         // Enqueue 3 items.
         for id in 0..3u64 {
-            queue.try_enqueue(item(id, latency_ms)).unwrap();
+            queue
+                .try_enqueue(item(id, latency_ms))
+                .expect("item should be accepted into a non-full queue");
         }
 
         // Give the worker enough time to drain all three items.
@@ -409,13 +438,56 @@ mod tests {
     #[tokio::test]
     async fn test_max_depth_matches_configured_capacity() {
         let queue = RequestQueue::with_capacity(42);
-        assert_eq!(queue.max_depth(), 42);
+        assert_eq!(
+            queue.max_depth().expect("lock should not be poisoned"),
+            42
+        );
     }
 
     #[tokio::test]
     async fn test_default_max_depth_is_constant() {
         let queue = RequestQueue::new();
-        assert_eq!(queue.max_depth(), MAX_DEPTH);
+        assert_eq!(
+            queue.max_depth().expect("lock should not be poisoned"),
+            MAX_DEPTH
+        );
+    }
+
+    // ── Poisoned lock handling ────────────────────────────────────────────────
+
+    /// A poisoned queue lock must surface as `QueueError::LockPoisoned`
+    /// instead of panicking the caller.
+    #[tokio::test]
+    async fn test_poisoned_lock_returns_error_instead_of_panicking() {
+        let queue = RequestQueue::with_capacity(4);
+
+        // Deliberately poison the lock by panicking while holding it.
+        let lock = Arc::clone(&queue.lock);
+        let join = std::thread::spawn(move || {
+            let _guard = lock.lock().expect("lock should be acquirable");
+            panic!("intentional panic to poison the queue lock");
+        });
+        assert!(
+            join.join().is_err(),
+            "the spawned thread should have panicked"
+        );
+
+        // Enqueue must report the poisoned lock rather than panicking.
+        assert_eq!(
+            queue.try_enqueue(item(1, 0)),
+            Err(QueueError::LockPoisoned),
+            "try_enqueue should return LockPoisoned"
+        );
+        assert_eq!(
+            queue.depth(),
+            Err(QueueError::LockPoisoned),
+            "depth should return LockPoisoned"
+        );
+        assert_eq!(
+            queue.max_depth(),
+            Err(QueueError::LockPoisoned),
+            "max_depth should return LockPoisoned"
+        );
     }
 
     // ── Metrics rendering ─────────────────────────────────────────────────────
@@ -423,7 +495,9 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_render_contains_expected_keys() {
         let queue = RequestQueue::with_capacity(4);
-        queue.try_enqueue(item(1, 0)).unwrap();
+        queue
+            .try_enqueue(item(1, 0))
+            .expect("item should be accepted into a non-full queue");
         // Fill then overflow.
         for id in 2..10u64 {
             let _ = queue.try_enqueue(item(id, 5_000));

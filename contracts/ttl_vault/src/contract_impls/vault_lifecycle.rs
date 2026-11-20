@@ -16,31 +16,35 @@ impl TtlVaultContract {
     /// # Returns
     /// The unique vault ID
     ///
-    /// # Panics
-    /// * Panics if `check_in_interval` is 0
-    /// * Panics if `check_in_interval` is outside the configured min/max bounds
+    /// # Errors
+    /// * `ContractError::AdminCannotOwnVault` - If the owner is the contract admin
+    /// * `ContractError::InvalidInterval` - If `check_in_interval` is 0 or outside the
+    ///   configured min/max bounds
+    /// * `ContractError::InvalidBeneficiary` - If owner and beneficiary are the same
+    /// * `ContractError::DuplicateVault` - If an identical vault already exists
+    /// * `ContractError::VaultCapacityExceeded` - If the owner's vault capacity is reached
     pub fn create_vault(
         env: Env,
         owner: Address,
         beneficiary: Address,
         check_in_interval: u64,
         token_address: Option<Address>,
-    ) -> u64 {
+    ) -> Result<u64, ContractError> {
         owner.require_auth();
         Self::require_initialized(&env);
         // Issue #811: admin must not own vaults to prevent self-dealing on releases
         if owner == Self::load_admin(&env) {
-            panic_with_error!(&env, ContractError::AdminCannotOwnVault);
+            return Err(ContractError::AdminCannotOwnVault);
         }
         Self::assert_not_blacklisted(&env, &owner);
         if check_in_interval == 0 {
-            panic_with_error!(&env, ContractError::InvalidInterval);
+            return Err(ContractError::InvalidInterval);
         }
 
         Self::assert_interval_in_bounds(&env, check_in_interval);
 
         if owner == beneficiary {
-            panic_with_error!(&env, ContractError::InvalidBeneficiary);
+            return Err(ContractError::InvalidBeneficiary);
         }
         // Issue #547: screen the beneficiary against AML/sanctions data.
         aml::require_compliant(&env, &beneficiary);
@@ -62,7 +66,7 @@ impl TtlVaultContract {
                 (DUPLICATE_VAULT_TOPIC,),
                 (owner, beneficiary, check_in_interval, existing_id),
             );
-            panic_with_error!(&env, ContractError::DuplicateVault);
+            return Err(ContractError::DuplicateVault);
         }
 
         // Issue #470: enforce per-owner vault capacity limit
@@ -74,7 +78,7 @@ impl TtlVaultContract {
         if limit > 0 {
             let current_count = Self::load_owner_vault_ids(&env, &owner).len() as u32;
             if current_count >= limit {
-                panic_with_error!(&env, ContractError::VaultCapacityExceeded);
+                return Err(ContractError::VaultCapacityExceeded);
             }
         }
 
@@ -174,7 +178,7 @@ impl TtlVaultContract {
             (VAULT_CREATED_TOPIC,),
             (vault_id, owner, beneficiary, check_in_interval, timestamp),
         );
-        vault_id
+        Ok(vault_id)
     }
 
     /// Records a check-in to reset the vault's expiry timer.

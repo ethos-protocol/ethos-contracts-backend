@@ -158,39 +158,42 @@ pub fn create_job_store() -> JobStore {
 }
 
 /// Submit a new job and return its ID.
-pub fn enqueue_job(store: &JobStore, job: BulkJob) -> String {
+pub fn enqueue_job(store: &JobStore, job: BulkJob) -> Result<String, AppError> {
     let id = job.id.clone();
-    store.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), job);
-    id
+    lock_store(store)?.insert(id.clone(), job);
+    Ok(id)
 }
 
 /// Retrieve a job by ID.
-pub fn get_job(store: &JobStore, id: &str) -> Option<BulkJob> {
-    store.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
+pub fn get_job(store: &JobStore, id: &str) -> Result<Option<BulkJob>, AppError> {
+    Ok(lock_store(store)?.get(id).cloned())
 }
 
 /// List all jobs, optionally filtered by status.
-pub fn list_jobs(store: &JobStore, status_filter: Option<JobStatus>) -> Vec<BulkJob> {
-    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+pub fn list_jobs(
+    store: &JobStore,
+    status_filter: Option<JobStatus>,
+) -> Result<Vec<BulkJob>, AppError> {
+    let store = lock_store(store)?;
     let mut jobs: Vec<BulkJob> = store
         .values()
         .filter(|j| status_filter.as_ref().map_or(true, |s| &j.status == s))
         .cloned()
         .collect();
     jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    jobs
+    Ok(jobs)
 }
 
 /// Cancel a queued job. Returns false if the job is not found or not cancellable.
-pub fn cancel_job(store: &JobStore, id: &str) -> bool {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+pub fn cancel_job(store: &JobStore, id: &str) -> Result<bool, AppError> {
+    let mut store = lock_store(store)?;
     if let Some(job) = store.get_mut(id) {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             job.mark_cancelled();
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 // ── Job executor (synchronous simulation for in-process queue) ────────────────
@@ -198,24 +201,24 @@ pub fn cancel_job(store: &JobStore, id: &str) -> bool {
 // In production this would be a background Tokio task. Here we expose a
 // `process_job` function that can be called from a spawned task or inline.
 
-pub fn process_job(store: &JobStore, id: &str) {
+pub fn process_job(store: &JobStore, id: &str) -> Result<(), AppError> {
     // Mark running
     {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = lock_store(store)?;
         if let Some(job) = s.get_mut(id) {
             if job.status != JobStatus::Queued {
-                return; // already picked up or cancelled
+                return Ok(()); // already picked up or cancelled
             }
             job.mark_running();
         } else {
-            return;
+            return Ok(());
         }
     }
 
     // Simulate processing — real implementations would call domain logic here.
     let (operation, total_items, request_id) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let job = s.get(id).unwrap();
+        let s = lock_store(store)?;
+        let job = s.get(id).ok_or(AppError::NotFound)?;
         (
             job.operation.clone(),
             job.total_items,
@@ -235,10 +238,10 @@ pub fn process_job(store: &JobStore, id: &str) {
         let chunk = batch_size.min(total_items - processed);
         processed += chunk;
 
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = lock_store(store)?;
         if let Some(job) = s.get_mut(id) {
             if job.status == JobStatus::Cancelled {
-                return;
+                return Ok(());
             }
             job.advance(chunk, 0);
         }
@@ -253,10 +256,11 @@ pub fn process_job(store: &JobStore, id: &str) {
         "message": "Bulk operation completed successfully"
     });
 
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut s = lock_store(store)?;
     if let Some(job) = s.get_mut(id) {
         job.mark_completed(result);
     }
+    Ok(())
 }
 
 // ── HTTP request / response types ────────────────────────────────────────────
@@ -301,6 +305,11 @@ use axum::{
 use crate::error::AppError;
 use crate::error_context::REQUEST_ID_HEADER;
 
+/// Acquire the job store lock, mapping a poisoned mutex to `AppError`.
+fn lock_store(store: &JobStore) -> Result<std::sync::MutexGuard<'_, HashMap<String, BulkJob>>, AppError> {
+    store.lock().map_err(|_| AppError::LockPoisoned)
+}
+
 /// POST /jobs — submit a bulk operation job.
 pub async fn create_job_handler(
     State(job_store): State<JobStore>,
@@ -327,14 +336,16 @@ pub async fn create_job_handler(
         .with_request_id(request_id);
     let job_id = job.id.clone();
 
-    enqueue_job(&job_store, job);
+    enqueue_job(&job_store, job)?;
 
     // Spawn synchronous processing in a blocking task so the handler returns
     // immediately (non-blocking to the caller).
     let store_clone = Arc::clone(&job_store);
     let id_clone = job_id.clone();
     tokio::task::spawn_blocking(move || {
-        process_job(&store_clone, &id_clone);
+        if let Err(err) = process_job(&store_clone, &id_clone) {
+            tracing::error!(job_id = %id_clone, error = ?err, "bulk job processing failed");
+        }
     });
 
     Ok((
@@ -352,7 +363,7 @@ pub async fn get_job_handler(
     State(job_store): State<JobStore>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, AppError> {
-    let job = get_job(&job_store, &job_id).ok_or(AppError::NotFound)?;
+    let job = get_job(&job_store, &job_id)?.ok_or(AppError::NotFound)?;
     let eta = job.estimated_seconds_remaining();
     Ok(Json(JobStatusResponse {
         job,
@@ -365,7 +376,7 @@ pub async fn list_jobs_handler(
     State(job_store): State<JobStore>,
     Query(query): Query<ListJobsQuery>,
 ) -> Result<Json<Vec<BulkJob>>, AppError> {
-    let jobs = list_jobs(&job_store, query.status);
+    let jobs = list_jobs(&job_store, query.status)?;
     Ok(Json(jobs))
 }
 
@@ -374,7 +385,7 @@ pub async fn cancel_job_handler(
     State(job_store): State<JobStore>,
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    if cancel_job(&job_store, &job_id) {
+    if cancel_job(&job_store, &job_id)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
@@ -394,8 +405,10 @@ mod tests {
             2,
             Some("test-label".into()),
         );
-        let id = enqueue_job(&store, job);
-        let retrieved = get_job(&store, &id).unwrap();
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+        let retrieved = get_job(&store, &id)
+            .expect("lock should succeed")
+            .expect("job should exist");
         assert_eq!(retrieved.status, JobStatus::Queued);
         assert_eq!(retrieved.total_items, 2);
     }
@@ -438,9 +451,15 @@ mod tests {
             5,
             None,
         );
-        let id = enqueue_job(&store, job);
-        assert!(cancel_job(&store, &id));
-        assert_eq!(get_job(&store, &id).unwrap().status, JobStatus::Cancelled);
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+        assert!(cancel_job(&store, &id).expect("cancel should succeed"));
+        assert_eq!(
+            get_job(&store, &id)
+                .expect("lock should succeed")
+                .expect("job should exist")
+                .status,
+            JobStatus::Cancelled
+        );
     }
 
     #[test]
@@ -448,13 +467,13 @@ mod tests {
         let store = create_job_store();
         for _ in 0..3 {
             let job = BulkJob::new(BulkOperationType::Custom, serde_json::json!([]), 1, None);
-            enqueue_job(&store, job);
+            enqueue_job(&store, job).expect("enqueue should succeed");
         }
-        let all = list_jobs(&store, None);
+        let all = list_jobs(&store, None).expect("list should succeed");
         assert_eq!(all.len(), 3);
-        let queued = list_jobs(&store, Some(JobStatus::Queued));
+        let queued = list_jobs(&store, Some(JobStatus::Queued)).expect("list should succeed");
         assert_eq!(queued.len(), 3);
-        let running = list_jobs(&store, Some(JobStatus::Running));
+        let running = list_jobs(&store, Some(JobStatus::Running)).expect("list should succeed");
         assert_eq!(running.len(), 0);
     }
 
@@ -470,12 +489,17 @@ mod tests {
         .with_request_id(Some("req-job-77".into()));
         assert_eq!(job.request_id.as_deref(), Some("req-job-77"));
 
-        let id = enqueue_job(&store, job);
-        process_job(&store, &id);
-        let done = get_job(&store, &id).unwrap();
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+        process_job(&store, &id).expect("processing should succeed");
+        let done = get_job(&store, &id)
+            .expect("lock should succeed")
+            .expect("job should exist");
         assert_eq!(done.status, JobStatus::Completed);
         // The correlation id survives into the job's structured result.
-        assert_eq!(done.result.unwrap()["request_id"], "req-job-77");
+        assert_eq!(
+            done.result.expect("result should be present")["request_id"],
+            "req-job-77"
+        );
     }
 
     #[test]
@@ -487,10 +511,35 @@ mod tests {
             3,
             None,
         );
-        let id = enqueue_job(&store, job);
-        process_job(&store, &id);
-        let done = get_job(&store, &id).unwrap();
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+        process_job(&store, &id).expect("processing should succeed");
+        let done = get_job(&store, &id)
+            .expect("lock should succeed")
+            .expect("job should exist");
         assert_eq!(done.status, JobStatus::Completed);
         assert_eq!(done.progress, 100);
+    }
+
+    #[test]
+    fn test_poisoned_lock_does_not_panic() {
+        let store = create_job_store();
+        let job = BulkJob::new(BulkOperationType::Custom, serde_json::json!([]), 1, None);
+        let id = enqueue_job(&store, job).expect("enqueue should succeed");
+
+        // Poison the mutex by panicking while holding the lock.
+        let poisoner = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("lock should succeed");
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+
+        // All store operations must surface a LockPoisoned error, not panic.
+        assert!(matches!(get_job(&store, &id), Err(AppError::LockPoisoned)));
+        assert!(matches!(list_jobs(&store, None), Err(AppError::LockPoisoned)));
+        assert!(matches!(cancel_job(&store, &id), Err(AppError::LockPoisoned)));
+        assert!(matches!(process_job(&store, &id), Err(AppError::LockPoisoned)));
+        let extra = BulkJob::new(BulkOperationType::Custom, serde_json::json!([]), 1, None);
+        assert!(matches!(enqueue_job(&store, extra), Err(AppError::LockPoisoned)));
     }
 }

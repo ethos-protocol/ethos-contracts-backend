@@ -34,6 +34,15 @@
 ///   `ValidationResult::conflicts` and `overall_valid` is set to `false`.
 use soroban_sdk::{contracttype, symbol_short, Bytes, Env, Vec};
 
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+/// Maximum accepted length of a rule payload, in bytes.
+pub const MAX_RULE_BYTES: u32 = 1024;
+/// Maximum accepted length of a slice payload, in bytes.
+pub const MAX_SLICE_BYTES: u32 = 4096;
+/// Highest accepted rule priority (0 is highest priority).
+pub const MAX_RULE_PRIORITY: u32 = 255;
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Error raised while registering a composition rule.
@@ -42,6 +51,19 @@ pub enum CompositionRuleError {
     /// The candidate rule conflicts with an already-registered enabled rule.
     /// Carries the `rule_id` of the existing conflicting rule.
     ConflictingRule(u64),
+    /// The rule payload is malformed (e.g. exceeds the maximum allowed length).
+    MalformedRuleBytes,
+    /// The rule priority is out of the accepted range.
+    InvalidPriority,
+    /// The rule tag is out of the accepted range.
+    InvalidTag,
+    /// The referenced rule does not exist.
+    RuleNotFound(u64),
+    /// The referenced slice does not exist.
+    SliceNotFound(u64),
+    /// The rule ID list supplied for a slice is malformed (e.g. contains
+    /// duplicate IDs or references a non-existent rule).
+    MalformedSliceRules,
 }
 
 // ── Event topics ─────────────────────────────────────────────────────────────
@@ -151,6 +173,17 @@ pub fn register_composition_rule(
     priority: u32,
     tag: u32,
 ) -> Result<u64, CompositionRuleError> {
+    // Reject malformed payloads before touching storage.
+    if rule_bytes.len() > MAX_RULE_BYTES {
+        return Err(CompositionRuleError::MalformedRuleBytes);
+    }
+    if priority > MAX_RULE_PRIORITY {
+        return Err(CompositionRuleError::InvalidPriority);
+    }
+    if tag == 0 {
+        return Err(CompositionRuleError::InvalidTag);
+    }
+
     let rule_id: u64 = env
         .storage()
         .persistent()
@@ -242,7 +275,10 @@ fn find_conflicting_rule(env: &Env, priority: u32, tag: u32, rule_bytes: &Bytes)
 fn bytes_overlap(a: &Bytes, b: &Bytes) -> bool {
     let shorter_len = a.len().min(b.len());
     for i in 0..shorter_len {
-        if a.get(i).unwrap() != b.get(i).unwrap() {
+        let (Some(ab), Some(bb)) = (a.get(i), b.get(i)) else {
+            return false;
+        };
+        if ab != bb {
             return false;
         }
     }
@@ -250,13 +286,19 @@ fn bytes_overlap(a: &Bytes, b: &Bytes) -> bool {
 }
 
 /// Enable or disable an existing rule.
-pub fn set_rule_enabled(env: &Env, rule_id: u64, enabled: bool) {
+pub fn set_rule_enabled(
+    env: &Env,
+    rule_id: u64,
+    enabled: bool,
+) -> Result<(), CompositionRuleError> {
     let key = RulesEngineKey::Rule(rule_id);
-    let mut rule: CompositionRule = env
+    let Some(mut rule) = env
         .storage()
         .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic_with_rule_not_found(env));
+        .get::<RulesEngineKey, CompositionRule>(&key)
+    else {
+        return Err(CompositionRuleError::RuleNotFound(rule_id));
+    };
 
     rule.enabled = enabled;
     rule.updated_at = env.ledger().timestamp();
@@ -272,12 +314,33 @@ pub fn set_rule_enabled(env: &Env, rule_id: u64, enabled: bool) {
         (RULE_UPDATED_TOPIC, rule_id),
         RuleUpdatedEvent { rule_id, enabled },
     );
+
+    Ok(())
 }
 
 /// Associate an ordered list of `rule_ids` with `slice_id`.
 ///
 /// This replaces any previous association.  Pass an empty `Vec` to clear.
-pub fn set_slice_rules(env: &Env, slice_id: u64, rule_ids: Vec<u64>) {
+pub fn set_slice_rules(
+    env: &Env,
+    slice_id: u64,
+    rule_ids: Vec<u64>,
+) -> Result<(), CompositionRuleError> {
+    // Validate the supplied rule list: every referenced rule must exist and
+    // no rule may be listed twice.
+    let len = rule_ids.len();
+    for i in 0..len {
+        let id = rule_ids.get(i).unwrap();
+        if get_rule(env, id).is_none() {
+            return Err(CompositionRuleError::RuleNotFound(id));
+        }
+        for j in (i + 1)..len {
+            if rule_ids.get(j).unwrap() == id {
+                return Err(CompositionRuleError::MalformedSliceRules);
+            }
+        }
+    }
+
     let key = RulesEngineKey::SliceRules(slice_id);
     env.storage().persistent().set(&key, &rule_ids);
     env.storage().persistent().extend_ttl(
@@ -285,6 +348,8 @@ pub fn set_slice_rules(env: &Env, slice_id: u64, rule_ids: Vec<u64>) {
         crate::VAULT_TTL_THRESHOLD,
         crate::VAULT_TTL_LEDGERS,
     );
+
+    Ok(())
 }
 
 /// Retrieve the rule IDs associated with `slice_id`.
@@ -321,7 +386,15 @@ pub fn get_rule(env: &Env, rule_id: u64) -> Option<CompositionRule> {
 ///
 /// Rules are evaluated in ascending priority order (lower number first).
 /// Conflicts are detected as described in the module doc.
-pub fn validate_slice_with_rules(env: &Env, slice_id: u64, slice_data: &Bytes) -> ValidationResult {
+pub fn validate_slice_with_rules(
+    env: &Env,
+    slice_id: u64,
+    slice_data: &Bytes,
+) -> Result<ValidationResult, CompositionRuleError> {
+    if slice_data.len() > MAX_SLICE_BYTES {
+        return Err(CompositionRuleError::MalformedRuleBytes);
+    }
+
     let rule_ids = get_slice_rules(env, slice_id);
 
     let mut outcomes: Vec<RuleOutcome> = Vec::new(env);
@@ -339,8 +412,12 @@ pub fn validate_slice_with_rules(env: &Env, slice_id: u64, slice_data: &Bytes) -
     let n = sorted_ids.len();
     for i in 0..n {
         for j in 0..n.saturating_sub(i + 1) {
-            let id_j = sorted_ids.get(j).unwrap();
-            let id_j1 = sorted_ids.get(j + 1).unwrap();
+            let Some(id_j) = sorted_ids.get(j) else {
+                return Err(CompositionRuleError::MalformedSliceRules);
+            };
+            let Some(id_j1) = sorted_ids.get(j + 1) else {
+                return Err(CompositionRuleError::MalformedSliceRules);
+            };
             let prio_j = get_rule(env, id_j).map_or(u32::MAX, |r| r.priority);
             let prio_j1 = get_rule(env, id_j1).map_or(u32::MAX, |r| r.priority);
             if prio_j > prio_j1 {
@@ -377,8 +454,12 @@ pub fn validate_slice_with_rules(env: &Env, slice_id: u64, slice_data: &Bytes) -
     let olen = outcomes.len();
     for i in 0..olen {
         for j in (i + 1)..olen {
-            let oi = outcomes.get(i).unwrap();
-            let oj = outcomes.get(j).unwrap();
+            let Some(oi) = outcomes.get(i) else {
+                return Err(CompositionRuleError::MalformedSliceRules);
+            };
+            let Some(oj) = outcomes.get(j) else {
+                return Err(CompositionRuleError::MalformedSliceRules);
+            };
             if oi.priority == oj.priority && oi.passed != oj.passed {
                 conflicts.push_back(oi.rule_id);
                 conflicts.push_back(oj.rule_id);
@@ -408,7 +489,7 @@ pub fn validate_slice_with_rules(env: &Env, slice_id: u64, slice_data: &Bytes) -
         },
     );
 
-    result
+    Ok(result)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -428,15 +509,12 @@ fn evaluate_rule(slice_data: &Bytes, rule_bytes: &Bytes) -> bool {
     }
     // Compare byte-by-byte over the prefix.
     for i in 0..rlen {
-        if slice_data.get(i).unwrap() != rule_bytes.get(i).unwrap() {
+        let (Some(sb), Some(rb)) = (slice_data.get(i), rule_bytes.get(i)) else {
+            return false;
+        };
+        if sb != rb {
             return false;
         }
     }
     true
-}
-
-#[cold]
-#[inline(never)]
-fn panic_with_rule_not_found(env: &Env) -> ! {
-    soroban_sdk::panic_with_error!(env, crate::ContractError::RuleNotFound)
 }

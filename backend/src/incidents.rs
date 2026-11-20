@@ -26,6 +26,7 @@ use axum::{
     Json,
 };
 use crate::clock::{Clock, SystemClock};
+use crate::error::AppError;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -179,6 +180,14 @@ impl Default for IncidentState {
     }
 }
 
+/// Acquire the incident store lock, mapping a poisoned lock to
+/// [`AppError::LockPoisoned`] instead of panicking.
+fn lock_store(
+    store: &IncidentStore,
+) -> Result<std::sync::MutexGuard<'_, HashMap<String, Incident>>, AppError> {
+    store.lock().map_err(|_| AppError::LockPoisoned)
+}
+
 fn timeline_entry_at(
     actor: impl Into<String>,
     note: impl Into<String>,
@@ -221,12 +230,14 @@ fn new_incident_at(
 /// For callers outside a request context — background jobs and validation
 /// routines (e.g. backup checksum verification) — that detect a problem and
 /// need to raise an alert without going through `POST /incidents`.
+///
+/// Returns an error if the store lock is poisoned.
 pub fn open_incident(
     store: &IncidentStore,
     title: impl Into<String>,
     description: impl Into<String>,
     severity: IncidentSeverity,
-) -> Incident {
+) -> Result<Incident, AppError> {
     open_incident_at(store, title, description, severity, SystemClock.now())
 }
 
@@ -236,7 +247,7 @@ fn open_incident_at(
     description: impl Into<String>,
     severity: IncidentSeverity,
     now: DateTime<Utc>,
-) -> Incident {
+) -> Result<Incident, AppError> {
     let incident = new_incident_at(title.into(), description.into(), severity, None, now);
 
     tracing::warn!(
@@ -245,45 +256,47 @@ fn open_incident_at(
         "incident opened"
     );
 
-    store.lock().unwrap_or_else(|p| p.into_inner()).insert(incident.id.clone(), incident.clone());
-    incident
+    lock_store(store)?.insert(incident.id.clone(), incident.clone());
+    Ok(incident)
 }
 
 /// `POST /incidents` — open a new incident with severity classification.
 pub async fn create_incident(
     State(state): State<Arc<IncidentState>>,
     Json(body): Json<CreateIncidentRequest>,
-) -> (StatusCode, Json<Incident>) {
+) -> Result<(StatusCode, Json<Incident>), AppError> {
     let mut incident = open_incident_at(
         &state.store,
         body.title,
         body.description,
         body.severity,
         state.clock.now(),
-    );
+    )?;
     incident.assigned_to = body.assigned_to.clone();
-    state
-        .store
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(incident.id.clone(), incident.clone());
+    lock_store(&state.store)?.insert(incident.id.clone(), incident.clone());
 
-    (StatusCode::CREATED, Json(incident))
+    Ok((StatusCode::CREATED, Json(incident)))
 }
 
 /// `GET /incidents` — list all tracked incidents.
-pub async fn list_incidents(State(state): State<Arc<IncidentState>>) -> Json<Vec<Incident>> {
-    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    Json(store.values().cloned().collect())
+pub async fn list_incidents(
+    State(state): State<Arc<IncidentState>>,
+) -> Result<Json<Vec<Incident>>, AppError> {
+    let store = lock_store(&state.store)?;
+    Ok(Json(store.values().cloned().collect()))
 }
 
 /// `GET /incidents/:id` — fetch a single incident.
 pub async fn get_incident(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
-) -> Result<Json<Incident>, StatusCode> {
-    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    store.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+) -> Result<Json<Incident>, AppError> {
+    let store = lock_store(&state.store)?;
+    store
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("incident {id} not found")))
 }
 
 /// `POST /incidents/:id/timeline` — append an entry to the incident timeline.
@@ -291,9 +304,11 @@ pub async fn add_timeline_entry(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
     Json(body): Json<AddTimelineEntryRequest>,
-) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Incident>, AppError> {
+    let mut store = lock_store(&state.store)?;
+    let incident = store
+        .get_mut(&id)
+        .ok_or_else(|| AppError::NotFound(format!("incident {id} not found")))?;
     let now = state.clock.now();
     incident.timeline.push(timeline_entry_at(body.actor, body.note, now));
     incident.updated_at = now;
@@ -306,9 +321,11 @@ pub async fn acknowledge_incident(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
     Json(body): Json<AcknowledgeIncidentRequest>,
-) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Incident>, AppError> {
+    let mut store = lock_store(&state.store)?;
+    let incident = store
+        .get_mut(&id)
+        .ok_or_else(|| AppError::NotFound(format!("incident {id} not found")))?;
 
     let now = state.clock.now();
     incident.acknowledged_at = Some(now);
@@ -329,9 +346,11 @@ pub async fn update_incident_status(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
     Json(body): Json<UpdateStatusRequest>,
-) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Incident>, AppError> {
+    let mut store = lock_store(&state.store)?;
+    let incident = store
+        .get_mut(&id)
+        .ok_or_else(|| AppError::NotFound(format!("incident {id} not found")))?;
 
     let note = format!("status changed from {:?} to {:?}", incident.status, body.status);
     incident.status = body.status;
@@ -377,9 +396,11 @@ pub async fn escalate_incident(
     State(state): State<Arc<IncidentState>>,
     Path(id): Path<String>,
     Json(body): Json<EscalateIncidentRequest>,
-) -> Result<Json<Incident>, StatusCode> {
-    let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
-    let incident = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Incident>, AppError> {
+    let mut store = lock_store(&state.store)?;
+    let incident = store
+        .get_mut(&id)
+        .ok_or_else(|| AppError::NotFound(format!("incident {id} not found")))?;
 
     let now = state.clock.now();
     escalate_to_next_tier_at(incident, &body.reason, now);
@@ -397,17 +418,18 @@ pub async fn escalate_incident(
 /// to be driven by a periodic background task so escalation happens
 /// automatically rather than relying on manual follow-up.
 ///
-/// Returns the incidents that were escalated.
-pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Vec<Incident> {
+/// Returns the incidents that were escalated, or an error if the store lock
+/// is poisoned.
+pub fn enforce_acknowledgment_timeouts(store: &IncidentStore) -> Result<Vec<Incident>, AppError> {
     enforce_acknowledgment_timeouts_at(store, SystemClock.now())
 }
 
 pub fn enforce_acknowledgment_timeouts_at(
     store: &IncidentStore,
     now: DateTime<Utc>,
-) -> Vec<Incident> {
+) -> Result<Vec<Incident>, AppError> {
     let mut escalated = Vec::new();
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = lock_store(store)?;
 
     for incident in store.values_mut() {
         if incident.acknowledged_at.is_some() {
@@ -425,7 +447,7 @@ pub fn enforce_acknowledgment_timeouts_at(
         }
     }
 
-    escalated
+    Ok(escalated)
 }
 
 #[cfg(test)]
@@ -450,7 +472,8 @@ mod tests {
                 assigned_to: None,
             }),
         )
-        .await;
+        .await
+        .expect("create_incident should succeed");
 
         assert_eq!(incident.created_at, now);
         assert_eq!(incident.updated_at, now);
@@ -471,7 +494,8 @@ mod tests {
             "primary db unreachable",
             IncidentSeverity::Sev1,
             now,
-        );
+        )
+        .expect("open_incident_at should succeed");
 
         // Acknowledge before the deadline elapses.
         {
@@ -481,7 +505,8 @@ mod tests {
             stored.acknowledgment_deadline = None;
         }
 
-        let escalated = enforce_acknowledgment_timeouts_at(&store, now);
+        let escalated = enforce_acknowledgment_timeouts_at(&store, now)
+            .expect("enforce should succeed");
         assert!(escalated.is_empty(), "acknowledged incident must not escalate");
 
         let guard = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -499,7 +524,8 @@ mod tests {
             "p99 above threshold",
             IncidentSeverity::Sev2,
             now,
-        );
+        )
+        .expect("open_incident_at should succeed");
 
         // Force the deadline into the past to simulate an unacknowledged timeout.
         {
@@ -509,7 +535,8 @@ mod tests {
         }
 
         let enforce_at = now;
-        let escalated = enforce_acknowledgment_timeouts_at(&store, enforce_at);
+        let escalated = enforce_acknowledgment_timeouts_at(&store, enforce_at)
+            .expect("enforce should succeed");
         assert_eq!(escalated.len(), 1);
         assert_eq!(escalated[0].escalation_level, 1);
 
@@ -517,5 +544,29 @@ mod tests {
         let stored = guard.get(&incident.id).unwrap();
         assert_eq!(stored.escalation_level, 1);
         assert!(stored.acknowledgment_deadline.unwrap() > enforce_at);
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_panic() {
+        let store = create_incident_store();
+
+        // Poison the lock by panicking while holding it.
+        let poison_store = store.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_store.lock().unwrap();
+            panic!("intentional panic to poison the lock");
+        }));
+
+        // All lock-acquiring operations must return an error, not panic.
+        let result = open_incident(
+            &store,
+            "poisoned",
+            "lock poisoned",
+            IncidentSeverity::Sev1,
+        );
+        assert!(matches!(result, Err(AppError::LockPoisoned)));
+
+        let result = enforce_acknowledgment_timeouts(&store);
+        assert!(matches!(result, Err(AppError::LockPoisoned)));
     }
 }

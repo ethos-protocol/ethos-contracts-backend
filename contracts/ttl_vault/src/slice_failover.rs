@@ -117,9 +117,9 @@ pub fn register_backup_slice(
     primary_slice_id: u64,
     backup_slice_id: u64,
     failure_threshold: u32,
-) -> u64 {
+) -> Result<u64, crate::ContractError> {
     if primary_slice_id == backup_slice_id {
-        soroban_sdk::panic_with_error!(env, crate::ContractError::InvalidSlice);
+        return Err(crate::ContractError::InvalidSlice);
     }
 
     let mut backups = get_backup_slices(env, primary_slice_id);

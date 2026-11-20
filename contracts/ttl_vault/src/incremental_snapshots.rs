@@ -21,7 +21,7 @@
 /// after reconstruction so corruption is detected rather than silently
 /// returned.
 use soroban_sdk::{
-    contracttype, panic_with_error, symbol_short,
+    contracttype, symbol_short,
     xdr::{FromXdr, ToXdr},
     Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, Val, Vec,
 };
@@ -86,12 +86,15 @@ fn enc<T: IntoVal<Env, Val>>(env: &Env, value: T) -> Bytes {
     value.to_xdr(env)
 }
 
-fn dec<T: TryFromVal<Env, Val>>(env: &Env, fields: &Vec<Bytes>, index: u32) -> T {
+fn dec<T: TryFromVal<Env, Val>>(
+    env: &Env,
+    fields: &Vec<Bytes>,
+    index: u32,
+) -> Result<T, ContractError> {
     let bytes = fields
         .get(index)
-        .unwrap_or_else(|| panic_with_error!(env, ContractError::SnapshotCorrupted));
-    T::from_xdr(env, &bytes)
-        .unwrap_or_else(|_| panic_with_error!(env, ContractError::SnapshotCorrupted))
+        .ok_or(ContractError::SnapshotCorrupted)?;
+    T::from_xdr(env, &bytes).map_err(|_| ContractError::SnapshotCorrupted)
 }
 
 /// Serializes each vault field independently, in declaration order.
@@ -122,30 +125,30 @@ pub fn encode_fields(env: &Env, v: &Vault) -> Vec<Bytes> {
 }
 
 /// Inverse of [`encode_fields`].
-pub fn decode_fields(env: &Env, f: &Vec<Bytes>) -> Vault {
-    Vault {
-        owner: dec(env, f, 0),
-        beneficiary: dec(env, f, 1),
-        balance: dec(env, f, 2),
-        check_in_interval: dec(env, f, 3),
-        last_check_in: dec(env, f, 4),
-        created_at: dec(env, f, 5),
-        status: dec(env, f, 6),
-        beneficiaries: dec(env, f, 7),
-        metadata: dec(env, f, 8),
-        token_address: dec(env, f, 9),
-        custom_metadata: dec(env, f, 10),
-        is_paused: dec(env, f, 11),
-        release_condition: dec(env, f, 12),
-        parent_vault_id: dec(env, f, 13),
-        passkey_hash: dec(env, f, 14),
-        max_deposit_amount: dec(env, f, 15),
-        withdrawal_approval_threshold: dec(env, f, 16),
-        spending_limit: dec(env, f, 17),
-        inactivity_penalty_bps: dec(env, f, 18),
-        burn_percentage: dec(env, f, 19),
-        penalty_recipient: dec(env, f, 20),
-    }
+pub fn decode_fields(env: &Env, f: &Vec<Bytes>) -> Result<Vault, ContractError> {
+    Ok(Vault {
+        owner: dec(env, f, 0)?,
+        beneficiary: dec(env, f, 1)?,
+        balance: dec(env, f, 2)?,
+        check_in_interval: dec(env, f, 3)?,
+        last_check_in: dec(env, f, 4)?,
+        created_at: dec(env, f, 5)?,
+        status: dec(env, f, 6)?,
+        beneficiaries: dec(env, f, 7)?,
+        metadata: dec(env, f, 8)?,
+        token_address: dec(env, f, 9)?,
+        custom_metadata: dec(env, f, 10)?,
+        is_paused: dec(env, f, 11)?,
+        release_condition: dec(env, f, 12)?,
+        parent_vault_id: dec(env, f, 13)?,
+        passkey_hash: dec(env, f, 14)?,
+        max_deposit_amount: dec(env, f, 15)?,
+        withdrawal_approval_threshold: dec(env, f, 16)?,
+        spending_limit: dec(env, f, 17)?,
+        inactivity_penalty_bps: dec(env, f, 18)?,
+        burn_percentage: dec(env, f, 19)?,
+        penalty_recipient: dec(env, f, 20)?,
+    })
 }
 
 fn empty_fields(env: &Env) -> Vec<Bytes> {
@@ -187,30 +190,29 @@ pub fn get_snapshot(env: &Env, vault_id: u64, sequence: u32) -> Option<Increment
 
 /// Replays the chain from the nearest checkpoint up to `sequence` and
 /// returns the per-field encodings at that point.
-fn replay_fields(env: &Env, vault_id: u64, sequence: u32) -> Vec<Bytes> {
+fn replay_fields(env: &Env, vault_id: u64, sequence: u32) -> Result<Vec<Bytes>, ContractError> {
     let checkpoint = sequence - (sequence % FULL_SNAPSHOT_INTERVAL);
     let mut fields = empty_fields(env);
     for seq in checkpoint..=sequence {
-        let snap = get_snapshot(env, vault_id, seq)
-            .unwrap_or_else(|| panic_with_error!(env, ContractError::SnapshotNotFound));
+        let snap = get_snapshot(env, vault_id, seq).ok_or(ContractError::SnapshotNotFound)?;
         if seq == checkpoint && !snap.is_full {
-            panic_with_error!(env, ContractError::SnapshotCorrupted);
+            return Err(ContractError::SnapshotCorrupted);
         }
         for delta in snap.deltas.iter() {
             let prev = fields
                 .get(delta.field)
-                .unwrap_or_else(|| panic_with_error!(env, ContractError::SnapshotCorrupted));
+                .ok_or(ContractError::SnapshotCorrupted)?;
             let next = diff_codec::diff_decompress(env, &prev, &delta.data, delta.len)
-                .unwrap_or_else(|| panic_with_error!(env, ContractError::SnapshotCorrupted));
+                .ok_or(ContractError::SnapshotCorrupted)?;
             fields.set(delta.field, next);
         }
     }
-    fields
+    Ok(fields)
 }
 
 /// Takes an incremental snapshot of the vault's current state and returns
 /// its sequence number.
-pub fn create_snapshot(env: &Env, vault_id: u64, vault: &Vault) -> u32 {
+pub fn create_snapshot(env: &Env, vault_id: u64, vault: &Vault) -> Result<u32, ContractError> {
     let sequence = get_snapshot_count(env, vault_id);
     let is_full = sequence.is_multiple_of(FULL_SNAPSHOT_INTERVAL);
 
@@ -218,13 +220,13 @@ pub fn create_snapshot(env: &Env, vault_id: u64, vault: &Vault) -> u32 {
     let previous = if is_full {
         empty_fields(env)
     } else {
-        replay_fields(env, vault_id, sequence - 1)
+        replay_fields(env, vault_id, sequence - 1)?
     };
 
     let mut deltas = Vec::new(env);
     let mut stored_size: u32 = 0;
     for i in 0..VAULT_FIELD_COUNT {
-        let next = current.get(i).unwrap();
+        let next = current.get(i).ok_or(ContractError::SnapshotCorrupted)?;
         let prev = previous.get(i).unwrap_or_else(|| Bytes::new(env));
         if !is_full && next == prev {
             continue;
@@ -256,15 +258,15 @@ pub fn create_snapshot(env: &Env, vault_id: u64, vault: &Vault) -> u32 {
         (INCR_SNAPSHOT_TOPIC, vault_id),
         (sequence, is_full, full_size, stored_size),
     );
-    sequence
+    Ok(sequence)
 }
 
 /// Reconstructs the full vault state at `sequence`, verifying it against the
 /// state hash recorded when the snapshot was taken.
 pub fn reconstruct(env: &Env, vault_id: u64, sequence: u32) -> Result<Vault, ContractError> {
     let snap = get_snapshot(env, vault_id, sequence).ok_or(ContractError::SnapshotNotFound)?;
-    let fields = replay_fields(env, vault_id, sequence);
-    let vault = decode_fields(env, &fields);
+    let fields = replay_fields(env, vault_id, sequence)?;
+    let vault = decode_fields(env, &fields)?;
     let (hash, _) = state_hash(env, &vault);
     if hash != snap.state_hash {
         return Err(ContractError::SnapshotCorrupted);

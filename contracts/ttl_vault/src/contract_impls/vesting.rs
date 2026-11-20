@@ -61,7 +61,12 @@ impl TtlVaultContract {
         if interval == 0 || num_installments == 0 {
             return Err(ContractError::InvalidInterval);
         }
-        let end_time = start_time + (interval as u64 * num_installments as u64);
+        let duration = (interval as u64)
+            .checked_mul(num_installments as u64)
+            .ok_or(ContractError::InvalidVestingSchedule)?;
+        let end_time = start_time
+            .checked_add(duration)
+            .ok_or(ContractError::InvalidVestingSchedule)?;
         if end_time <= start_time {
             return Err(ContractError::InvalidVestingSchedule);
         }
@@ -84,7 +89,7 @@ impl TtlVaultContract {
             {
                 total_scheduled = total_scheduled
                     .checked_add(s.total_amount)
-                    .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
+                    .ok_or(ContractError::BalanceOverflow)?;
             }
         }
         if total_scheduled > vault.balance {
@@ -167,8 +172,13 @@ impl TtlVaultContract {
             .ok_or(ContractError::VestingNotFound)?;
 
         // Calculate unclaimed amount
+        if schedule.num_installments == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
         let per_installment = schedule.total_amount / (schedule.num_installments as i128);
-        let claimed_amount = per_installment * (schedule.claimed_installments as i128);
+        let claimed_amount = per_installment
+            .checked_mul(schedule.claimed_installments as i128)
+            .ok_or(ContractError::BalanceOverflow)?;
         let unclaimed = schedule.total_amount.saturating_sub(claimed_amount);
 
         // Return unclaimed to vault
@@ -317,6 +327,9 @@ impl TtlVaultContract {
             return Err(ContractError::NothingToClaimYet);
         }
 
+        if schedule.interval == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
         let elapsed = now - schedule.start_time;
         let unlocked =
             ((elapsed / schedule.interval) + 1).min(schedule.num_installments as u64) as u32;
@@ -329,7 +342,9 @@ impl TtlVaultContract {
         let amount = if unlocked >= schedule.num_installments {
             vault.balance
         } else {
-            per_installment * claimable as i128
+            per_installment
+                .checked_mul(claimable as i128)
+                .ok_or(ContractError::BalanceOverflow)?
         };
 
         let beneficiary = if vault.beneficiaries.is_empty() {
@@ -350,11 +365,14 @@ impl TtlVaultContract {
             .persistent()
             .extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
 
+        let reversal_deadline = now
+            .checked_add(reversal_window_seconds)
+            .ok_or(ContractError::InvalidInterval)?;
         let pending = VestingPendingClaim {
             amount,
             beneficiary,
             initiated_at: now,
-            reversal_deadline: now + reversal_window_seconds,
+            reversal_deadline,
             new_installments_claimed: unlocked,
             prev_installments_claimed,
         };
@@ -531,8 +549,14 @@ impl TtlVaultContract {
         }
 
         // Enforce cliff: no claims until start_time + cliff_period has elapsed
-        if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
-            return Err(ContractError::CliffNotReached);
+        if schedule.cliff_period > 0 {
+            let cliff_end = schedule
+                .start_time
+                .checked_add(schedule.cliff_period)
+                .ok_or(ContractError::InvalidVestingSchedule)?;
+            if now < cliff_end {
+                return Err(ContractError::CliffNotReached);
+            }
         }
 
         // Emit cliff reached event on the first claim after cliff (cliff_period > 0 and no prior claims)
@@ -553,6 +577,9 @@ impl TtlVaultContract {
         let unlocked = if accelerated {
             schedule.num_installments
         } else {
+            if schedule.interval == 0 {
+                return Err(ContractError::InvalidInterval);
+            }
             let elapsed = now.saturating_sub(schedule.start_time);
             ((elapsed / schedule.interval) + 1).min(schedule.num_installments as u64) as u32
         };
@@ -578,7 +605,9 @@ impl TtlVaultContract {
         let mut base_amount = if unlocked >= schedule.num_installments {
             vault.balance
         } else {
-            per_installment * claimable as i128
+            per_installment
+                .checked_mul(claimable as i128)
+                .ok_or(ContractError::BalanceOverflow)?
         };
 
         // Issue #541: add rolled over amounts if enabled
@@ -588,7 +617,9 @@ impl TtlVaultContract {
             .get::<DataKey, VestingRolloverConfig>(&DataKey::VestingRollover(vault_id))
         {
             if cfg.enabled && cfg.rolled_amount > 0 {
-                base_amount += cfg.rolled_amount;
+                base_amount = base_amount
+                    .checked_add(cfg.rolled_amount)
+                    .ok_or(ContractError::BalanceOverflow)?;
                 cfg.rolled_amount = 0;
                 env.storage()
                     .persistent()
@@ -616,10 +647,21 @@ impl TtlVaultContract {
             }
             if late_count > 0 {
                 let on_time_count = claimable.saturating_sub(late_count);
-                let on_time_amount = per_installment * on_time_count as i128;
-                let late_amount = per_installment * late_count as i128;
-                let penalty = late_amount * penalty_cfg.penalty_bps as i128 / 10_000;
-                let penalized = on_time_amount + late_amount - penalty;
+                let on_time_amount = per_installment
+                    .checked_mul(on_time_count as i128)
+                    .ok_or(ContractError::BalanceOverflow)?;
+                let late_amount = per_installment
+                    .checked_mul(late_count as i128)
+                    .ok_or(ContractError::BalanceOverflow)?;
+                let penalty = late_amount
+                    .checked_mul(penalty_cfg.penalty_bps as i128)
+                    .ok_or(ContractError::BalanceOverflow)?
+                    / 10_000;
+                let penalized = on_time_amount
+                    .checked_add(late_amount)
+                    .ok_or(ContractError::BalanceOverflow)?
+                    .checked_sub(penalty)
+                    .ok_or(ContractError::BalanceOverflow)?;
                 // For the final batch keep vault.balance as ceiling to avoid dust mismatch.
                 if unlocked >= schedule.num_installments {
                     penalized.min(vault.balance)
@@ -749,8 +791,17 @@ impl TtlVaultContract {
             {
                 let remaining = schedule.num_installments - schedule.claimed_installments;
                 if remaining > 0 {
+                    if schedule.num_installments == 0 {
+                        return Err(ContractError::InvalidInterval);
+                    }
                     let per_installment = schedule.total_amount / schedule.num_installments as i128;
-                    total_unvested += per_installment * remaining as i128;
+                    total_unvested = total_unvested
+                        .checked_add(
+                            per_installment
+                                .checked_mul(remaining as i128)
+                                .ok_or(ContractError::BalanceOverflow)?,
+                        )
+                        .ok_or(ContractError::BalanceOverflow)?;
                 }
             }
         }
@@ -1133,8 +1184,13 @@ impl TtlVaultContract {
                 .persistent()
                 .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(vault_id, i))
             {
+                if schedule.num_installments == 0 {
+                    continue;
+                }
                 let per_installment = schedule.total_amount / (schedule.num_installments as i128);
-                let claimed_amount = per_installment * (schedule.claimed_installments as i128);
+                let claimed_amount = per_installment
+                    .checked_mul(schedule.claimed_installments as i128)
+                    .unwrap_or(i128::MAX);
                 let unclaimed = schedule.total_amount.saturating_sub(claimed_amount);
                 total = total.saturating_add(unclaimed);
             }
@@ -1244,6 +1300,9 @@ impl TtlVaultContract {
                 if now < entry.start_time {
                     continue;
                 }
+                if entry.interval == 0 || entry.num_installments == 0 {
+                    return Err(ContractError::InvalidInterval);
+                }
                 let elapsed = now - entry.start_time;
                 let unlocked =
                     ((elapsed / entry.interval) + 1).min(entry.num_installments as u64) as u32;
@@ -1256,13 +1315,19 @@ impl TtlVaultContract {
                 // For simplicity here, we assume the BPS applies to the current balance + what was already claimed.
                 // But since we don't track original balance, we'll just use BPS * (current_balance / remaining_bps).
                 // Better: assume vault.balance is the total pool for staggered vesting if no other vesting is set.
-                let per_installment =
-                    (vault.balance * entry.bps as i128 / 10_000) / entry.num_installments as i128;
+                let beneficiary_share = vault
+                    .balance
+                    .checked_mul(entry.bps as i128)
+                    .ok_or(ContractError::BalanceOverflow)?
+                    / 10_000;
+                let per_installment = beneficiary_share / entry.num_installments as i128;
                 let amount = if unlocked >= entry.num_installments {
                     // Last installment takes the remaining share for this beneficiary
-                    vault.balance * entry.bps as i128 / 10_000
+                    beneficiary_share
                 } else {
-                    per_installment * claimable as i128
+                    per_installment
+                        .checked_mul(claimable as i128)
+                        .ok_or(ContractError::BalanceOverflow)?
                 };
 
                 if amount > 0 {
@@ -1272,7 +1337,9 @@ impl TtlVaultContract {
                     vault.balance -= amount;
                     entry.claimed_installments = unlocked;
                     entries.set(i, entry);
-                    total_amount += amount;
+                    total_amount = total_amount
+                        .checked_add(amount)
+                        .ok_or(ContractError::BalanceOverflow)?;
                 }
             }
         }
@@ -1574,11 +1641,22 @@ impl TtlVaultContract {
             if milestone.is_fulfilled && !milestone.claimed {
                 let is_last = i == num_milestones_usize - 1;
                 let share = if is_last {
-                    schedule.total_amount - total_claimable - schedule.claimed_amount
+                    schedule
+                        .total_amount
+                        .checked_sub(total_claimable)
+                        .ok_or(ContractError::BalanceOverflow)?
+                        .checked_sub(schedule.claimed_amount)
+                        .ok_or(ContractError::BalanceOverflow)?
                 } else {
-                    schedule.total_amount * (milestone.bps as i128) / 10_000
+                    schedule
+                        .total_amount
+                        .checked_mul(milestone.bps as i128)
+                        .ok_or(ContractError::BalanceOverflow)?
+                        / 10_000
                 };
-                total_claimable += share;
+                total_claimable = total_claimable
+                    .checked_add(share)
+                    .ok_or(ContractError::BalanceOverflow)?;
                 any_claimable = true;
             }
         }
@@ -1636,7 +1714,10 @@ impl TtlVaultContract {
 
         // Update state
         vault.balance -= total_claimable;
-        let new_claimed = schedule.claimed_amount + total_claimable;
+        let new_claimed = schedule
+            .claimed_amount
+            .checked_add(total_claimable)
+            .ok_or(ContractError::BalanceOverflow)?;
 
         // Mark milestones as claimed
         let mut updated_milestones = Vec::new(&env);

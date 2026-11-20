@@ -19,10 +19,22 @@ fuzz_target!(|data: &[u8]| {
     // property is tested over the whole valid input domain.
     env.budget().reset_unlimited();
     let original = Bytes::from_slice(&env, data);
-    let compressed = compression::compress_proof(&env, &original)
-        .expect("a non-empty proof must be compressible");
-    let decompressed = compression::decompress_proof(&env, &compressed, MAX_PROOF_SIZE)
-        .expect("a compressed proof within the size limit must be decompressible");
+
+    // Assert on the error return rather than panicking: a non-empty proof
+    // within the size limit must be compressible, so any `Err` is a failure.
+    let compressed = match compression::compress_proof(&env, &original) {
+        Ok(compressed) => compressed,
+        Err(err) => panic!("a non-empty proof must be compressible, got error: {err:?}"),
+    };
+
+    // Likewise, a compressed proof within the size limit must be
+    // decompressible; assert on the error return instead of panicking.
+    let decompressed = match compression::decompress_proof(&env, &compressed, MAX_PROOF_SIZE) {
+        Ok(decompressed) => decompressed,
+        Err(err) => panic!(
+            "a compressed proof within the size limit must be decompressible, got error: {err:?}"
+        ),
+    };
 
     assert_eq!(decompressed.len(), original.len());
     for i in 0..original.len() {

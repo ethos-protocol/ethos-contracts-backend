@@ -19,6 +19,8 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
+use crate::error::AppError;
+
 /// Configuration for a single endpoint's bulkhead.
 #[derive(Debug, Clone)]
 pub struct BulkheadConfig {
@@ -66,26 +68,41 @@ impl Bulkhead {
 }
 
 /// Error returned when a bulkhead rejects a request outright because its
-/// wait queue is already full.
+/// wait queue is already full, or because internal state could not be
+/// accessed safely.
 #[derive(Debug, thiserror::Error)]
-#[error("bulkhead queue full for endpoint {endpoint}")]
-pub struct BulkheadQueueFull {
-    pub endpoint: String,
+pub enum BulkheadError {
+    #[error("bulkhead queue full for endpoint {endpoint}")]
+    QueueFull { endpoint: String },
+    #[error(transparent)]
+    Internal(#[from] AppError),
 }
 
-impl IntoResponse for BulkheadQueueFull {
+impl BulkheadError {
+    /// Convenience constructor for a full wait queue.
+    pub fn queue_full(endpoint: impl Into<String>) -> Self {
+        Self::QueueFull {
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+impl IntoResponse for BulkheadError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "code": "bulkhead_queue_full",
-                "message": format!(
-                    "endpoint {} is overloaded, queue capacity exceeded",
-                    self.endpoint
-                ),
-            })),
-        )
-            .into_response()
+        match self {
+            BulkheadError::QueueFull { endpoint } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "code": "bulkhead_queue_full",
+                    "message": format!(
+                        "endpoint {} is overloaded, queue capacity exceeded",
+                        endpoint
+                    ),
+                })),
+            )
+                .into_response(),
+            BulkheadError::Internal(err) => err.into_response(),
+        }
     }
 }
 
@@ -129,9 +146,13 @@ impl BulkheadRegistry {
     }
 
     /// Registers (or replaces) an explicit configuration for `endpoint`.
-    pub fn configure(&self, endpoint: &str, config: BulkheadConfig) {
-        let mut guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
+    pub fn configure(&self, endpoint: &str, config: BulkheadConfig) -> Result<(), AppError> {
+        let mut guard = self
+            .bulkheads
+            .lock()
+            .map_err(|_| AppError::LockPoisoned("bulkhead registry"))?;
         guard.insert(endpoint.to_string(), Bulkhead::new(config));
+        Ok(())
     }
 
     fn key_for_path(path: &str) -> String {
@@ -147,11 +168,14 @@ impl BulkheadRegistry {
     /// Attempts to reserve a slot for `endpoint`. Returns an error
     /// immediately if the endpoint's wait queue is already full, otherwise
     /// waits (queues) until a concurrency slot frees up.
-    pub async fn acquire(&self, path: &str) -> Result<BulkheadPermit, BulkheadQueueFull> {
+    pub async fn acquire(&self, path: &str) -> Result<BulkheadPermit, BulkheadError> {
         let endpoint = Self::key_for_path(path);
 
         let (semaphore, metrics, max_queue_size) = {
-            let mut guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
+            let mut guard = self
+                .bulkheads
+                .lock()
+                .map_err(|_| AppError::LockPoisoned("bulkhead registry"))?;
             let bulkhead = guard
                 .entry(endpoint.clone())
                 .or_insert_with(|| Bulkhead::new(self.default_config.clone()));
@@ -180,13 +204,21 @@ impl BulkheadRegistry {
         if queued_now > max_queue_size {
             metrics.queued.fetch_sub(1, Ordering::SeqCst);
             metrics.rejected.fetch_add(1, Ordering::SeqCst);
-            return Err(BulkheadQueueFull { endpoint });
+            return Err(BulkheadError::queue_full(endpoint));
         }
 
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .expect("bulkhead semaphore should never be closed");
+        let permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                // The semaphore was closed; undo the queue accounting and
+                // surface the failure instead of panicking.
+                metrics.queued.fetch_sub(1, Ordering::SeqCst);
+                metrics.rejected.fetch_add(1, Ordering::SeqCst);
+                return Err(BulkheadError::Internal(AppError::Internal(
+                    "bulkhead semaphore closed".to_string(),
+                )));
+            }
+        };
         metrics.queued.fetch_sub(1, Ordering::SeqCst);
         metrics.active.fetch_add(1, Ordering::SeqCst);
 
@@ -196,8 +228,11 @@ impl BulkheadRegistry {
         })
     }
 
-    pub fn metrics_snapshot(&self) -> Vec<BulkheadMetricsSnapshot> {
-        let guard = self.bulkheads.lock().unwrap_or_else(|p| p.into_inner());
+    pub fn metrics_snapshot(&self) -> Result<Vec<BulkheadMetricsSnapshot>, AppError> {
+        let guard = self
+            .bulkheads
+            .lock()
+            .map_err(|_| AppError::LockPoisoned("bulkhead registry"))?;
         let mut snapshots: Vec<_> = guard
             .iter()
             .map(|(endpoint, b)| BulkheadMetricsSnapshot {
@@ -211,19 +246,19 @@ impl BulkheadRegistry {
             })
             .collect();
         snapshots.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
-        snapshots
+        Ok(snapshots)
     }
 
     /// Render all bulkhead metrics in Prometheus text exposition format (#364).
     ///
     /// Exposes per-bulkhead labels for `active_permits`, `queue_depth`,
     /// `rejected_total`, and `completed_total`.
-    pub fn render_prometheus(&self) -> String {
+    pub fn render_prometheus(&self) -> Result<String, AppError> {
         use std::fmt::Write as _;
-        let snapshots = self.metrics_snapshot();
+        let snapshots = self.metrics_snapshot()?;
         let mut out = String::new();
         if snapshots.is_empty() {
-            return out;
+            return Ok(out);
         }
 
         let _ = writeln!(
@@ -304,7 +339,7 @@ impl BulkheadRegistry {
             );
         }
 
-        out
+        Ok(out)
     }
 }
 
@@ -328,8 +363,8 @@ pub async fn bulkhead_middleware(
 
 async fn bulkhead_metrics_handler(
     State(registry): State<Arc<BulkheadRegistry>>,
-) -> Json<Vec<BulkheadMetricsSnapshot>> {
-    Json(registry.metrics_snapshot())
+) -> Result<Json<Vec<BulkheadMetricsSnapshot>>, AppError> {
+    Ok(Json(registry.metrics_snapshot()?))
 }
 
 /// Builds the `/admin/bulkheads/metrics` router with its own state; merge
@@ -351,9 +386,12 @@ mod tests {
             max_queue_size: 5,
         });
 
-        let permit1 = registry.acquire("/api/slow").await.unwrap();
-        let snapshot = registry.metrics_snapshot();
-        let slow = snapshot.iter().find(|s| s.endpoint == "/api/slow").unwrap();
+        let permit1 = registry.acquire("/api/slow").await.expect("acquire");
+        let snapshot = registry.metrics_snapshot().expect("snapshot");
+        let slow = snapshot
+            .iter()
+            .find(|s| s.endpoint == "/api/slow")
+            .expect("slow endpoint present");
         assert_eq!(slow.active, 1);
         drop(permit1);
     }
@@ -365,10 +403,10 @@ mod tests {
             max_queue_size: 0,
         }));
 
-        let _permit = registry.acquire("/api/slow").await.unwrap();
+        let _permit = registry.acquire("/api/slow").await.expect("acquire");
         // A second request has nowhere to queue and should be rejected.
         let result = registry.acquire("/api/slow").await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(BulkheadError::QueueFull { .. })));
     }
 
     #[tokio::test]
@@ -378,7 +416,7 @@ mod tests {
             max_queue_size: 0,
         });
 
-        let _slow_permit = registry.acquire("/api/slow").await.unwrap();
+        let _slow_permit = registry.acquire("/api/slow").await.expect("acquire");
         // A saturated /api/slow bulkhead must not affect /api/fast.
         let fast_permit = registry.acquire("/api/fast").await;
         assert!(fast_permit.is_ok());
@@ -392,8 +430,8 @@ mod tests {
         });
 
         // Acquire permit on /api/vaults/42 -> endpoint /api/vaults
-        let permit = registry.acquire("/api/vaults/42").await.unwrap();
-        let out = registry.render_prometheus();
+        let permit = registry.acquire("/api/vaults/42").await.expect("acquire");
+        let out = registry.render_prometheus().expect("render");
         assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 1"));
         assert!(out.contains("bulkhead_queue_depth{endpoint=\"/api/vaults\"} 0"));
         assert!(out.contains("bulkhead_rejected_total{endpoint=\"/api/vaults\"} 0"));
@@ -402,23 +440,50 @@ mod tests {
         assert!(out.contains("bulkhead_max_queue_size{endpoint=\"/api/vaults\"} 0"));
 
         // Second permit
-        let permit2 = registry.acquire("/api/vaults/43").await.unwrap();
-        let out = registry.render_prometheus();
+        let permit2 = registry.acquire("/api/vaults/43").await.expect("acquire");
+        let out = registry.render_prometheus().expect("render");
         assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 2"));
 
         // Third attempt exceeds capacity and max_queue_size=0 -> rejected!
         let rej = registry.acquire("/api/vaults/44").await;
-        assert!(rej.is_err());
+        assert!(matches!(rej, Err(BulkheadError::QueueFull { .. })));
 
-        let out = registry.render_prometheus();
+        let out = registry.render_prometheus().expect("render");
         assert!(out.contains("bulkhead_rejected_total{endpoint=\"/api/vaults\"} 1"));
 
         // Release permits -> completed_total increases, active decreases
         drop(permit);
         drop(permit2);
 
-        let out = registry.render_prometheus();
+        let out = registry.render_prometheus().expect("render");
         assert!(out.contains("bulkhead_active_permits{endpoint=\"/api/vaults\"} 0"));
         assert!(out.contains("bulkhead_completed_total{endpoint=\"/api/vaults\"} 2"));
+    }
+
+    #[tokio::test]
+    async fn poisoned_lock_does_not_panic_queue() {
+        let registry = Arc::new(BulkheadRegistry::new(BulkheadConfig {
+            max_concurrent: 1,
+            max_queue_size: 5,
+        }));
+
+        // Poison the registry mutex by panicking while holding the lock.
+        let poisoner = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.bulkheads.lock().expect("lock");
+            panic!("intentional panic to poison the bulkhead registry lock");
+        })
+        .join();
+
+        // Acquiring must return an error rather than panicking.
+        let result = registry.acquire("/api/slow").await;
+        assert!(matches!(
+            result,
+            Err(BulkheadError::Internal(AppError::LockPoisoned(_)))
+        ));
+
+        // Metrics snapshot must also surface the error instead of panicking.
+        assert!(registry.metrics_snapshot().is_err());
+        assert!(registry.render_prometheus().is_err());
     }
 }

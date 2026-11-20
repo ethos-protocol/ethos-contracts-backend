@@ -4,7 +4,11 @@ impl TtlVaultContract {
 
     /// Delegates beneficiary role to another address.
     /// Only the current beneficiary or the current delegate can call this.
-    pub fn delegate_beneficiary_role(env: Env, vault_id: u64, delegate_address: Address) {
+    pub fn delegate_beneficiary_role(
+        env: Env,
+        vault_id: u64,
+        delegate_address: Address,
+    ) -> Result<(), ContractError> {
         Self::assert_not_paused(&env);
         let vault = Self::load_vault(&env, vault_id);
 
@@ -20,15 +24,17 @@ impl TtlVaultContract {
 
         // The chain always has at least one entry: either loaded from storage (which is
         // only ever written non-empty, see below) or freshly seeded with the beneficiary.
+        // Guard defensively so a corrupted/empty stored chain yields a typed error
+        // instead of a panic.
         let current_delegate = chain
-            .get(chain.len() - 1)
-            .expect("chain is seeded with at least one entry and never stored empty");
+            .get(chain.len().checked_sub(1).ok_or(ContractError::InvalidBeneficiary)?)
+            .ok_or(ContractError::InvalidBeneficiary)?;
         current_delegate.require_auth();
 
         // Check if already in chain to prevent cycles
         for addr in chain.iter() {
             if addr == delegate_address {
-                panic_with_error!(&env, ContractError::InvalidBeneficiary);
+                return Err(ContractError::InvalidBeneficiary);
             }
         }
 
@@ -47,6 +53,7 @@ impl TtlVaultContract {
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(vault.check_in_interval),
         );
+        Ok(())
     }
 
     /// Gets the beneficiary delegation chain for a vault.
@@ -2562,11 +2569,16 @@ impl TtlVaultContract {
     /// * `vault_id`   - The vault to configure
     /// * `caller`     - Must be the vault owner (requires auth)
     /// * `thresholds` - Seconds-before-expiry values (duplicates ignored; max 10 entries)
-    pub fn set_countdown_config(env: Env, vault_id: u64, caller: Address, thresholds: Vec<u64>) {
+    pub fn set_countdown_config(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        thresholds: Vec<u64>,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
-            panic_with_error!(&env, ContractError::NotOwner);
+            return Err(ContractError::NotOwner);
         }
         let config = CountdownConfig {
             thresholds: thresholds.clone(),
@@ -2586,6 +2598,7 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((SET_COUNTDOWN_TOPIC, vault_id), thresholds);
+        Ok(())
     }
 
     /// Returns the countdown config for a vault, or the default (7d/3d/1d) if not set.
@@ -2614,12 +2627,11 @@ impl TtlVaultContract {
     ///
     /// # Returns
     /// The remaining TTL in seconds (0 if expired or vault not Locked)
-    pub fn check_countdown(env: Env, vault_id: u64) -> u64 {
-        let vault = Self::try_load_vault(&env, vault_id)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+    pub fn check_countdown(env: Env, vault_id: u64) -> Result<u64, ContractError> {
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
 
         if vault.status != ReleaseStatus::Locked {
-            return 0;
+            return Ok(0);
         }
 
         let ttl = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
@@ -2651,6 +2663,6 @@ impl TtlVaultContract {
                 .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         }
 
-        ttl
+        Ok(ttl)
     }
 }
