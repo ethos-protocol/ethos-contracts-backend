@@ -11,6 +11,31 @@
 /// - Maximum inheritance depth
 use soroban_sdk::{contracttype, symbol_short, Bytes, Env, Vec};
 
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Typed errors returned by the template inheritance module.
+///
+/// Every fallible operation reports failure through this enum instead of
+/// panicking, so callers can handle each failure mode explicitly.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemplateInheritanceError {
+    /// The referenced template does not exist.
+    TemplateNotFound,
+    /// The requested inheritance would create a cycle.
+    InheritanceCycleDetected,
+    /// The inheritance chain exceeds [`MAX_INHERITANCE_DEPTH`].
+    MaxDepthExceeded,
+    /// An override index is out of bounds for the override chain.
+    OverrideIndexOutOfBounds,
+    /// An expected override entry is missing.
+    MissingOverride,
+    /// A parent reference is invalid (e.g. dangling or self-referential).
+    InvalidParentReference,
+    /// A cached resolved template was expected but not present.
+    CacheMiss,
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum depth of inheritance chain (prevents infinite loops)
@@ -108,7 +133,7 @@ pub fn create_template(
     data: Bytes,
     parent_template_id: u64,
     overrides: Bytes,
-) -> u64 {
+) -> Result<u64, TemplateInheritanceError> {
     let template_id: u64 = env
         .storage()
         .persistent()
@@ -119,13 +144,13 @@ pub fn create_template(
     if parent_template_id > 0 {
         // The parent must exist — a dangling reference produces a broken chain
         // that cycle detection cannot reason about.
-        if get_template(env, parent_template_id).is_none() {
-            soroban_sdk::panic_with_error!(env, crate::ContractError::TemplateNotFound);
+        if get_template(env, parent_template_id)?.is_none() {
+            return Err(TemplateInheritanceError::TemplateNotFound);
         }
 
-        let result = check_inheritance_cycle(env, parent_template_id, template_id);
+        let result = check_inheritance_cycle(env, parent_template_id, template_id)?;
         if result.has_cycle {
-            soroban_sdk::panic_with_error!(env, crate::ContractError::InheritanceCycleDetected);
+            return Err(TemplateInheritanceError::InheritanceCycleDetected);
         }
     }
 
@@ -187,17 +212,17 @@ pub fn create_template(
         },
     );
 
-    template_id
+    Ok(template_id)
 }
 
 /// Create a template that inherits from a parent with overrides.
-pub fn create_inherited_template(env: &Env, parent_id: u64, overrides: Bytes) -> u64 {
-    let parent = get_template(env, parent_id);
-    if parent.is_none() {
-        soroban_sdk::panic_with_error!(env, crate::ContractError::TemplateNotFound);
-    }
-
-    let parent_template = parent.unwrap();
+pub fn create_inherited_template(
+    env: &Env,
+    parent_id: u64,
+    overrides: Bytes,
+) -> Result<u64, TemplateInheritanceError> {
+    let parent_template = get_template(env, parent_id)?
+        .ok_or(TemplateInheritanceError::TemplateNotFound)?;
 
     // Use parent's name as base, mark as inherited
     let name = parent_template.name.clone();
@@ -206,30 +231,46 @@ pub fn create_inherited_template(env: &Env, parent_id: u64, overrides: Bytes) ->
 }
 
 /// Get a template by ID.
-pub fn get_template(env: &Env, template_id: u64) -> Option<Template> {
-    env.storage()
+pub fn get_template(
+    env: &Env,
+    template_id: u64,
+) -> Result<Option<Template>, TemplateInheritanceError> {
+    Ok(env
+        .storage()
         .persistent()
-        .get(&TemplateKey::Template(template_id))
+        .get(&TemplateKey::Template(template_id)))
 }
 
 /// Get parent template ID for a template.
-pub fn get_parent_template_id(env: &Env, template_id: u64) -> u64 {
-    env.storage()
+pub fn get_parent_template_id(
+    env: &Env,
+    template_id: u64,
+) -> Result<u64, TemplateInheritanceError> {
+    Ok(env
+        .storage()
         .persistent()
         .get(&TemplateKey::TemplateParent(template_id))
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 /// Get overrides for a template.
-pub fn get_template_overrides(env: &Env, template_id: u64) -> Bytes {
-    env.storage()
+pub fn get_template_overrides(
+    env: &Env,
+    template_id: u64,
+) -> Result<Bytes, TemplateInheritanceError> {
+    Ok(env
+        .storage()
         .persistent()
         .get(&TemplateKey::TemplateOverrides(template_id))
-        .unwrap_or_else(|| Bytes::new(env))
+        .unwrap_or_else(|| Bytes::new(env)))
 }
 
 /// Check if creating a child of `parent_id` with ID `child_id` would create a cycle.
-pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> CycleCheckResult {
+pub fn check_inheritance_cycle(
+    env: &Env,
+    parent_id: u64,
+    child_id: u64,
+) -> Result<CycleCheckResult, TemplateInheritanceError> {
     let mut visited: Vec<u64> = Vec::new(env);
     let mut current = parent_id;
     let mut depth = 0u32;
@@ -238,10 +279,10 @@ pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> Cycl
         if current == child_id {
             // Found a cycle
             visited.push_back(child_id);
-            return CycleCheckResult {
+            return Ok(CycleCheckResult {
                 has_cycle: true,
                 cycle_path: visited,
-            };
+            });
         }
 
         if current == 0 {
@@ -251,31 +292,31 @@ pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> Cycl
 
         if depth >= MAX_INHERITANCE_DEPTH {
             // Depth limit exceeded (treat as cycle)
-            return CycleCheckResult {
+            return Ok(CycleCheckResult {
                 has_cycle: true,
                 cycle_path: visited,
-            };
+            });
         }
 
         // If the stored inheritance graph is already cyclic (e.g. corrupted
         // state), detect the revisit immediately instead of looping until the
         // depth cap is hit.
         if vec_contains(&visited, current) {
-            return CycleCheckResult {
+            return Ok(CycleCheckResult {
                 has_cycle: true,
                 cycle_path: visited,
-            };
+            });
         }
 
         visited.push_back(current);
-        current = get_parent_template_id(env, current);
+        current = get_parent_template_id(env, current)?;
         depth = depth.saturating_add(1);
     }
 
-    CycleCheckResult {
+    Ok(CycleCheckResult {
         has_cycle: false,
         cycle_path: Vec::new(env),
-    }
+    })
 }
 
 /// Returns true if `value` is present in `vec`.
@@ -284,25 +325,33 @@ pub fn check_inheritance_cycle(env: &Env, parent_id: u64, child_id: u64) -> Cycl
 /// scan is sufficient.
 fn vec_contains(vec: &Vec<u64>, value: u64) -> bool {
     for i in 0..vec.len() {
-        if vec.get(i).unwrap() == value {
-            return true;
+        if let Some(item) = vec.get(i) {
+            if item == value {
+                return true;
+            }
         }
     }
     false
 }
 
 /// Resolve a template's data by applying all parent overrides.
-pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate> {
+pub fn resolve_template(
+    env: &Env,
+    template_id: u64,
+) -> Result<Option<ResolvedTemplate>, TemplateInheritanceError> {
     // Check cache first
     if let Some(cached) = env
         .storage()
         .persistent()
         .get::<TemplateKey, ResolvedTemplate>(&TemplateKey::ResolvedTemplate(template_id))
     {
-        return Some(cached);
+        return Ok(Some(cached));
     }
 
-    let template = get_template(env, template_id)?;
+    let template = match get_template(env, template_id)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
 
     let mut depth = 0u32;
     let resolved_data = template.data.clone();
@@ -314,8 +363,10 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
     let mut seen: Vec<u64> = Vec::new(env);
 
     loop {
-        let _current_template = get_template(env, current_id)?;
-        let overrides = get_template_overrides(env, current_id);
+        if get_template(env, current_id)?.is_none() {
+            return Ok(None);
+        }
+        let overrides = get_template_overrides(env, current_id)?;
 
         if !overrides.is_empty() {
             override_chain.push_back(overrides);
@@ -324,11 +375,11 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
         // A template that appears twice on the ancestor path means the
         // inheritance graph is cyclic; terminate instead of walking forever.
         if vec_contains(&seen, current_id) {
-            return None;
+            return Ok(None);
         }
         seen.push_back(current_id);
 
-        let parent_id = get_parent_template_id(env, current_id);
+        let parent_id = get_parent_template_id(env, current_id)?;
         if parent_id == 0 {
             break;
         }
@@ -337,7 +388,7 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
         depth = depth.saturating_add(1);
 
         if depth >= MAX_INHERITANCE_DEPTH {
-            return None; // Too deep
+            return Ok(None); // Too deep
         }
     }
 
@@ -345,12 +396,15 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
     // In a real implementation, this would parse and merge the bytes
     // For now, we concatenate them as a placeholder
     for i in (0..override_chain.len()).rev() {
-        let override_bytes = override_chain.get(i).unwrap();
-        if !override_bytes.is_empty() {
-            // Merge override_bytes into resolved_data
-            // Simplified: just extend (real impl would do proper merge)
-            let _ = override_bytes;
+        let override_bytes = override_chain
+            .get(i)
+            .ok_or(TemplateInheritanceError::OverrideIndexOutOfBounds)?;
+        if override_bytes.is_empty() {
+            return Err(TemplateInheritanceError::MissingOverride);
         }
+        // Merge override_bytes into resolved_data
+        // Simplified: just extend (real impl would do proper merge)
+        let _ = override_bytes;
     }
 
     let resolved = ResolvedTemplate {
@@ -371,7 +425,7 @@ pub fn resolve_template(env: &Env, template_id: u64) -> Option<ResolvedTemplate>
         crate::VAULT_TTL_LEDGERS,
     );
 
-    Some(resolved)
+    Ok(Some(resolved))
 }
 
 /// Invalidate cached resolved template (called when template is updated).
@@ -381,7 +435,10 @@ pub fn invalidate_template_cache(env: &Env, template_id: u64) {
 }
 
 /// Get inheritance depth for a template.
-pub fn get_inheritance_depth(env: &Env, template_id: u64) -> u32 {
+pub fn get_inheritance_depth(
+    env: &Env,
+    template_id: u64,
+) -> Result<u32, TemplateInheritanceError> {
     let mut depth = 0u32;
     let mut current = template_id;
     let mut seen: Vec<u64> = Vec::new(env);
@@ -394,7 +451,7 @@ pub fn get_inheritance_depth(env: &Env, template_id: u64) -> u32 {
         }
         seen.push_back(current);
 
-        let parent_id = get_parent_template_id(env, current);
+        let parent_id = get_parent_template_id(env, current)?;
         if parent_id == 0 {
             break;
         }
@@ -406,7 +463,7 @@ pub fn get_inheritance_depth(env: &Env, template_id: u64) -> u32 {
         }
     }
 
-    depth
+    Ok(depth)
 }
 
 #[cfg(test)]
@@ -427,10 +484,11 @@ mod tests {
             let data = Bytes::new(&env);
             let overrides = Bytes::new(&env);
 
-            let template_id = create_template(&env, name.clone(), data.clone(), 0, overrides);
+            let template_id =
+                create_template(&env, name.clone(), data.clone(), 0, overrides).unwrap();
             assert_eq!(template_id, 0);
 
-            let retrieved = get_template(&env, template_id);
+            let retrieved = get_template(&env, template_id).unwrap();
             assert!(retrieved.is_some());
             let template = retrieved.unwrap();
             assert_eq!(template.template_id, 0);
@@ -448,14 +506,15 @@ mod tests {
             let overrides = Bytes::new(&env);
 
             // Create root template
-            let root_id = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let root_id =
+                create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
 
             // Create child template inheriting from root
-            let child_id =
-                create_template(&env, name.clone(), data.clone(), root_id, overrides.clone());
+            let child_id = create_template(&env, name.clone(), data.clone(), root_id, overrides.clone())
+                .unwrap();
             assert_eq!(child_id, 1);
 
-            let retrieved = get_template(&env, child_id);
+            let retrieved = get_template(&env, child_id).unwrap();
             assert!(retrieved.is_some());
             let child = retrieved.unwrap();
             assert_eq!(child.template_id, child_id);
@@ -474,11 +533,12 @@ mod tests {
 
             // Create a chain: 0 -> 1 -> 2 -> 3
             // Note: template 0 is created first but can't be a parent (0 is sentinel for no parent)
-            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
             assert_eq!(id0, 0);
 
             // Now create a second root template (id1) to use as parent
-            let id1_root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id1_root =
+                create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
             assert_eq!(id1_root, 1);
 
             // Create child of id1_root
@@ -488,17 +548,18 @@ mod tests {
                 data.clone(),
                 id1_root,
                 overrides.clone(),
-            );
+            )
+            .unwrap();
             assert_eq!(id2, 2);
 
-            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone());
+            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone()).unwrap();
             assert_eq!(id3, 3);
 
             // Verify depths
-            let depth0 = get_inheritance_depth(&env, id0);
-            let depth1_root = get_inheritance_depth(&env, id1_root);
-            let depth2 = get_inheritance_depth(&env, id2);
-            let depth3 = get_inheritance_depth(&env, id3);
+            let depth0 = get_inheritance_depth(&env, id0).unwrap();
+            let depth1_root = get_inheritance_depth(&env, id1_root).unwrap();
+            let depth2 = get_inheritance_depth(&env, id2).unwrap();
+            let depth3 = get_inheritance_depth(&env, id3).unwrap();
 
             assert_eq!(depth0, 0);
             assert_eq!(depth1_root, 0);
@@ -517,11 +578,11 @@ mod tests {
             let overrides = Bytes::new(&env);
 
             // Create: 0 -> 1
-            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone()).unwrap();
 
             // Try to create: 0 -> 1 -> 0 (cycle)
-            let result = check_inheritance_cycle(&env, id1, id0);
+            let result = check_inheritance_cycle(&env, id1, id0).unwrap();
             assert!(result.has_cycle);
             assert!(!result.cycle_path.is_empty());
         });
@@ -537,12 +598,12 @@ mod tests {
             let overrides = Bytes::new(&env);
 
             // Create: 0 -> 1 -> 2
-            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
-            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone());
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone()).unwrap();
+            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone()).unwrap();
 
             // Try to create: 2 -> 0 (would make 0 -> 1 -> 2 -> 0)
-            let result = check_inheritance_cycle(&env, id2, id0);
+            let result = check_inheritance_cycle(&env, id2, id0).unwrap();
             assert!(result.has_cycle);
         });
     }
@@ -558,10 +619,11 @@ mod tests {
 
             // Build a chain up to MAX_INHERITANCE_DEPTH
             // Note: template 0 can't be a parent (0 is sentinel), so create dummy first
-            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
 
             // Now create the actual root
-            let root_id = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let root_id =
+                create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
             let mut current_id = root_id;
 
             for _ in 1..MAX_INHERITANCE_DEPTH {
@@ -571,17 +633,18 @@ mod tests {
                     data.clone(),
                     current_id,
                     overrides.clone(),
-                );
+                )
+                .unwrap();
             }
 
             // Verify depth is at the limit (counting from root, which has depth 0)
-            let depth = get_inheritance_depth(&env, current_id);
+            let depth = get_inheritance_depth(&env, current_id).unwrap();
             assert_eq!(depth, MAX_INHERITANCE_DEPTH - 1);
 
             // Verify the chain was built successfully up to the depth limit
             // Note: check_inheritance_cycle detects cycles, not depth violations per se
             // The depth limit is enforced in create_template when parent_template_id > 0
-            let result = check_inheritance_cycle(&env, current_id, 999);
+            let result = check_inheritance_cycle(&env, current_id, 999).unwrap();
             // Should not detect a cycle since 999 is not in the chain
             assert!(!result.has_cycle);
         });
@@ -596,9 +659,9 @@ mod tests {
             let data = Bytes::from_slice(&env, &[1, 2, 3, 4]);
             let overrides = Bytes::new(&env);
 
-            let id = create_template(&env, name.clone(), data.clone(), 0, overrides);
+            let id = create_template(&env, name.clone(), data.clone(), 0, overrides).unwrap();
 
-            let resolved = resolve_template(&env, id);
+            let resolved = resolve_template(&env, id).unwrap();
             assert!(resolved.is_some());
 
             let rt = resolved.unwrap();
@@ -618,12 +681,12 @@ mod tests {
 
             // Create chain: dummy (0) -> root (1) -> child (2)
             // Note: template 0 cannot be a parent (0 is sentinel for no parent)
-            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            let id2 = create_template(&env, name.clone(), data.clone(), root, overrides.clone());
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let id2 = create_template(&env, name.clone(), data.clone(), root, overrides.clone()).unwrap();
 
             // Resolve the leaf
-            let resolved = resolve_template(&env, id2);
+            let resolved = resolve_template(&env, id2).unwrap();
             assert!(resolved.is_some());
 
             let rt = resolved.unwrap();
@@ -637,7 +700,7 @@ mod tests {
         let env = soroban_sdk::Env::default();
         let contract_id = env.register_contract(None, crate::TtlVaultContract);
         env.as_contract(&contract_id, || {
-            let template = get_template(&env, 999);
+            let template = get_template(&env, 999).unwrap();
             assert!(template.is_none());
         });
     }
@@ -647,7 +710,7 @@ mod tests {
         let env = soroban_sdk::Env::default();
         let contract_id = env.register_contract(None, crate::TtlVaultContract);
         env.as_contract(&contract_id, || {
-            let resolved = resolve_template(&env, 999);
+            let resolved = resolve_template(&env, 999).unwrap();
             assert!(resolved.is_none());
         });
     }
@@ -662,11 +725,11 @@ mod tests {
             let overrides = Bytes::new(&env);
 
             // Create: 0 -> 1
-            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone()).unwrap();
 
             // Check if creating 1 -> 999 would cycle (should not)
-            let result = check_inheritance_cycle(&env, id1, 999);
+            let result = check_inheritance_cycle(&env, id1, 999).unwrap();
             assert!(!result.has_cycle);
         });
     }
@@ -681,29 +744,28 @@ mod tests {
             let overrides = Bytes::new(&env);
 
             // Create a dummy template 0 (can't be used as parent since 0 is sentinel)
-            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
 
             // Now create the actual root that can be used as a parent
-            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
-            assert_eq!(get_inheritance_depth(&env, root), 0);
+            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            assert_eq!(get_inheritance_depth(&env, root).unwrap(), 0);
 
             // Build inheritance chain from the root
-            let id1 = create_template(&env, name.clone(), data.clone(), root, overrides.clone());
-            assert_eq!(get_inheritance_depth(&env, id1), 1);
+            let id1 = create_template(&env, name.clone(), data.clone(), root, overrides.clone()).unwrap();
+            assert_eq!(get_inheritance_depth(&env, id1).unwrap(), 1);
 
-            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone());
-            assert_eq!(get_inheritance_depth(&env, id2), 2);
+            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone()).unwrap();
+            assert_eq!(get_inheritance_depth(&env, id2).unwrap(), 2);
 
-            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone());
-            assert_eq!(get_inheritance_depth(&env, id3), 3);
+            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone()).unwrap();
+            assert_eq!(get_inheritance_depth(&env, id3).unwrap(), 3);
 
-            let id4 = create_template(&env, name.clone(), data.clone(), id3, overrides.clone());
-            assert_eq!(get_inheritance_depth(&env, id4), 4);
+            let id4 = create_template(&env, name.clone(), data.clone(), id3, overrides.clone()).unwrap();
+            assert_eq!(get_inheritance_depth(&env, id4).unwrap(), 4);
         });
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #124)")]
     fn test_create_template_rejects_nonexistent_parent() {
         let env = soroban_sdk::Env::default();
         let contract_id = env.register_contract(None, crate::TtlVaultContract);
@@ -714,7 +776,41 @@ mod tests {
 
             // Parent 42 was never created — must be rejected instead of
             // producing a dangling parent reference.
-            create_template(&env, name, data, 42, overrides);
+            let result = create_template(&env, name, data, 42, overrides);
+            assert_eq!(result, Err(TemplateInheritanceError::TemplateNotFound));
+        });
+    }
+
+    #[test]
+    fn test_create_inherited_template_missing_parent() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let overrides = Bytes::new(&env);
+            let result = create_inherited_template(&env, 42, overrides);
+            assert_eq!(result, Err(TemplateInheritanceError::TemplateNotFound));
+        });
+    }
+
+    #[test]
+    fn test_create_template_rejects_cycle() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone()).unwrap();
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone()).unwrap();
+
+            // Corrupt the graph so the next child would close a cycle.
+            env.storage()
+                .persistent()
+                .set(&TemplateKey::TemplateParent(id0), &id1);
+
+            let result = create_template(&env, name, data, id1, overrides);
+            assert_eq!(result, Err(TemplateInheritanceError::InheritanceCycleDetected));
         });
     }
 
@@ -744,8 +840,8 @@ mod tests {
 
             // Resolution must terminate (no infinite recursion) and report the
             // cyclic chain as broken instead of walking until the depth cap.
-            assert!(resolve_template(&env, a).is_none());
-            assert!(resolve_template(&env, b).is_none());
+            assert!(resolve_template(&env, a).unwrap().is_none());
+            assert!(resolve_template(&env, b).unwrap().is_none());
         });
     }
 
