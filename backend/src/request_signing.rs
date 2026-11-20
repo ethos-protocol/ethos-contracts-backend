@@ -96,6 +96,15 @@ impl SignatureVerifier {
             };
         }
 
+        // Ed25519 is not implemented yet, so reject it explicitly instead of
+        // failing every signature (#894).
+        if req.algorithm.as_deref() == Some("ed25519") {
+            return VerificationResult {
+                valid: false,
+                reason: Some("ed25519 signing is not supported yet".to_string()),
+            };
+        }
+
         // 3. Verify signature
         let algorithm = parse_algorithm(&req.algorithm);
         let expected_sig = sign_request(&req.body, secret, algorithm);

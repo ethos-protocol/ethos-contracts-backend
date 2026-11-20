@@ -215,7 +215,10 @@ pub fn process_job(store: &JobStore, id: &str) {
     // Simulate processing — real implementations would call domain logic here.
     let (operation, total_items, request_id) = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let job = s.get(id).unwrap();
+        // A job removed while it was queued is not an error to panic on (#893).
+        let Some(job) = s.get(id) else {
+            return;
+        };
         (
             job.operation.clone(),
             job.total_items,

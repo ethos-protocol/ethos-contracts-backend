@@ -448,6 +448,7 @@ fn dispatch_notification(channel: &AlertChannel, rule: &AlertRule, message: &str
                 message = %message,
                 "ALERT dispatched via Slack"
             );
+            deliver_http("slack", rule, message);
         }
         AlertChannel::Email => {
             tracing::info!(
@@ -468,6 +469,7 @@ fn dispatch_notification(channel: &AlertChannel, rule: &AlertRule, message: &str
                 message = %message,
                 "ALERT dispatched via Webhook"
             );
+            deliver_http("webhook", rule, message);
         }
         AlertChannel::Log => {
             tracing::warn!(
@@ -482,6 +484,39 @@ fn dispatch_notification(channel: &AlertChannel, rule: &AlertRule, message: &str
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+/// Posts the alert to each Slack or webhook destination (#892).
+///
+/// Runs on the current Tokio runtime and never blocks the caller. Email has no
+/// provider in this codebase, so it stays log-only. Failures are logged, and
+/// the error text omits the URL because a webhook URL can carry a secret.
+fn deliver_http(channel: &'static str, rule: &AlertRule, message: &str) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(channel, rule_name = %rule.name, "no async runtime, alert not delivered");
+        return;
+    };
+    let payload = serde_json::json!({
+        "text": message,
+        "rule": rule.name,
+        "severity": format!("{:?}", rule.severity),
+    });
+    for destination in rule.destinations.clone() {
+        let payload = payload.clone();
+        handle.spawn(async move {
+            match reqwest::Client::new().post(&destination).json(&payload).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!(channel, "alert delivered");
+                }
+                Ok(resp) => {
+                    tracing::error!(channel, status = %resp.status(), "alert delivery rejected");
+                }
+                Err(err) => {
+                    tracing::error!(channel, error = %err.without_url(), "alert delivery failed");
+                }
+            }
+        });
+    }
+}
 
 /// Request body for `POST /alerts/rules`.
 #[derive(Debug, Deserialize)]
