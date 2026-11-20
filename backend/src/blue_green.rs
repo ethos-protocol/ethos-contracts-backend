@@ -42,6 +42,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::metrics::Metrics;
+
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Which slot is currently active (receiving live traffic).
@@ -165,12 +167,20 @@ pub type BlueGreenStore = Arc<Mutex<HashMap<String, BlueGreenDeployment>>>;
 #[derive(Clone)]
 pub struct BlueGreenState {
     pub store: BlueGreenStore,
+    pub metrics: Arc<Metrics>,
 }
 
 impl BlueGreenState {
     pub fn new() -> Self {
+        Self::with_metrics(Arc::new(Metrics::new()))
+    }
+
+    /// Construct state sharing an existing metrics registry so blue-green
+    /// metrics are exposed alongside the rest of the service's metrics.
+    pub fn with_metrics(metrics: Arc<Metrics>) -> Self {
         Self {
             store: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 }
@@ -415,6 +425,13 @@ pub async fn rollback_blue_green(
         body.reason
     ));
 
+    let service = deployment.service.clone();
+    state
+        .metrics
+        .bluegreen_rollbacks_total
+        .with_label_values(&[service.as_str()])
+        .inc();
+
     tracing::warn!(
         deployment_id = %id,
         rolled_back_from = %current_active,
@@ -445,6 +462,14 @@ pub async fn report_health(
     slot.last_health_check = Some(now);
     deployment.updated_at = now;
 
+    let service = deployment.service.clone();
+    let slot_name = body.slot.to_string();
+    state
+        .metrics
+        .bluegreen_slot_health
+        .with_label_values(&[service.as_str(), slot_name.as_str()])
+        .set(slot_health_metric_value(body.health));
+
     // If the active slot is now unhealthy, mark the overall deployment as unhealthy.
     let active_health = deployment.active().health;
     if active_health == SlotHealth::Unhealthy {
@@ -461,6 +486,15 @@ pub async fn report_health(
     }
 
     Ok(Json(deployment.clone()))
+}
+
+/// Map a [`SlotHealth`] to the numeric value exported via
+/// `ethos_protocol_bluegreen_slot_health` (1 = healthy, 0 = otherwise).
+fn slot_health_metric_value(health: SlotHealth) -> f64 {
+    match health {
+        SlotHealth::Healthy => 1.0,
+        SlotHealth::Unknown | SlotHealth::Degraded | SlotHealth::Unhealthy => 0.0,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -640,5 +674,64 @@ mod tests {
     fn active_slot_opposite() {
         assert_eq!(ActiveSlot::Blue.opposite(), ActiveSlot::Green);
         assert_eq!(ActiveSlot::Green.opposite(), ActiveSlot::Blue);
+    }
+
+    #[tokio::test]
+    async fn health_report_and_rollback_emit_metrics() {
+        let state = Arc::new(BlueGreenState::new());
+        let d = create_deployment(&state).await;
+
+        let _ = report_health(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(ReportHealthRequest {
+                slot: ActiveSlot::Green,
+                health: SlotHealth::Healthy,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = report_health(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(ReportHealthRequest {
+                slot: ActiveSlot::Blue,
+                health: SlotHealth::Unhealthy,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = rollback_blue_green(
+            State(Arc::clone(&state)),
+            Path(d.id.clone()),
+            Json(RollbackBlueGreenRequest { reason: "test".into() }),
+        )
+        .await
+        .unwrap();
+
+        let rendered = state.metrics.render();
+
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_slot_health{service=\"vault-api\",slot=\"green\"} 1"
+            ),
+            "expected healthy green slot metric, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_slot_health{service=\"vault-api\",slot=\"blue\"} 0"
+            ),
+            "expected unhealthy blue slot metric, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "ethos_protocol_bluegreen_rollbacks_total{service=\"vault-api\"} 1"
+            ),
+            "expected rollback counter, got:\n{rendered}"
+        );
     }
 }

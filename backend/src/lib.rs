@@ -8,6 +8,8 @@ pub mod anomaly_detection;
 pub mod anomaly_explanation;
 #[cfg(test)]
 mod api_versioning_tests;
+#[cfg(test)]
+mod alert_metrics_tests;
 pub mod audit;
 pub mod backup_validation;
 pub mod batch_conditional_completion;

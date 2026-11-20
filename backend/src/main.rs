@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -126,6 +126,55 @@ mod stellar_integration_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod http_duration_metrics_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_http_request_duration_histogram() {
+        let state = AppState::for_tests();
+        let app = build_router(state);
+
+        // Drive one request through the middleware so the histogram has samples.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("ethos_protocol_http_request_duration_seconds"),
+            "metrics output missing request duration histogram:\n{text}"
+        );
+        assert!(
+            text.contains("ethos_protocol_http_request_duration_seconds_bucket"),
+            "metrics output missing request duration histogram buckets:\n{text}"
+        );
+    }
+}
+
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
     if allowed_origins.is_empty() {
@@ -147,6 +196,31 @@ fn build_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers(tower_http::cors::Any)
+}
+
+/// Records every HTTP request's duration into the
+/// `ethos_protocol_http_request_duration_seconds` histogram (#947).
+///
+/// The `EthosHighApiLatencyP99` alert and the latency dashboards query the
+/// `_bucket` series of this metric, so it must be exported from `/metrics`.
+async fn http_duration_middleware(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().as_str().to_string();
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    ethos_protocol_backend::metrics::observe_http_request_duration(
+        &method, &path, &status, elapsed,
+    );
+
+    response
 }
 
 async fn profile_http_request(
@@ -194,6 +268,7 @@ async fn metrics_handler(State(state): State<AppState>) -> String {
     out.push_str(&state.load_shedder.render_prometheus());
     out.push_str(&state.batcher.render_prometheus());
     out.push_str(&state.scaler.render_prometheus());
+    out.push_str(&ethos_protocol_backend::metrics::render_http_request_duration());
     out
 }
 
@@ -444,6 +519,10 @@ pub fn build_router(state: AppState) -> Router {
             state.profiler_state.clone(),
             profile_http_request,
         ))
+        // ── HTTP request duration histogram (#947) ─────────────────────────
+        // Feeds `ethos_protocol_http_request_duration_seconds` used by the
+        // EthosHighApiLatencyP99 alert and the latency dashboards.
+        .layer(axum::middleware::from_fn(http_duration_middleware))
         .layer(build_cors_layer())
         .with_state(state)
 }
