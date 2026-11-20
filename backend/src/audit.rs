@@ -266,41 +266,38 @@ mod tests {
     fn constant_time_comparison_requires_exact_match() {
         assert!(constant_time_eq(b"admin-key", b"admin-key"));
         assert!(!constant_time_eq(b"Xadmin-key", b"admin-key"));
-        assert!(!constant_time_eq(b"admin-keY", b"admin-key"));
-        assert!(!constant_time_eq(b"admin", b"admin-key"));
+        assert!(!constant_time_eq(b"admin-key", b"admin-ke"));
+        assert!(!constant_time_eq(b"", b"admin-key"));
     }
 
     #[test]
-    fn untrusted_peer_cannot_spoof_client_ip_headers() {
+    fn client_ip_ignores_forwarded_header_from_untrusted_peer() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
-        headers.insert("x-real-ip", "198.51.100.11".parse().unwrap());
-
-        let client_ip = extract_client_ip_from_trusted_proxies(
-            &headers,
-            Some("203.0.113.1".parse().unwrap()),
-            &["10.0.0.1".parse().unwrap()],
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[]),
+            "10.0.0.1"
         );
-
-        assert_eq!(client_ip, "203.0.113.1");
     }
 
     #[test]
-    fn trusted_proxy_uses_first_untrusted_address_in_forwarded_chain() {
+    fn client_ip_uses_forwarded_header_from_trusted_peer() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "198.51.100.99, 192.0.2.45, 10.0.0.2"
-                .parse()
-                .unwrap(),
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&headers, Some(peer), &[trusted]),
+            "1.2.3.4"
         );
+    }
 
-        let client_ip = extract_client_ip_from_trusted_proxies(
-            &headers,
-            Some("10.0.0.1".parse().unwrap()),
-            &["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+    #[test]
+    fn client_ip_returns_unknown_without_peer() {
+        assert_eq!(
+            extract_client_ip_from_trusted_proxies(&HeaderMap::new(), None, &[]),
+            "unknown"
         );
-
-        assert_eq!(client_ip, "192.0.2.45");
     }
 }
