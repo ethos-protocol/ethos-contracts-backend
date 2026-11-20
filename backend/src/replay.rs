@@ -190,21 +190,18 @@ pub fn replay_log_entry(
         }
     }
 
-    // Simulate replay: in a real system this would re-issue the request.
-    // We echo back the stored response to demonstrate the plumbing.
-    let replayed_status = log.response_status;
-    let replayed_body = log.response_body.clone();
+    // No live handler is wired into replay yet, so nothing is re-issued. Echoing
+    // the stored response back always matches, so report the replay as not
+    // performed instead of as validated (#890).
+    let replayed_status = 0;
+    let replayed_body = serde_json::Value::Null;
 
-    let (outcome, diff_notes) = if validate {
-        compare_responses(
-            log.response_status,
-            &log.response_body,
-            replayed_status,
-            &replayed_body,
-        )
+    let diff_notes = if validate {
+        vec!["replay not performed: no live handler is wired".to_string()]
     } else {
-        (ReplayOutcome::Unvalidated, vec![])
+        vec![]
     };
+    let outcome = ReplayOutcome::Unvalidated;
 
     ReplayResult {
         log_id: log.id.clone(),

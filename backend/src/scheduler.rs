@@ -159,10 +159,16 @@ async fn run_encryption_backfill_job() {
         }
     };
 
-    let placeholder_records: Vec<crate::encryption::BackfillRecord> = vec![];
+    // No loader for stored plaintext rows is wired yet. Running over an empty
+    // list would report a finished backfill that changed nothing (#888).
+    let records: Vec<crate::encryption::BackfillRecord> = Vec::new();
+    if records.is_empty() {
+        tracing::warn!("encryption_backfill: no record source is configured, backfill not run");
+        return;
+    }
     let summary = crate::encryption::run_backfill(
         &engine,
-        &placeholder_records,
+        &records,
         BackfillCursor::default(),
         /* batch_size */ 200,
         Duration::from_secs(1),
@@ -275,10 +281,14 @@ fn run_backup_validation_job() {
         "backup validation job started"
     );
 
-    // Simulate validating a placeholder backup so the code path is exercised.
-    // Replace with real backup retrieval when storage integration is ready.
-    let placeholder_backups: Vec<(String, Vec<u8>)> = vec![];
-    let results = BackupValidator::validate_all_backups(&placeholder_backups);
+    // No backup storage is wired yet. An empty list must not report a passed
+    // validation, so the job fails here (#889).
+    let backups: Vec<(String, Vec<u8>)> = Vec::new();
+    if backups.is_empty() {
+        tracing::error!(job_id = %job_id, "backup validation failed: no backups found");
+        return;
+    }
+    let results = BackupValidator::validate_all_backups(&backups);
 
     for result in &results {
         if result.valid {

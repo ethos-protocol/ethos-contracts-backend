@@ -352,36 +352,14 @@ pub fn run_rotation_scheduler(db: &Arc<Db>) {
                 "secret_rotation: OVERDUE — rotate this secret immediately"
             );
 
-            // If auto-rotation is enabled we record a system rotation event.
-            // In a real deployment this would trigger a secrets-manager API call.
+            // A rotation is recorded only after the secret has changed. No
+            // secrets-manager client is wired here, so nothing is rotated and
+            // nothing is recorded. Alert so an operator rotates it (#891).
             if policy.auto_rotate {
-                let grace_ends = if policy.grace_period_hours > 0 {
-                    Some(now + chrono::Duration::hours(i64::from(policy.grace_period_hours)))
-                } else {
-                    None
-                };
-                let log = SecretRotationLog {
-                    id: 0,
-                    secret_type: policy.secret_type.clone(),
-                    rotated_at: now,
-                    actor: "system".to_string(),
-                    grace_period_active: grace_ends.is_some(),
-                    grace_period_ends_at: grace_ends,
-                    notes: Some("Automated rotation triggered by scheduler".to_string()),
-                };
-                if let Err(e) = db.log_secret_rotation(&log) {
-                    tracing::error!(
-                        secret_type = ?policy.secret_type,
-                        error = %e,
-                        "secret_rotation: failed to log auto-rotation"
-                    );
-                } else {
-                    tracing::info!(
-                        secret_type = ?policy.secret_type,
-                        "secret_rotation: auto-rotation recorded"
-                    );
-                    notify_rotation(&log, policy);
-                }
+                tracing::error!(
+                    secret_type = ?policy.secret_type,
+                    "secret_rotation: auto-rotation requested but no secrets-manager client is configured; rotation not performed"
+                );
             }
         } else if let Some(next_due) = status.next_rotation_due {
             let days_left = next_due.signed_duration_since(now).num_days();
