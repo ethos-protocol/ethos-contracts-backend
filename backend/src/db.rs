@@ -2195,6 +2195,26 @@ impl Db {
         )?;
         Ok(count as u64)
     }
+
+    /// Delete credential update rows older than `retention_days` (#882).
+    pub fn purge_old_credential_updates(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM credential_updates WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Delete conflict resolutions resolved before `retention_days` ago (#883).
+    pub fn prune_resolved_conflicts(&self, retention_days: i64) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let count = self.conn.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM conflict_resolutions WHERE resolved_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
 }
 
 // ── Cache-aware vault accessors ───────────────────────────────────────────────

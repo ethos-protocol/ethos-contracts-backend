@@ -282,7 +282,47 @@ pub struct ShardNode {
     conn: Mutex<Connection>,
 }
 
+impl CoordinatorLog {
+    /// Delete log rows for finished transactions older than `cutoff` (#880).
+    ///
+    /// Only terminal states are removed. In-flight rows are kept so recovery
+    /// can still finish them.
+    pub fn prune_terminal_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DistributedTxError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let count = conn
+            .execute(
+                "DELETE FROM coordinator_tx_log
+                 WHERE state IN ('committed', 'aborted') AND updated_at < ?1",
+                params![cutoff.to_rfc3339()],
+            )
+            .map_err(|e| DistributedTxError::LogUnavailable(e.to_string()))?;
+        Ok(count as u64)
+    }
+}
+
 impl ShardNode {
+    /// Delete committed-transaction markers older than `horizon` (#881).
+    ///
+    /// `horizon` must be longer than the longest time a duplicate `prepare`
+    /// can still arrive. Those duplicates are refused by this table, so pruning
+    /// earlier would let a replayed transaction run again.
+    pub fn prune_committed_before(
+        &self,
+        horizon: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DistributedTxError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let count = conn
+            .execute(
+                "DELETE FROM committed_transactions WHERE committed_at < ?1",
+                params![horizon.to_rfc3339()],
+            )
+            .map_err(|e| DistributedTxError::ShardUnavailable(self.shard_id, e.to_string()))?;
+        Ok(count as u64)
+    }
+
     /// Open or create the shard database at `path`.
     pub fn open(shard_id: usize, path: &str) -> Result<Self, DistributedTxError> {
         let conn = Connection::open(path)
