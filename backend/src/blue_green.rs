@@ -149,6 +149,55 @@ impl BlueGreenDeployment {
             ActiveSlot::Green => &self.blue,
         }
     }
+
+    /// Route all traffic to `slot`.
+    fn route_traffic_to(&mut self, slot: ActiveSlot) {
+        self.active_slot = slot;
+        let (blue, green) = match slot {
+            ActiveSlot::Blue => (1.0, 0.0),
+            ActiveSlot::Green => (0.0, 1.0),
+        };
+        self.blue.traffic_weight = blue;
+        self.green.traffic_weight = green;
+    }
+
+    /// Revert traffic to the standby slot and return `(from, to)`.
+    ///
+    /// A second rollback would send traffic back to the slot that was just
+    /// rolled away from, so it is refused and the caller must handle it.
+    #[must_use = "a rollback that did not happen must be reported to the caller"]
+    pub fn execute_rollback(
+        &mut self,
+        reason: &str,
+    ) -> Result<(ActiveSlot, ActiveSlot), BlueGreenRollbackError> {
+        if self.status == BlueGreenStatus::RolledBack {
+            return Err(BlueGreenRollbackError::AlreadyRolledBack);
+        }
+
+        let current_active = self.active_slot;
+        let rollback_to = current_active.opposite();
+        self.route_traffic_to(rollback_to);
+        self.status = BlueGreenStatus::RolledBack;
+        self.push_event(format!(
+            "rollback: reverted from {current_active} to {rollback_to}; reason: {reason}"
+        ));
+        Ok((current_active, rollback_to))
+    }
+}
+
+/// Why a blue-green rollback could not be executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlueGreenRollbackError {
+    #[error("deployment has already been rolled back")]
+    AlreadyRolledBack,
+}
+
+impl From<BlueGreenRollbackError> for StatusCode {
+    fn from(error: BlueGreenRollbackError) -> Self {
+        match error {
+            BlueGreenRollbackError::AlreadyRolledBack => StatusCode::CONFLICT,
+        }
+    }
 }
 
 /// A single historical event in a blue-green deployment's lifecycle.
@@ -358,17 +407,7 @@ pub async fn switch_traffic(
     ));
 
     // Perform the switch atomically.
-    deployment.active_slot = new_active;
-    match new_active {
-        ActiveSlot::Blue => {
-            deployment.blue.traffic_weight = 1.0;
-            deployment.green.traffic_weight = 0.0;
-        }
-        ActiveSlot::Green => {
-            deployment.green.traffic_weight = 1.0;
-            deployment.blue.traffic_weight = 0.0;
-        }
-    }
+    deployment.route_traffic_to(new_active);
     deployment.status = BlueGreenStatus::Stable;
     deployment.push_event(format!(
         "traffic switched to {new_active}; {previous_active} is now standby"
@@ -395,25 +434,7 @@ pub async fn rollback_blue_green(
     let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    let current_active = deployment.active_slot;
-    let rollback_to = current_active.opposite();
-
-    deployment.active_slot = rollback_to;
-    match rollback_to {
-        ActiveSlot::Blue => {
-            deployment.blue.traffic_weight = 1.0;
-            deployment.green.traffic_weight = 0.0;
-        }
-        ActiveSlot::Green => {
-            deployment.green.traffic_weight = 1.0;
-            deployment.blue.traffic_weight = 0.0;
-        }
-    }
-    deployment.status = BlueGreenStatus::RolledBack;
-    deployment.push_event(format!(
-        "rollback: reverted from {current_active} to {rollback_to}; reason: {}",
-        body.reason
-    ));
+    let (current_active, rollback_to) = deployment.execute_rollback(&body.reason)?;
 
     tracing::warn!(
         deployment_id = %id,

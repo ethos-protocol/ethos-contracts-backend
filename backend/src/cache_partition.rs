@@ -73,7 +73,7 @@ impl PartitionStats {
     /// Cache-hit ratio in the range `[0.0, 1.0]`.  Returns `None` when no
     /// accesses have been recorded yet.
     pub fn hit_ratio(&self) -> Option<f64> {
-        let total = self.hits + self.misses;
+        let total = self.hits.saturating_add(self.misses);
         if total == 0 {
             None
         } else {
@@ -112,17 +112,17 @@ impl TenantPartition {
     fn get(&mut self, key: &str) -> Option<String> {
         match self.data.get(key) {
             Some(entry) if !entry.is_expired() => {
-                self.hits += 1;
+                self.hits = self.hits.saturating_add(1);
                 Some(entry.value.clone())
             }
             Some(_expired) => {
-                self.evictions += 1;
-                self.misses += 1;
+                self.evictions = self.evictions.saturating_add(1);
+                self.misses = self.misses.saturating_add(1);
                 self.data.remove(key);
                 None
             }
             None => {
-                self.misses += 1;
+                self.misses = self.misses.saturating_add(1);
                 None
             }
         }

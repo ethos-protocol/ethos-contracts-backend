@@ -44,10 +44,12 @@ impl EvictionWindow {
     /// Count evictions that occurred within the last `window` duration.
     fn count_within(&self, window: Duration) -> usize {
         let ts = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
-        let cutoff = Instant::now()
-            .checked_sub(window)
-            .unwrap_or_else(|| Instant::now());
-        ts.iter().filter(|&&t| t >= cutoff).count()
+        // A window reaching back before the monotonic clock's origin covers
+        // every recorded eviction.
+        match Instant::now().checked_sub(window) {
+            Some(cutoff) => ts.iter().filter(|&&t| t >= cutoff).count(),
+            None => ts.len(),
+        }
     }
 
     fn total(&self) -> usize {
@@ -199,7 +201,7 @@ impl CacheMetrics {
     pub fn hit_ratio(&self) -> Option<f64> {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
+        let total = hits.saturating_add(misses);
         if total == 0 {
             None
         } else {

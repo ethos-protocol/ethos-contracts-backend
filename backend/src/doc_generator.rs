@@ -434,13 +434,9 @@ fn dedent(lines: &[&str]) -> String {
 
     lines
         .iter()
-        .map(|line| {
-            if line.len() >= indent {
-                &line[indent..]
-            } else {
-                line.trim_start()
-            }
-        })
+        // `indent` is a byte count taken from another line, so it may not
+        // fall on a char boundary here; fall back to trimming instead.
+        .map(|line| line.get(indent..).unwrap_or_else(|| line.trim_start()))
         .collect::<Vec<_>>()
         .join("\n")
         .trim_end()

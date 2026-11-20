@@ -120,6 +120,35 @@ impl CanaryDeployment {
             description: description.into(),
         });
     }
+
+    /// Roll the canary back, recording `reason` in its history.
+    ///
+    /// Returns an error instead of rolling back twice, so callers must decide
+    /// how to surface a rollback that did not happen.
+    #[must_use = "a rollback that did not happen must be reported to the caller"]
+    pub fn execute_rollback(&mut self, reason: impl Into<String>) -> Result<(), CanaryRollbackError> {
+        if self.status == CanaryStatus::RolledBack {
+            return Err(CanaryRollbackError::AlreadyRolledBack);
+        }
+        self.status = CanaryStatus::RolledBack;
+        self.push_event(reason);
+        Ok(())
+    }
+}
+
+/// Why a canary rollback could not be executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CanaryRollbackError {
+    #[error("canary has already been rolled back")]
+    AlreadyRolledBack,
+}
+
+impl From<CanaryRollbackError> for StatusCode {
+    fn from(error: CanaryRollbackError) -> Self {
+        match error {
+            CanaryRollbackError::AlreadyRolledBack => StatusCode::CONFLICT,
+        }
+    }
 }
 
 /// Request body for `POST /deployments/canary`.
@@ -269,7 +298,6 @@ pub async fn evaluate_canary(
     });
 
     if absolute_breach || baseline_breach {
-        deployment.status = CanaryStatus::RolledBack;
         let reason = if baseline_breach {
             format!(
                 "automated rollback: canary error_rate={:.4} exceeded baseline error_rate={:.4} by more than the configured margin ({:.4})",
@@ -283,7 +311,7 @@ pub async fn evaluate_canary(
                 body.metrics.error_rate, body.metrics.latency_p99_ms
             )
         };
-        deployment.push_event(reason);
+        deployment.execute_rollback(reason)?;
         tracing::error!(
             deployment_id = %id,
             error_rate = body.metrics.error_rate,
@@ -296,9 +324,21 @@ pub async fn evaluate_canary(
     }
 
     let elapsed_minutes = (Utc::now() - deployment.stage_started_at).num_minutes();
-    let stage = deployment.stages[deployment.current_stage].clone();
+    let Some(min_duration_minutes) = deployment
+        .stages
+        .get(deployment.current_stage)
+        .map(|stage| stage.min_duration_minutes)
+    else {
+        tracing::error!(
+            deployment_id = %id,
+            current_stage = deployment.current_stage,
+            stages = deployment.stages.len(),
+            "canary current_stage is out of range"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
 
-    if elapsed_minutes >= stage.min_duration_minutes {
+    if elapsed_minutes >= min_duration_minutes {
         if deployment.current_stage + 1 < deployment.stages.len() {
             deployment.current_stage += 1;
             deployment.stage_started_at = Utc::now();
@@ -325,8 +365,7 @@ pub async fn rollback_canary(
     let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
     let deployment = store.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 
-    deployment.status = CanaryStatus::RolledBack;
-    deployment.push_event(format!("manual rollback: {}", body.reason));
+    deployment.execute_rollback(format!("manual rollback: {}", body.reason))?;
 
     tracing::warn!(deployment_id = %id, reason = %body.reason, "canary rolled back manually");
 

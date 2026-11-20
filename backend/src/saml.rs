@@ -97,15 +97,20 @@ impl SamlConfig {
             return Err("SAML configuration values must not be empty".to_string());
         }
 
-        let values: HashMap<_, _> = values
+        let mut values: HashMap<_, _> = values
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
-        let certificate = normalize_certificate(
+        let mut take = |key: &str| {
             values
-                .get("SAML_IDP_CERTIFICATE")
-                .expect("required SAML certificate was checked"),
-        );
+                .remove(key)
+                .ok_or_else(|| format!("SAML is partially configured; {key} is missing"))
+        };
+        let entity_id = take("SAML_SP_ENTITY_ID")?;
+        let acs_url = take("SAML_SP_ACS_URL")?;
+        let idp_entity_id = take("SAML_IDP_ENTITY_ID")?;
+        let idp_sso_url = take("SAML_IDP_SSO_URL")?;
+        let certificate = normalize_certificate(&take("SAML_IDP_CERTIFICATE")?);
         let decoded_certificate = STANDARD
             .decode(&certificate)
             .map_err(|_| "SAML_IDP_CERTIFICATE must be a base64 DER certificate".to_string())?;
@@ -120,10 +125,10 @@ impl SamlConfig {
         }
 
         Ok(Some(Self {
-            entity_id: values["SAML_SP_ENTITY_ID"].clone(),
-            acs_url: values["SAML_SP_ACS_URL"].clone(),
-            idp_entity_id: values["SAML_IDP_ENTITY_ID"].clone(),
-            idp_sso_url: values["SAML_IDP_SSO_URL"].clone(),
+            entity_id,
+            acs_url,
+            idp_entity_id,
+            idp_sso_url,
             idp_certificate: certificate,
             clock_skew_secs,
         }))
