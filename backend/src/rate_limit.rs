@@ -225,10 +225,10 @@ impl std::fmt::Display for RateLimitError {
 /// limiter.register_endpoint("POST /api/vaults", cfg);
 ///
 /// let status = limiter
-///     .check_and_record("user_123", UserTier::Free, "POST /api/vaults")
-///     .unwrap();
+///     .check_and_record("user_123", UserTier::Free, "POST /api/vaults")?;
 /// assert_eq!(status.used, 1);
 /// assert_eq!(status.remaining, 4);
+/// # Ok::<(), ethos_protocol_backend::rate_limit::RateLimitError>(())
 /// ```
 pub struct RateLimiter {
     /// Per-endpoint configuration.
@@ -533,7 +533,7 @@ mod tests {
         let limiter = make_limiter(100, 60);
         let status = limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert_eq!(status.used, 1);
         assert_eq!(status.remaining, 2);
         assert_eq!(status.limit, 3);
@@ -545,7 +545,7 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         let err = limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
@@ -569,12 +569,12 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         // user2 has not hit the limit.
         let status = limiter
             .check_and_record("user2", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert_eq!(status.used, 1);
     }
 
@@ -583,8 +583,12 @@ mod tests {
     #[test]
     fn test_pro_tier_higher_limit_than_free() {
         let limiter = make_limiter(100, 60);
-        let limit = limiter.resolve_limit(ENDPOINT, UserTier::Pro).unwrap();
-        let free_limit = limiter.resolve_limit(ENDPOINT, UserTier::Free).unwrap();
+        let limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Pro)
+            .expect("resolve_limit should succeed");
+        let free_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Free)
+            .expect("resolve_limit should succeed");
         assert!(limit.max_requests > free_limit.max_requests);
     }
 
@@ -595,7 +599,7 @@ mod tests {
         for _ in 0..1000 {
             limiter
                 .check_and_record("admin_user", UserTier::Admin, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
     }
 
@@ -604,7 +608,7 @@ mod tests {
         let limiter = make_limiter(100, 60);
         let limit = limiter
             .resolve_limit(ENDPOINT, UserTier::Enterprise)
-            .unwrap();
+            .expect("resolve_limit should succeed");
         assert_eq!(limit.max_requests, 200);
     }
 
@@ -637,7 +641,7 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         assert!(limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
@@ -656,7 +660,7 @@ mod tests {
         // Pro tier is not configured → falls back to default (10).
         let limit = limiter
             .resolve_limit("GET /api/vaults", UserTier::Pro)
-            .unwrap();
+            .expect("resolve_limit should succeed");
         assert_eq!(limit.max_requests, 10);
     }
 
@@ -667,7 +671,7 @@ mod tests {
         let limiter = make_limiter(100, 60);
         let status = limiter
             .quota_status("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("quota_status should succeed");
         assert!(status.is_none());
     }
 
@@ -676,14 +680,14 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         let status = limiter
             .quota_status("user1", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         assert_eq!(status.used, 2);
         assert_eq!(status.remaining, 1);
     }
@@ -693,16 +697,16 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         // Check status twice; count should not change.
         let s1 = limiter
             .quota_status("user1", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         let s2 = limiter
             .quota_status("user1", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         assert_eq!(s1.used, s2.used);
     }
 
@@ -714,7 +718,7 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         limiter.reset_quota("user1", ENDPOINT);
         // Should be allowed again.
@@ -728,10 +732,10 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user2", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter.reset_all();
         assert_eq!(limiter.active_quota_count(), 0);
     }
@@ -743,10 +747,10 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user2", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert_eq!(limiter.active_quota_count(), 2);
     }
 
@@ -755,10 +759,10 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert_eq!(limiter.active_quota_count(), 1);
     }
 
@@ -767,22 +771,22 @@ mod tests {
         let limiter = make_limiter(100, 60);
         limiter
             .check_and_record("rotated-key-1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
 
         {
-            let mut quotas = limiter.quotas.lock().unwrap();
-            let entry = quotas.values_mut().next().unwrap();
+            let mut quotas = limiter.quotas.lock().expect("lock should not be poisoned");
+            let entry = quotas.values_mut().next().expect("next() should return a value");
             entry.window_start = Instant::now() - entry.window_duration;
         }
 
         limiter
             .check_and_record("rotated-key-2", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
 
         assert_eq!(limiter.active_quota_count(), 1);
         assert!(limiter
             .quota_status("rotated-key-1", UserTier::Free, ENDPOINT)
-            .unwrap()
+            .expect("quota_status should succeed")
             .is_none());
     }
 
@@ -800,10 +804,10 @@ mod tests {
         // Exhaust the 2-request quota.
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert!(limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
             .is_err());
@@ -855,10 +859,10 @@ mod tests {
         // Exhaust /api/vaults.
         limiter
             .check_and_record("user1", UserTier::Free, "GET /api/vaults")
-            .unwrap();
+            .expect("check_and_record should succeed");
         limiter
             .check_and_record("user1", UserTier::Free, "GET /api/vaults")
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert!(limiter
             .check_and_record("user1", UserTier::Free, "GET /api/vaults")
             .is_err());
@@ -917,7 +921,7 @@ mod tests {
         for _ in 0..5_000 {
             limiter
                 .check_and_record("admin", UserTier::Admin, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
     }
 
@@ -928,7 +932,7 @@ mod tests {
         for _ in 0..TierLimit::default_deny().max_requests {
             limiter
                 .check_and_record_enforced("u", UserTier::Free, "GET /never/registered")
-                .unwrap();
+                .expect("check_and_record_enforced should succeed");
         }
         assert!(limiter
             .check_and_record_enforced("u", UserTier::Free, "GET /never/registered")
@@ -941,7 +945,7 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("u", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         let err = limiter
             .check_and_record("u", UserTier::Free, ENDPOINT)
@@ -958,8 +962,8 @@ mod tests {
     #[test]
     fn test_tier_from_headers_reads_declared_plan() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer x".parse().unwrap());
-        headers.insert("x-user-tier", "enterprise".parse().unwrap());
+        headers.insert(header::AUTHORIZATION, "Bearer x".parse().expect("valid header value"));
+        headers.insert("x-user-tier", "enterprise".parse().expect("valid header value"));
         assert_eq!(tier_from_headers(&headers), UserTier::Enterprise);
     }
 
@@ -976,14 +980,14 @@ mod tests {
         for _ in 0..2 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
 
         // After 2 requests (cost 1 each), remaining should be 1
         let status = limiter
             .quota_status("user1", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         assert_eq!(status.remaining, 1);
     }
 
@@ -995,13 +999,13 @@ mod tests {
         for _ in 0..50 {
             limiter
                 .check_and_record("user1", UserTier::Enterprise, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
 
         let status = limiter
             .quota_status("user1", UserTier::Enterprise, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         assert_eq!(status.used, 50);
         assert_eq!(status.remaining, 150);
     }
@@ -1010,11 +1014,15 @@ mod tests {
     fn test_different_tiers_have_proportional_limits() {
         let limiter = make_limiter(100, 60);
 
-        let free_limit = limiter.resolve_limit(ENDPOINT, UserTier::Free).unwrap();
-        let pro_limit = limiter.resolve_limit(ENDPOINT, UserTier::Pro).unwrap();
+        let free_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Free)
+            .expect("resolve_limit should succeed");
+        let pro_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Pro)
+            .expect("resolve_limit should succeed");
         let enterprise_limit = limiter
             .resolve_limit(ENDPOINT, UserTier::Enterprise)
-            .unwrap();
+            .expect("resolve_limit should succeed");
 
         // Verify tiered structure: Free < Pro < Enterprise
         assert!(free_limit.max_requests < pro_limit.max_requests);
@@ -1026,8 +1034,10 @@ mod tests {
         let limiter = make_limiter(100, 60);
         let unauth_limit = limiter
             .resolve_limit(ENDPOINT, UserTier::Unauthenticated)
-            .unwrap();
-        let free_limit = limiter.resolve_limit(ENDPOINT, UserTier::Free).unwrap();
+            .expect("resolve_limit should succeed");
+        let free_limit = limiter
+            .resolve_limit(ENDPOINT, UserTier::Free)
+            .expect("resolve_limit should succeed");
 
         // Unauthenticated should be at least as strict as free (often stricter)
         assert!(unauth_limit.max_requests <= free_limit.max_requests);
@@ -1050,13 +1060,13 @@ mod tests {
         for _ in 0..5 {
             limiter
                 .check_and_record("user1", UserTier::Free, "POST /api/transfer")
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
 
         // Status endpoint should still have full quota
         let status_quota = limiter
             .quota_status("user1", UserTier::Free, "GET /api/status")
-            .unwrap();
+            .expect("quota_status should succeed");
         assert!(
             status_quota.is_none(),
             "status endpoint should not have quota yet"
@@ -1065,7 +1075,7 @@ mod tests {
         // Can still make requests to status
         limiter
             .check_and_record("user1", UserTier::Free, "GET /api/status")
-            .unwrap();
+            .expect("check_and_record should succeed");
     }
 
     #[test]
@@ -1103,7 +1113,7 @@ mod tests {
         for _ in 0..3 {
             limiter
                 .check_and_record("user1", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
         assert!(limiter
             .check_and_record("user1", UserTier::Free, ENDPOINT)
@@ -1112,7 +1122,7 @@ mod tests {
         // Same user with Pro tier has higher quota
         let pro_status = limiter
             .check_and_record("user1", UserTier::Pro, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert!(pro_status.used == 1);
         assert!(pro_status.remaining > 2);
     }
@@ -1134,7 +1144,7 @@ mod tests {
         // Should still be functioning
         let status = limiter
             .check_and_record("user1", UserTier::Admin, ENDPOINT)
-            .unwrap();
+            .expect("check_and_record should succeed");
         assert!(status.used > 0);
     }
 
@@ -1146,28 +1156,72 @@ mod tests {
         for _ in 0..2 {
             limiter
                 .check_and_record("user_a", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
 
         // User B independent quota
         for _ in 0..1 {
             limiter
                 .check_and_record("user_b", UserTier::Free, ENDPOINT)
-                .unwrap();
+                .expect("check_and_record should succeed");
         }
 
         let a_status = limiter
             .quota_status("user_a", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
         let b_status = limiter
             .quota_status("user_b", UserTier::Free, ENDPOINT)
-            .unwrap()
-            .unwrap();
+            .expect("quota_status should succeed")
+            .expect("quota entry should exist");
 
         assert_eq!(a_status.used, 2);
         assert_eq!(b_status.used, 1);
         assert_eq!(a_status.remaining, 1);
         assert_eq!(b_status.remaining, 2);
+    }
+
+    // ── Lock poisoning ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_poisoned_quota_lock_does_not_panic_limiter() {
+        let limiter = make_limiter(100, 60);
+        limiter
+            .check_and_record("user1", UserTier::Free, ENDPOINT)
+            .expect("first request should be allowed");
+
+        // Poison the quota mutex by panicking while the guard is held.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = limiter.quotas.lock();
+            panic!("intentional panic to poison the quota lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(limiter.quotas.is_poisoned());
+
+        // Every limiter entry point must keep working and keep enforcing
+        // limits instead of propagating the poison as a panic.
+        let status = limiter
+            .check_and_record("user1", UserTier::Free, ENDPOINT)
+            .expect("limiter should recover from a poisoned lock");
+        assert_eq!(status.used, 2);
+
+        let current = limiter
+            .quota_status("user1", UserTier::Free, ENDPOINT)
+            .expect("quota_status should recover from a poisoned lock")
+            .expect("quota entry should still exist");
+        assert_eq!(current.used, 2);
+
+        limiter
+            .check_and_record("user1", UserTier::Free, ENDPOINT)
+            .expect("third request should be allowed");
+        let err = limiter
+            .check_and_record("user1", UserTier::Free, ENDPOINT)
+            .expect_err("limit must still be enforced after poisoning");
+        assert!(matches!(err, RateLimitError::TooManyRequests { .. }));
+
+        assert_eq!(limiter.active_quota_count(), 1);
+        limiter.reset_quota("user1", ENDPOINT);
+        assert_eq!(limiter.active_quota_count(), 0);
+        limiter.reset_all();
     }
 }

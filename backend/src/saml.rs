@@ -13,14 +13,21 @@
 //! GET  /saml/metadata → sp_metadata          (XML the IdP is configured with)
 //! GET  /saml/login    → initiate_login       (AuthnRequest + RelayState)
 //! POST /saml/acs      → assertion_consumer_service
-//!                         ├─ base64-decode SAMLResponse
-//!                         ├─ parse_response    → SamlAssertion
+//!                         ├─ parse_verified_response → SamlAssertion
+//!                         │    (base64-decode, XML-DSig verify against
+//!                         │     the pinned IdP certificate, then parse)
 //!                         ├─ validate_assertion (issuer, audience, window,
 //!                         │                      InResponseTo, replay, signer)
 //!                         └─ map_attributes     → SamlUser → session
 //! ```
 //!
 //! # Signature handling
+//!
+//! [`parse_verified_response`] is the only public way to turn a
+//! `SAMLResponse` into a [`SamlAssertion`]. The lexical parser it delegates to
+//! (`parse_unverified_response`) performs no signature check and is
+//! deliberately crate-private so no caller can obtain an identity from
+//! attacker-controlled XML without verification.
 //!
 //! Assertions must carry a `<Signature>` whose `<X509Certificate>` matches the
 //! certificate pinned in [`SamlConfig`], so an assertion from an unknown
@@ -211,17 +218,24 @@ pub enum SamlError {
 
 // === Parsing
 
-/// Decode and parse a base64 `SAMLResponse` form field into an assertion.
-pub fn parse_encoded_response(encoded: &str) -> Result<SamlAssertion, SamlError> {
+/// Decode a base64 `SAMLResponse` form field (HTTP-POST binding) into XML.
+fn decode_response(encoded: &str) -> Result<String, SamlError> {
     let raw = STANDARD
         .decode(encoded.trim())
         .map_err(|_| SamlError::NotBase64)?;
-    let xml = String::from_utf8(raw).map_err(|_| SamlError::NotUtf8)?;
-    parse_response(&xml)
+    String::from_utf8(raw).map_err(|_| SamlError::NotUtf8)
 }
 
 /// Parse a SAML `Response` document, returning the assertion it carries.
-pub fn parse_response(xml: &str) -> Result<SamlAssertion, SamlError> {
+///
+/// # Security
+///
+/// This performs **no signature verification**: the returned assertion is
+/// whatever the XML claims, including any `<X509Certificate>` it embeds. It is
+/// crate-private on purpose and must only be fed XML that has already been
+/// reduced to its signed content by [`parse_verified_response`]. External
+/// input must always go through [`parse_verified_response`].
+pub(crate) fn parse_unverified_response(xml: &str) -> Result<SamlAssertion, SamlError> {
     let status = element_start_tag(xml, "StatusCode")
         .and_then(|tag| tag_attribute(tag, "Value"))
         .ok_or(SamlError::MissingElement("StatusCode"))?;
@@ -609,11 +623,18 @@ pub async fn assertion_consumer_service(
     }
 }
 
-fn parse_verified_response(encoded: &str, config: &SamlConfig) -> Result<SamlAssertion, SamlError> {
-    let raw = STANDARD
-        .decode(encoded.trim())
-        .map_err(|_| SamlError::NotBase64)?;
-    let xml = String::from_utf8(raw).map_err(|_| SamlError::NotUtf8)?;
+/// Decode a base64 `SAMLResponse`, verify its XML-DSig signature against the
+/// IdP certificate pinned in `config`, and parse the assertion from the
+/// signed content only.
+///
+/// This is the only supported entry point for untrusted SAML input. Callers
+/// must still run [`validate_assertion`] on the result to enforce issuer,
+/// audience, validity window, `InResponseTo` and replay checks.
+pub fn parse_verified_response(
+    encoded: &str,
+    config: &SamlConfig,
+) -> Result<SamlAssertion, SamlError> {
+    let xml = decode_response(encoded)?;
     let certificate = STANDARD
         .decode(normalize_certificate(&config.idp_certificate))
         .map_err(|_| SamlError::InvalidSignature)?;
@@ -634,7 +655,7 @@ fn parse_verified_response(encoded: &str, config: &SamlConfig) -> Result<SamlAss
         Some(&allowed_algorithms),
     )
     .map_err(|_| SamlError::InvalidSignature)?;
-    let mut assertion = parse_response(&verified_xml)?;
+    let mut assertion = parse_unverified_response(&verified_xml)?;
     if assertion.signing_certificate.is_none() {
         assertion.signing_certificate = Some(normalize_certificate(&config.idp_certificate));
     }
@@ -884,8 +905,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_extracts_core_fields() {
-        let assertion = parse_response(&valid_response()).unwrap();
+    fn parse_unverified_response_extracts_core_fields() {
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         assert_eq!(assertion.id, "_assert-1");
         assert_eq!(assertion.issuer, "http://www.okta.com/exk1234");
         assert_eq!(assertion.subject, "ada@corp.example");
@@ -921,8 +942,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_keeps_multivalued_attributes() {
-        let assertion = parse_response(&valid_response()).unwrap();
+    fn parse_unverified_response_keeps_multivalued_attributes() {
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         assert_eq!(
             assertion.attributes["http://schemas.xmlsoap.org/claims/Group"],
             vec!["engineering".to_string(), "vault-admins".to_string()]
@@ -930,34 +951,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_rejects_failure_status() {
+    fn parse_unverified_response_rejects_failure_status() {
         let xml = valid_response().replace(
             "urn:oasis:names:tc:SAML:2.0:status:Success",
             "urn:oasis:names:tc:SAML:2.0:status:Requester",
         );
         assert!(matches!(
-            parse_response(&xml),
+            parse_unverified_response(&xml),
             Err(SamlError::StatusNotSuccess(_))
         ));
     }
 
     #[test]
-    fn parse_encoded_response_rejects_non_base64() {
+    fn parse_verified_response_rejects_non_base64() {
         assert_eq!(
-            parse_encoded_response("!!!not base64!!!"),
+            parse_verified_response("!!!not base64!!!", &config()),
             Err(SamlError::NotBase64)
         );
     }
 
     #[test]
-    fn parse_encoded_response_accepts_base64_post_binding() {
+    fn decode_response_accepts_base64_post_binding() {
         let encoded = STANDARD.encode(valid_response());
-        assert_eq!(parse_encoded_response(&encoded).unwrap().id, "_assert-1");
+        let xml = decode_response(&encoded).expect("valid base64 should decode");
+        assert_eq!(
+            parse_unverified_response(&xml)
+                .expect("decoded response should parse")
+                .id,
+            "_assert-1"
+        );
+    }
+
+    #[test]
+    fn parse_verified_response_rejects_unsigned_response_claiming_pinned_certificate() {
+        // `valid_response` embeds the pinned certificate in a `<Signature>`
+        // element but carries no real XML-DSig signature. The unverified
+        // parser would accept it; the public verified path must not.
+        let encoded = STANDARD.encode(valid_response());
+        assert_eq!(
+            parse_verified_response(&encoded, &config()),
+            Err(SamlError::InvalidSignature)
+        );
     }
 
     #[test]
     fn validate_assertion_accepts_a_good_assertion() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = security_with_pending("_req-1");
         assert_eq!(
             validate_assertion(&assertion, &config(), &security, now()),
@@ -967,7 +1006,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_rejects_wrong_issuer() {
-        let mut assertion = parse_response(&valid_response()).unwrap();
+        let mut assertion = parse_unverified_response(&valid_response()).unwrap();
         assertion.issuer = "http://evil.example".to_string();
         let security = security_with_pending("_req-1");
         assert!(matches!(
@@ -978,7 +1017,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_rejects_wrong_audience() {
-        let mut assertion = parse_response(&valid_response()).unwrap();
+        let mut assertion = parse_unverified_response(&valid_response()).unwrap();
         assertion.audience = Some("https://other.example".to_string());
         let security = security_with_pending("_req-1");
         assert!(matches!(
@@ -989,7 +1028,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_rejects_expired_window() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = security_with_pending("_req-1");
         let later = DateTime::parse_from_rfc3339("2026-07-30T11:00:00Z")
             .unwrap()
@@ -1002,7 +1041,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_tolerates_clock_skew() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = security_with_pending("_req-1");
         // 30s before NotBefore, inside the configured 60s skew.
         let early = DateTime::parse_from_rfc3339("2026-07-30T09:58:30Z")
@@ -1017,14 +1056,14 @@ mod tests {
     #[test]
     fn validate_assertion_rejects_unsigned_and_untrusted() {
         let security = security_with_pending("_req-1");
-        let mut unsigned = parse_response(&valid_response()).unwrap();
+        let mut unsigned = parse_unverified_response(&valid_response()).unwrap();
         unsigned.signing_certificate = None;
         assert_eq!(
             validate_assertion(&unsigned, &config(), &security, now()),
             Err(SamlError::Unsigned)
         );
 
-        let other = parse_response(&response_xml(
+        let other = parse_unverified_response(&response_xml(
             "2026-07-30T09:59:00Z",
             "2026-07-30T10:05:00Z",
             "_req-1",
@@ -1039,7 +1078,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_rejects_unknown_request_id() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = SamlSecurityState::default();
         assert!(matches!(
             validate_assertion(&assertion, &config(), &security, now()),
@@ -1049,7 +1088,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_rejects_replay() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = security_with_pending("_req-1");
         assert_eq!(
             validate_assertion(&assertion, &config(), &security, now()),
@@ -1071,7 +1110,7 @@ mod tests {
 
     #[test]
     fn validate_assertion_purges_expired_replay_guard_entries() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let security = security_with_pending("_req-1");
         // Simulate a replay-guard entry left over from a much earlier
         // assertion whose own validity window has since elapsed; it must not
@@ -1095,7 +1134,7 @@ mod tests {
 
     #[test]
     fn map_attributes_projects_configured_claims() {
-        let assertion = parse_response(&valid_response()).unwrap();
+        let assertion = parse_unverified_response(&valid_response()).unwrap();
         let user = map_attributes(&assertion, &AttributeMapping::default()).unwrap();
         assert_eq!(
             user,
@@ -1111,7 +1150,7 @@ mod tests {
 
     #[test]
     fn map_attributes_honors_custom_mapping() {
-        let mut assertion = parse_response(&valid_response()).unwrap();
+        let mut assertion = parse_unverified_response(&valid_response()).unwrap();
         assertion
             .attributes
             .insert("mail".to_string(), vec!["ada@alt.example".to_string()]);
@@ -1129,7 +1168,7 @@ mod tests {
 
     #[test]
     fn map_attributes_falls_back_to_email_name_id() {
-        let mut assertion = parse_response(&valid_response()).unwrap();
+        let mut assertion = parse_unverified_response(&valid_response()).unwrap();
         assertion.attributes.clear();
         let user = map_attributes(&assertion, &AttributeMapping::default()).unwrap();
         assert_eq!(user.email, "ada@corp.example");
@@ -1137,7 +1176,7 @@ mod tests {
 
     #[test]
     fn map_attributes_fails_without_any_email() {
-        let mut assertion = parse_response(&valid_response()).unwrap();
+        let mut assertion = parse_unverified_response(&valid_response()).unwrap();
         assertion.attributes.clear();
         assertion.subject = "opaque-subject-id".to_string();
         assert!(matches!(

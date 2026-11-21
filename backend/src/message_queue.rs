@@ -173,6 +173,14 @@ pub enum MessageQueueError {
     Serialization(#[from] serde_json::Error),
     #[error("consumer group {0} is not registered")]
     UnknownConsumerGroup(String),
+    #[error("topic {0} has no partitions configured")]
+    NoPartitions(String),
+    #[error("message {message_id} not found in partition {partition} of topic {topic}")]
+    MessageNotFound {
+        topic: String,
+        partition: u32,
+        message_id: String,
+    },
 }
 
 // ── Internal partition storage ────────────────────────────────────────────────
@@ -293,7 +301,15 @@ impl MessageBroker {
             .get_mut(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
 
-        let cfg = store.config.as_ref().unwrap();
+        let cfg = store
+            .config
+            .as_ref()
+            .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
+        // `assign_partition` asserts on a zero partition count; reject it here
+        // with a typed error so a misconfigured topic cannot panic publishers.
+        if cfg.partition_count == 0 {
+            return Err(MessageQueueError::NoPartitions(topic.to_string()));
+        }
         let partition = assign_partition(
             &cfg.strategy,
             key.as_deref(),
@@ -305,7 +321,12 @@ impl MessageBroker {
 
         let msg = QueueMessage::new(topic, partition, key, headers, payload);
         let id = msg.id.clone();
-        store.partitions[partition as usize].messages.push(msg);
+        store
+            .partitions
+            .get_mut(partition as usize)
+            .ok_or_else(|| MessageQueueError::InvalidPartition(partition, topic.to_string()))?
+            .messages
+            .push(msg);
         Ok(id)
     }
 
@@ -339,7 +360,10 @@ impl MessageBroker {
             .copied()
             .unwrap_or(0);
 
-        let msgs: Vec<QueueMessage> = store.partitions[partition as usize]
+        let msgs: Vec<QueueMessage> = store
+            .partitions
+            .get(partition as usize)
+            .ok_or_else(|| MessageQueueError::InvalidPartition(partition, topic.to_string()))?
             .messages
             .iter()
             .skip(offset)
@@ -432,28 +456,28 @@ impl MessageBroker {
 
         let max_retries = store.config.as_ref().map(|c| c.max_retries).unwrap_or(3);
 
-        let idx = store.partitions[partition as usize]
+        let stored = store
+            .partitions
+            .get_mut(partition as usize)
+            .ok_or_else(|| MessageQueueError::InvalidPartition(partition, topic.to_string()))?
             .messages
-            .iter()
-            .position(|m| m.id == message_id)
-            .ok_or_else(|| {
-                MessageQueueError::TopicNotFound(format!(
-                    "{topic}: message {message_id} not found in partition {partition}"
-                ))
+            .iter_mut()
+            .find(|m| m.id == message_id)
+            .ok_or_else(|| MessageQueueError::MessageNotFound {
+                topic: topic.to_string(),
+                partition,
+                message_id: message_id.to_string(),
             })?;
 
-        let attempts = {
-            let m = &mut store.partitions[partition as usize].messages[idx];
-            m.delivery_attempts += 1;
-            m.delivery_attempts
-        };
+        stored.delivery_attempts += 1;
+        let attempts = stored.delivery_attempts;
 
         if attempts < max_retries {
             return Ok(DeliveryOutcome::Retry { attempts });
         }
 
         // ── Poison: route to the DLQ ─────────────────────────────────────────
-        let mut msg = store.partitions[partition as usize].messages[idx].clone();
+        let mut msg = stored.clone();
         msg.headers
             .insert("dlq_reason".into(), "max_delivery_attempts_exceeded".into());
         msg.headers.insert("dlq_error".into(), error.to_string());
@@ -780,7 +804,7 @@ mod tests {
                     .with_partitions(4)
                     .with_strategy(PartitionStrategy::HashKey),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         broker
     }
 
@@ -795,13 +819,13 @@ mod tests {
                 serde_json::json!({"action": "check_in"}),
                 None,
             )
-            .unwrap();
+            .expect("publish should succeed");
         assert!(!id.is_empty());
 
         // Find which partition it landed on
         let mut found = false;
         for p in 0..4u32 {
-            let msgs = broker.poll("test.topic", p, "group-a", 10).unwrap();
+            let msgs = broker.poll("test.topic", p, "group-a", 10).expect("poll should succeed");
             if !msgs.is_empty() {
                 assert_eq!(msgs[0].payload["action"], "check_in");
                 found = true;
@@ -823,11 +847,11 @@ mod tests {
                     serde_json::json!({}),
                     None,
                 )
-                .unwrap();
+                .expect("publish should succeed");
         }
         // All 5 messages must land in the same partition
         let counts: Vec<usize> = (0..4u32)
-            .map(|p| broker.poll("test.topic", p, "grp", 100).unwrap().len())
+            .map(|p| broker.poll("test.topic", p, "grp", 100).expect("poll should succeed").len())
             .collect();
         let non_zero: Vec<_> = counts.iter().filter(|&&c| c > 0).collect();
         assert_eq!(non_zero.len(), 1, "hash-key routing must be sticky");
@@ -843,7 +867,7 @@ mod tests {
                     .with_partitions(4)
                     .with_strategy(PartitionStrategy::RoundRobin),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         for _ in 0..8 {
             broker
                 .publish(
@@ -853,10 +877,10 @@ mod tests {
                     serde_json::json!({}),
                     None,
                 )
-                .unwrap();
+                .expect("publish should succeed");
         }
         let counts: Vec<usize> = (0..4u32)
-            .map(|p| broker.poll("rr.topic", p, "g", 100).unwrap().len())
+            .map(|p| broker.poll("rr.topic", p, "g", 100).expect("poll should succeed").len())
             .collect();
         // Each partition should have 2 messages
         assert!(counts.iter().all(|&c| c == 2));
@@ -874,15 +898,15 @@ mod tests {
                     serde_json::json!({"i": i}),
                     Some(0),
                 )
-                .unwrap();
+                .expect("publish should succeed");
         }
         // Poll all 3
-        let msgs = broker.poll("test.topic", 0, "grp", 10).unwrap();
+        let msgs = broker.poll("test.topic", 0, "grp", 10).expect("poll should succeed");
         assert_eq!(msgs.len(), 3);
         // Ack first 2
-        broker.commit_offset("test.topic", 0, "grp", 2).unwrap();
+        broker.commit_offset("test.topic", 0, "grp", 2).expect("commit_offset should succeed");
         // Poll again — should only see message 3
-        let msgs2 = broker.poll("test.topic", 0, "grp", 10).unwrap();
+        let msgs2 = broker.poll("test.topic", 0, "grp", 10).expect("poll should succeed");
         assert_eq!(msgs2.len(), 1);
     }
 
@@ -891,7 +915,7 @@ mod tests {
         let broker = Arc::new(MessageBroker::new());
         broker
             .create_topic(TopicConfig::new("dlq.topic").with_partitions(1))
-            .unwrap();
+            .expect("create_topic should succeed");
         let mut msg = QueueMessage::new(
             "dlq.topic",
             0,
@@ -900,8 +924,8 @@ mod tests {
             serde_json::json!({"x": 1}),
         );
         msg.delivery_attempts = 5; // already exceeded retries
-        broker.send_to_dlq("dlq.topic", msg).unwrap();
-        let dlq = broker.list_dlq("dlq.topic").unwrap();
+        broker.send_to_dlq("dlq.topic", msg).expect("send_to_dlq should succeed");
+        let dlq = broker.list_dlq("dlq.topic").expect("list_dlq should succeed");
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0].headers["dlq_reason"], "max_retries_exceeded");
     }
@@ -924,15 +948,15 @@ mod tests {
                     .with_partitions(4)
                     .with_strategy(PartitionStrategy::HashKey),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         let publisher = MessagePublisher::new(Arc::clone(&broker), "vault.events");
         publisher
             .publish_vault_event("vault-x", "check_in", serde_json::json!({}))
-            .unwrap();
+            .expect("publish_vault_event should succeed");
 
         let mut found_header = false;
         for p in 0..4u32 {
-            let msgs = broker.poll("vault.events", p, "test", 10).unwrap();
+            let msgs = broker.poll("vault.events", p, "test", 10).expect("poll should succeed");
             for m in &msgs {
                 assert_eq!(
                     m.headers.get("event_type").map(|s| s.as_str()),
@@ -953,7 +977,7 @@ mod tests {
                     .with_partitions(1)
                     .with_max_retries(3),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         let id = broker
             .publish(
                 "poison.topic",
@@ -962,28 +986,28 @@ mod tests {
                 serde_json::json!({}),
                 Some(0),
             )
-            .unwrap();
+            .expect("publish should succeed");
 
         assert_eq!(
             broker
                 .record_failed_delivery("poison.topic", 0, &id, "boom")
-                .unwrap(),
+                .expect("record_failed_delivery should succeed"),
             DeliveryOutcome::Retry { attempts: 1 }
         );
         assert_eq!(
             broker
                 .record_failed_delivery("poison.topic", 0, &id, "boom")
-                .unwrap(),
+                .expect("record_failed_delivery should succeed"),
             DeliveryOutcome::Retry { attempts: 2 }
         );
         assert_eq!(
             broker
                 .record_failed_delivery("poison.topic", 0, &id, "boom")
-                .unwrap(),
+                .expect("record_failed_delivery should succeed"),
             DeliveryOutcome::Poisoned { attempts: 3 }
         );
 
-        let dlq = broker.list_dlq("poison.topic").unwrap();
+        let dlq = broker.list_dlq("poison.topic").expect("list_dlq should succeed");
         assert_eq!(dlq.len(), 1);
         assert_eq!(
             dlq[0].headers["dlq_reason"],
@@ -991,7 +1015,9 @@ mod tests {
         );
         assert_eq!(dlq[0].headers["dlq_error"], "boom");
 
-        let events = broker.list_poison_events("poison.topic").unwrap();
+        let events = broker
+            .list_poison_events("poison.topic")
+            .expect("list_poison_events should succeed");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].attempts, 3);
         assert_eq!(events[0].message_id, id);
@@ -1006,7 +1032,7 @@ mod tests {
                     .with_partitions(1)
                     .with_max_retries(2),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         broker
             .publish(
                 "proc.poison",
@@ -1015,7 +1041,7 @@ mod tests {
                 serde_json::json!({"n": 1}),
                 Some(0),
             )
-            .unwrap();
+            .expect("publish should succeed");
         broker
             .publish(
                 "proc.poison",
@@ -1024,7 +1050,7 @@ mod tests {
                 serde_json::json!({"n": 2}),
                 Some(0),
             )
-            .unwrap();
+            .expect("publish should succeed");
 
         let consumer =
             MessageConsumer::new(Arc::clone(&broker), "grp", vec![("proc.poison".into(), 0)]);
@@ -1038,9 +1064,9 @@ mod tests {
                     Ok(())
                 }
             })
-            .unwrap();
+            .expect("process should succeed");
         assert_eq!(s1.dlq_count, 0);
-        assert_eq!(broker.list_dlq("proc.poison").unwrap().len(), 0);
+        assert_eq!(broker.list_dlq("proc.poison").expect("list_dlq should succeed").len(), 0);
 
         // Second pass: attempt 2 == max_retries -> poison-routed, offset advances
         // past it so message 2 is then processed.
@@ -1052,14 +1078,20 @@ mod tests {
                     Ok(())
                 }
             })
-            .unwrap();
+            .expect("process should succeed");
         assert_eq!(s2.dlq_count, 1);
         assert_eq!(s2.processed, 1);
 
-        assert_eq!(broker.list_dlq("proc.poison").unwrap().len(), 1);
-        assert_eq!(broker.list_poison_events("proc.poison").unwrap().len(), 1);
+        assert_eq!(broker.list_dlq("proc.poison").expect("list_dlq should succeed").len(), 1);
+        assert_eq!(
+            broker
+                .list_poison_events("proc.poison")
+                .expect("list_poison_events should succeed")
+                .len(),
+            1
+        );
         // Nothing left to redeliver.
-        assert_eq!(broker.poll("proc.poison", 0, "grp", 10).unwrap().len(), 0);
+        assert_eq!(broker.poll("proc.poison", 0, "grp", 10).expect("poll should succeed").len(), 0);
     }
 
     #[test]
@@ -1072,7 +1104,7 @@ mod tests {
                     .with_partitions(1)
                     .with_max_retries(1),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         let id = broker
             .publish(
                 "mirror.topic",
@@ -1081,16 +1113,16 @@ mod tests {
                 serde_json::json!({"k": "v"}),
                 Some(0),
             )
-            .unwrap();
+            .expect("publish should succeed");
 
         let outcome = broker
             .record_failed_delivery("mirror.topic", 0, &id, "downstream 500")
-            .unwrap();
+            .expect("record_failed_delivery should succeed");
         assert_eq!(outcome, DeliveryOutcome::Poisoned { attempts: 1 });
 
         let store = dlq_store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(store.len(), 1);
-        let entry = store.values().next().unwrap();
+        let entry = store.values().next().expect("next() should return a value");
         assert_eq!(entry.error, "downstream 500");
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.payload, serde_json::json!({"k": "v"}));
@@ -1106,7 +1138,7 @@ mod tests {
                     .with_partitions(4)
                     .with_strategy(PartitionStrategy::HashKey),
             )
-            .unwrap();
+            .expect("create_topic should succeed");
         let publisher = MessagePublisher::new(Arc::clone(&broker), "vault.events");
         publisher
             .publish_vault_event_correlated(
@@ -1115,12 +1147,12 @@ mod tests {
                 "check_in",
                 serde_json::json!({}),
             )
-            .unwrap();
+            .expect("publish_vault_event_correlated should succeed");
 
         let mut seen = None;
         for p in 0..4u32 {
-            for m in broker.poll("vault.events", p, "c", 10).unwrap() {
-                seen = Some(m.request_id().unwrap().to_string());
+            for m in broker.poll("vault.events", p, "c", 10).expect("poll should succeed") {
+                seen = Some(m.request_id().expect("message should carry a request id").to_string());
             }
         }
         assert_eq!(seen.as_deref(), Some("req-trace-42"));
@@ -1131,7 +1163,7 @@ mod tests {
         let broker = Arc::new(MessageBroker::new());
         broker
             .create_topic(TopicConfig::new("proc.topic").with_partitions(1))
-            .unwrap();
+            .expect("create_topic should succeed");
         for i in 0..3u32 {
             broker
                 .publish(
@@ -1141,17 +1173,17 @@ mod tests {
                     serde_json::json!({"i": i}),
                     Some(0),
                 )
-                .unwrap();
+                .expect("publish should succeed");
         }
         let consumer =
             MessageConsumer::new(Arc::clone(&broker), "grp", vec![("proc.topic".into(), 0)]);
         let summary = consumer
             .process("proc.topic", 0, 10, 3, |_| Ok(()))
-            .unwrap();
+            .expect("process should succeed");
         assert_eq!(summary.processed, 3);
         assert_eq!(summary.failed, 0);
         // No more messages after ack
-        let remaining = broker.poll("proc.topic", 0, "grp", 10).unwrap();
+        let remaining = broker.poll("proc.topic", 0, "grp", 10).expect("poll should succeed");
         assert_eq!(remaining.len(), 0);
     }
 }
