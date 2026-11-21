@@ -609,20 +609,39 @@ impl DistributedTxCoordinator {
         // ── Phase 1: Prepare ─────────────────────────────────────────────────
         let mut prepared_shards: Vec<usize> = Vec::new();
         for &shard_idx in &participating_shards {
-            let shard = self
-                .shards
-                .get(shard_idx)
-                .ok_or(DistributedTxError::ShardUnavailable(
+            let Some(shard) = self.shards.get(shard_idx) else {
+                let err = DistributedTxError::ShardUnavailable(
                     shard_idx,
                     "index out of range".to_string(),
-                ))?;
+                );
+                return Err(self.abort_after_prepare_failure(
+                    tx_id,
+                    &participating_shards,
+                    &prepared_shards,
+                    err,
+                ));
+            };
 
             let ops = tx
                 .shard_ops
                 .get(&shard_idx)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            match shard.prepare(tx_id, ops)? {
+            let vote = match shard.prepare(tx_id, ops) {
+                Ok(vote) => vote,
+                Err(err) => {
+                    // A participant failed mid-prepare. No commit decision is
+                    // durable yet, so record the abort and release every shard
+                    // that already voted before surfacing the error.
+                    return Err(self.abort_after_prepare_failure(
+                        tx_id,
+                        &participating_shards,
+                        &prepared_shards,
+                        err,
+                    ));
+                }
+            };
+            match vote {
                 Vote::Commit => {
                     prepared_shards.push(shard_idx);
                 }
@@ -630,11 +649,7 @@ impl DistributedTxCoordinator {
                     // No commit decision was ever made durable → abort.
                     self.log
                         .record(tx_id, TxState::Aborting, &participating_shards)?;
-                    for &already in &prepared_shards {
-                        if let Some(s) = self.shards.get(already) {
-                            s.rollback(tx_id).ok();
-                        }
-                    }
+                    self.rollback_shards(tx_id, &prepared_shards);
                     self.log
                         .record(tx_id, TxState::Aborted, &participating_shards)?;
                     return Ok(TxOutcome::RolledBack);
@@ -642,8 +657,17 @@ impl DistributedTxCoordinator {
             }
         }
 
-        self.log
-            .record(tx_id, TxState::Prepared, &participating_shards)?;
+        let prepared_logged = self
+            .log
+            .record(tx_id, TxState::Prepared, &participating_shards);
+        if let Err(err) = prepared_logged {
+            return Err(self.abort_after_prepare_failure(
+                tx_id,
+                &participating_shards,
+                &prepared_shards,
+                err,
+            ));
+        }
 
         // ── Commit point ────────────────────────────────────────────────────
         // Persisting `Committing` is the atomic commit decision: if the
@@ -653,22 +677,89 @@ impl DistributedTxCoordinator {
             .record(tx_id, TxState::Committing, &participating_shards)?;
 
         // ── Phase 2: Commit ─────────────────────────────────────────────────
+        // The commit decision is durable, so a failure here must not be turned
+        // into an abort. The log keeps the transaction in `Committing`, which
+        // makes `recover` re-drive the commit; we re-assert that record and log
+        // the failure before returning so the shard state is never unknown.
         for &shard_idx in &participating_shards {
-            let shard = self
-                .shards
-                .get(shard_idx)
-                .ok_or(DistributedTxError::ShardUnavailable(
+            let result = match self.shards.get(shard_idx) {
+                Some(shard) => shard.commit(tx_id),
+                None => Err(DistributedTxError::ShardUnavailable(
                     shard_idx,
                     "index out of range".to_string(),
-                ))?;
-
-            shard.commit(tx_id)?;
+                )),
+            };
+            if let Err(err) = result {
+                tracing::error!(
+                    tx_id = %tx_id,
+                    shard = shard_idx,
+                    error = %err,
+                    "2PC commit failed after commit decision; left in Committing for recovery"
+                );
+                let rerecorded = self
+                    .log
+                    .record(tx_id, TxState::Committing, &participating_shards);
+                if let Err(log_err) = rerecorded {
+                    tracing::error!(
+                        tx_id = %tx_id,
+                        error = %log_err,
+                        "failed to re-record Committing state after commit failure"
+                    );
+                }
+                return Err(err);
+            }
         }
 
         self.log
             .record(tx_id, TxState::Committed, &participating_shards)?;
 
         Ok(TxOutcome::Committed)
+    }
+
+    /// Best-effort rollback of every shard in `shards`.
+    fn rollback_shards(&self, tx_id: &str, shards: &[usize]) {
+        for &idx in shards {
+            if let Some(shard) = self.shards.get(idx) {
+                if let Err(err) = shard.rollback(tx_id) {
+                    tracing::warn!(
+                        tx_id = %tx_id,
+                        shard = idx,
+                        error = %err,
+                        "2PC rollback failed; recovery will retry"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record an abort for a transaction that failed before its commit
+    /// decision became durable, roll back the shards that already prepared,
+    /// and return the original error.
+    ///
+    /// Log writes are best-effort here: if the `Aborting` record cannot be
+    /// written the transaction is still in `Preparing`/`Prepared`, which
+    /// `recover` also resolves as presumed-abort.
+    fn abort_after_prepare_failure(
+        &self,
+        tx_id: &str,
+        participants: &[usize],
+        prepared: &[usize],
+        err: DistributedTxError,
+    ) -> DistributedTxError {
+        tracing::error!(
+            tx_id = %tx_id,
+            error = %err,
+            "2PC prepare phase failed; aborting transaction"
+        );
+        if let Err(log_err) = self.log.record(tx_id, TxState::Aborting, participants) {
+            tracing::error!(tx_id = %tx_id, error = %log_err, "failed to record Aborting state");
+            return err;
+        }
+        self.rollback_shards(tx_id, prepared);
+        if let Err(log_err) = self.log.record(tx_id, TxState::Aborted, participants) {
+            tracing::error!(tx_id = %tx_id, error = %log_err, "failed to record Aborted state");
+        }
+        err
     }
 
     /// Recovery routine — run once on coordinator startup.
@@ -846,6 +937,8 @@ impl std::error::Error for DistributedTxError {}
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn make_coordinator(n: usize) -> DistributedTxCoordinator {
         let shards: Vec<Arc<ShardNode>> = (0..n)
             .map(|i| {
@@ -873,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_shard_commit() {
+    fn test_single_shard_commit() -> TestResult {
         let coord = make_coordinator(1);
 
         let mut tx = DistributedTransaction::new("tx-001");
@@ -888,12 +981,13 @@ mod tests {
         let outcome = coord.execute(&tx).expect("execute");
         assert_eq!(outcome, TxOutcome::Committed);
 
-        let val = coord.shards[0].read("k1").unwrap();
+        let val = coord.shards[0].read("k1")?;
         assert_eq!(val, Some("v1".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_multi_shard_commit() {
+    fn test_multi_shard_commit() -> TestResult {
         let coord = make_coordinator(2);
 
         let mut tx = DistributedTransaction::new("tx-multi");
@@ -915,18 +1009,13 @@ mod tests {
         let outcome = coord.execute(&tx).expect("execute");
         assert_eq!(outcome, TxOutcome::Committed);
 
-        assert_eq!(
-            coord.shards[0].read("key0").unwrap(),
-            Some("val0".to_string())
-        );
-        assert_eq!(
-            coord.shards[1].read("key1").unwrap(),
-            Some("val1".to_string())
-        );
+        assert_eq!(coord.shards[0].read("key0")?, Some("val0".to_string()));
+        assert_eq!(coord.shards[1].read("key1")?, Some("val1".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_duplicate_tx_id_votes_abort() {
+    fn test_duplicate_tx_id_votes_abort() -> TestResult {
         let coord = make_coordinator(1);
 
         let mut tx = DistributedTransaction::new("tx-dup");
@@ -938,16 +1027,17 @@ mod tests {
             },
         );
 
-        coord.execute(&tx).unwrap(); // first commit
+        coord.execute(&tx)?; // first commit
 
         // Re-submit same tx_id — shard already has it in committed log,
         // so prepare detects duplicate and votes Abort.
-        let outcome2 = coord.execute(&tx).unwrap();
+        let outcome2 = coord.execute(&tx)?;
         assert_eq!(outcome2, TxOutcome::RolledBack);
+        Ok(())
     }
 
     #[test]
-    fn test_rollback_on_abort() {
+    fn test_rollback_on_abort() -> TestResult {
         let coord = make_coordinator(2);
 
         // Manually prepare shard-0 with the same tx_id to trigger an abort on
@@ -956,7 +1046,7 @@ mod tests {
             shard_key: "x".into(),
             value: "y".into(),
         }];
-        coord.shards[0].prepare("tx-force-abort", &ops).unwrap();
+        coord.shards[0].prepare("tx-force-abort", &ops)?;
 
         let mut tx = DistributedTransaction::new("tx-force-abort");
         tx.add_op(
@@ -975,15 +1065,16 @@ mod tests {
         );
 
         // Shard 0 will abort (duplicate), coordinator should rollback shard 1.
-        let outcome = coord.execute(&tx).unwrap();
+        let outcome = coord.execute(&tx)?;
         assert_eq!(outcome, TxOutcome::RolledBack);
 
         // Key "z" must NOT have been committed to shard 1.
-        assert_eq!(coord.shards[1].read("z").unwrap(), None);
+        assert_eq!(coord.shards[1].read("z")?, None);
+        Ok(())
     }
 
     #[test]
-    fn test_delete_operation() {
+    fn test_delete_operation() -> TestResult {
         let coord = make_coordinator(1);
 
         let mut tx1 = DistributedTransaction::new("tx-put");
@@ -994,7 +1085,7 @@ mod tests {
                 value: "some-value".into(),
             },
         );
-        coord.execute(&tx1).unwrap();
+        coord.execute(&tx1)?;
 
         let mut tx2 = DistributedTransaction::new("tx-del");
         tx2.add_op(
@@ -1003,9 +1094,10 @@ mod tests {
                 shard_key: "del-me".into(),
             },
         );
-        coord.execute(&tx2).unwrap();
+        coord.execute(&tx2)?;
 
-        assert_eq!(coord.shards[0].read("del-me").unwrap(), None);
+        assert_eq!(coord.shards[0].read("del-me")?, None);
+        Ok(())
     }
 
     #[test]
@@ -1026,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rebalance_moves_keys() {
+    fn test_rebalance_moves_keys() -> TestResult {
         // Create a coordinator with 2 shards, then rebalance under 3 shards.
         let coord = make_coordinator(3);
 
@@ -1041,30 +1133,33 @@ mod tests {
                     value: "v".into(),
                 },
             );
-            coord.execute(&tx).unwrap();
+            coord.execute(&tx)?;
         }
 
         // Rebalance: move keys that would belong to shard-2 under 3-shard layout.
-        let moved = coord.rebalance(0, 2, 3).unwrap();
+        let moved = coord.rebalance(0, 2, 3)?;
         // moved should be ≥ 0; exact count depends on hash distribution.
         let _ = moved; // just asserting it doesn't panic
+        Ok(())
     }
 
     #[test]
-    fn test_empty_transaction_commits() {
+    fn test_empty_transaction_commits() -> TestResult {
         let coord = make_coordinator(1);
         let tx = DistributedTransaction::new("tx-empty");
         // No ops — should commit vacuously.
-        let outcome = coord.execute(&tx).unwrap();
+        let outcome = coord.execute(&tx)?;
         assert_eq!(outcome, TxOutcome::Committed);
+        Ok(())
     }
 
     #[test]
-    fn test_from_env_single_shard() {
+    fn test_from_env_single_shard() -> TestResult {
         std::env::set_var("DB_SHARD_COUNT", "1");
-        let coord = DistributedTxCoordinator::from_env().unwrap();
+        let coord = DistributedTxCoordinator::from_env()?;
         assert_eq!(coord.shard_count(), 1);
         std::env::remove_var("DB_SHARD_COUNT");
+        Ok(())
     }
 
     // ── Crash-recovery tests (#354) ─────────────────────────────────────────
@@ -1085,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_records_terminal_state_in_the_log() {
+    fn execute_records_terminal_state_in_the_log() -> TestResult {
         let (shards, log) = shards_and_log(2);
         let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
 
@@ -1104,16 +1199,17 @@ mod tests {
                 value: "2".into(),
             },
         );
-        coord.execute(&tx).unwrap();
+        coord.execute(&tx)?;
 
-        let rec = log.get("tx-logged").unwrap().unwrap();
+        let rec = log.get("tx-logged")?.ok_or("expected a value")?;
         assert_eq!(rec.state, TxState::Committed);
         assert_eq!(rec.participants, vec![0, 1]);
-        assert!(log.load_in_flight().unwrap().is_empty());
+        assert!(log.load_in_flight()?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn recovery_resumes_commit_when_decision_was_durable() {
+    fn recovery_resumes_commit_when_decision_was_durable() -> TestResult {
         // Simulate: coordinator persisted `Committing`, committed shard 0, then
         // crashed before committing shard 1.
         let (shards, log) = shards_and_log(2);
@@ -1126,24 +1222,25 @@ mod tests {
             shard_key: "k1".into(),
             value: "v1".into(),
         }];
-        shards[0].prepare(tx_id, &ops0).unwrap();
-        shards[1].prepare(tx_id, &ops1).unwrap();
-        log.record(tx_id, TxState::Committing, &[0, 1]).unwrap();
-        shards[0].commit(tx_id).unwrap(); // partial commit before "crash"
+        shards[0].prepare(tx_id, &ops0)?;
+        shards[1].prepare(tx_id, &ops1)?;
+        log.record(tx_id, TxState::Committing, &[0, 1])?;
+        shards[0].commit(tx_id)?; // partial commit before "crash"
 
         // Restart: fresh coordinator over the same shards + log.
         let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
-        let outcomes = coord.recover().unwrap();
+        let outcomes = coord.recover()?;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].action, RecoveryAction::ResumedCommit);
 
-        assert_eq!(coord.shards[0].read("k0").unwrap(), Some("v0".into()));
-        assert_eq!(coord.shards[1].read("k1").unwrap(), Some("v1".into()));
-        assert_eq!(log.get(tx_id).unwrap().unwrap().state, TxState::Committed);
+        assert_eq!(coord.shards[0].read("k0")?, Some("v0".into()));
+        assert_eq!(coord.shards[1].read("k1")?, Some("v1".into()));
+        assert_eq!(log.get(tx_id)?.ok_or("missing")?.state, TxState::Committed);
+        Ok(())
     }
 
     #[test]
-    fn recovery_aborts_when_no_commit_decision_was_durable() {
+    fn recovery_aborts_when_no_commit_decision_was_durable() -> TestResult {
         // Simulate: coordinator prepared both shards, persisted `Prepared`, then
         // crashed before the commit decision.
         let (shards, log) = shards_and_log(2);
@@ -1152,39 +1249,74 @@ mod tests {
             shard_key: "z".into(),
             value: "w".into(),
         }];
-        shards[0].prepare(tx_id, &ops).unwrap();
-        shards[1].prepare(tx_id, &ops).unwrap();
-        log.record(tx_id, TxState::Prepared, &[0, 1]).unwrap();
+        shards[0].prepare(tx_id, &ops)?;
+        shards[1].prepare(tx_id, &ops)?;
+        log.record(tx_id, TxState::Prepared, &[0, 1])?;
 
         let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
-        let outcomes = coord.recover().unwrap();
+        let outcomes = coord.recover()?;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].action, RecoveryAction::Compensated);
 
         // Nothing was applied, and the prepared entries were discarded so the
         // shards can accept new work under the same key.
-        assert_eq!(coord.shards[0].read("z").unwrap(), None);
-        assert_eq!(coord.shards[1].read("z").unwrap(), None);
-        assert_eq!(log.get(tx_id).unwrap().unwrap().state, TxState::Aborted);
+        assert_eq!(coord.shards[0].read("z")?, None);
+        assert_eq!(coord.shards[1].read("z")?, None);
+        assert_eq!(log.get(tx_id)?.ok_or("missing")?.state, TxState::Aborted);
+        Ok(())
     }
 
     #[test]
-    fn recovery_is_idempotent() {
+    fn recovery_is_idempotent() -> TestResult {
         let (shards, log) = shards_and_log(1);
         let tx_id = "tx-idem";
         let ops = vec![Operation::Put {
             shard_key: "i".into(),
             value: "1".into(),
         }];
-        shards[0].prepare(tx_id, &ops).unwrap();
-        log.record(tx_id, TxState::Committing, &[0]).unwrap();
+        shards[0].prepare(tx_id, &ops)?;
+        log.record(tx_id, TxState::Committing, &[0])?;
 
         let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
-        let first = coord.recover().unwrap();
+        let first = coord.recover()?;
         assert_eq!(first.len(), 1);
         // Second pass has nothing in flight and must not error.
-        let second = coord.recover().unwrap();
+        let second = coord.recover()?;
         assert!(second.is_empty());
-        assert_eq!(coord.shards[0].read("i").unwrap(), Some("1".into()));
+        assert_eq!(coord.shards[0].read("i")?, Some("1".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_failure_is_recorded_as_aborted_before_returning() -> TestResult {
+        let (shards, log) = shards_and_log(1);
+        let coord = DistributedTxCoordinator::with_log(shards, Arc::clone(&log));
+
+        // Shard 0 prepares, then shard 5 does not exist and prepare fails.
+        let mut tx = DistributedTransaction::new("tx-prepare-fails");
+        tx.add_op(
+            0,
+            Operation::Put {
+                shard_key: "p".into(),
+                value: "1".into(),
+            },
+        );
+        tx.add_op(
+            5,
+            Operation::Put {
+                shard_key: "q".into(),
+                value: "2".into(),
+            },
+        );
+
+        let err = coord.execute(&tx).err().ok_or("execute should fail")?;
+        assert!(matches!(err, DistributedTxError::ShardUnavailable(5, _)));
+
+        // The failure was recorded and the prepared shard was released.
+        let rec = log.get("tx-prepare-fails")?.ok_or("log record missing")?;
+        assert_eq!(rec.state, TxState::Aborted);
+        assert!(log.load_in_flight()?.is_empty());
+        assert_eq!(coord.shards[0].read("p")?, None);
+        Ok(())
     }
 }

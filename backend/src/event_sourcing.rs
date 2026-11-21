@@ -450,7 +450,7 @@ impl<'a> EventReplayer<'a> {
         // Step 3 — apply
         for raw in events {
             let event = raw.migrate_to_current();
-            apply_event(&mut state, &event);
+            apply_event(&mut state, &event)?;
         }
 
         Ok(ReplayedState {
@@ -527,7 +527,7 @@ impl<'a> EventReplayer<'a> {
 
         for raw in filtered {
             let event = raw.migrate_to_current();
-            apply_event(&mut state, &event);
+            apply_event(&mut state, &event)?;
         }
 
         Ok(ReplayedState {
@@ -552,47 +552,95 @@ pub struct ReplayedState {
 
 // ── Event application ─────────────────────────────────────────────────────────
 
+/// Build a [`EventSourcingError::MalformedEvent`] for `event`.
+fn malformed(event: &StoredEvent, reason: impl Into<String>) -> EventSourcingError {
+    EventSourcingError::MalformedEvent {
+        vault_id: event.vault_id.clone(),
+        sequence: event.sequence,
+        reason: reason.into(),
+    }
+}
+
+/// Read a required integer `balance_delta` from `event`.
+fn required_balance_delta(event: &StoredEvent) -> Result<i128, EventSourcingError> {
+    match event.data.get("balance_delta") {
+        Some(v) => v
+            .as_i64()
+            .map(i128::from)
+            .ok_or_else(|| malformed(event, "balance_delta is not an integer")),
+        None => Err(malformed(event, "missing balance_delta")),
+    }
+}
+
+/// Read an optional `ttl_remaining`; present but not a `u64` is malformed.
+fn optional_ttl(event: &StoredEvent) -> Result<Option<u64>, EventSourcingError> {
+    match event.data.get("ttl_remaining") {
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| malformed(event, "ttl_remaining is not a non-negative integer")),
+        None => Ok(None),
+    }
+}
+
 /// Apply a single event to a mutable state.  Keep this pure so it is easy to
 /// test in isolation.
-fn apply_event(state: &mut SnapshotState, event: &StoredEvent) {
+///
+/// Returns [`EventSourcingError::MalformedEvent`] when the payload does not
+/// match its event type, so replay fails loudly instead of silently
+/// reconstructing the wrong state. `state` is left unchanged on error.
+fn apply_event(state: &mut SnapshotState, event: &StoredEvent) -> Result<(), EventSourcingError> {
+    if !event.data.is_object() {
+        return Err(malformed(event, "data payload is not a JSON object"));
+    }
     match &event.event_type {
         EventType::Deposit => {
-            if let Some(delta) = event.data.get("balance_delta").and_then(|v| v.as_i64()) {
-                state.balance += delta as i128;
-            }
+            let delta = required_balance_delta(event)?;
+            state.balance = state
+                .balance
+                .checked_add(delta)
+                .ok_or_else(|| malformed(event, "balance overflow"))?;
         }
         EventType::Withdrawal => {
-            if let Some(delta) = event.data.get("balance_delta").and_then(|v| v.as_i64()) {
-                state.balance -= delta as i128;
-            }
+            let delta = required_balance_delta(event)?;
+            state.balance = state
+                .balance
+                .checked_sub(delta)
+                .ok_or_else(|| malformed(event, "balance overflow"))?;
         }
         EventType::CheckIn => {
+            let ttl = optional_ttl(event)?;
             state.last_check_in = event.timestamp;
-            if let Some(ttl) = event.data.get("ttl_remaining").and_then(|v| v.as_u64()) {
-                state.ttl_remaining = Some(ttl);
+            if ttl.is_some() {
+                state.ttl_remaining = ttl;
             }
         }
         EventType::TtlUpdate => {
-            if let Some(ttl) = event.data.get("ttl_remaining").and_then(|v| v.as_u64()) {
+            if let Some(ttl) = optional_ttl(event)? {
                 state.ttl_remaining = Some(ttl);
             }
         }
         EventType::StatusChange => {
-            if let Some(s) = event.data.get("status").and_then(|v| v.as_str()) {
-                state.status = match s {
-                    "active" => VaultStatus::Active,
-                    "expired" => VaultStatus::Expired,
-                    "released" => VaultStatus::Released,
-                    "paused" => VaultStatus::Paused,
-                    _ => state.status.clone(),
-                };
-            }
+            let status = event
+                .data
+                .get("status")
+                .ok_or_else(|| malformed(event, "missing status"))?
+                .as_str()
+                .ok_or_else(|| malformed(event, "status is not a string"))?;
+            state.status = match status {
+                "active" => VaultStatus::Active,
+                "expired" => VaultStatus::Expired,
+                "released" => VaultStatus::Released,
+                "paused" => VaultStatus::Paused,
+                other => return Err(malformed(event, format!("unknown status: {other}"))),
+            };
         }
         EventType::Release => {
             state.status = VaultStatus::Released;
             state.balance = 0;
         }
     }
+    Ok(())
 }
 
 // ── Shared state wrapper ──────────────────────────────────────────────────────
@@ -642,6 +690,12 @@ pub enum EventSourcingError {
     Serialization(#[from] serde_json::Error),
     #[error("database error: {0}")]
     DatabaseError(String),
+    #[error("malformed event {vault_id}#{sequence}: {reason}")]
+    MalformedEvent {
+        vault_id: String,
+        sequence: u64,
+        reason: String,
+    },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -650,61 +704,63 @@ pub enum EventSourcingError {
 mod tests {
     use super::*;
 
-    fn make_log_with_events() -> EventLog {
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn make_log_with_events() -> Result<EventLog, EventSourcingError> {
         let log = EventLog::new();
         log.append(
             "vault-1",
             EventType::Deposit,
             serde_json::json!({"balance_delta": 1000}),
-        )
-        .unwrap();
+        )?;
         log.append(
             "vault-1",
             EventType::CheckIn,
             serde_json::json!({"ttl_remaining": 86400}),
-        )
-        .unwrap();
+        )?;
         log.append(
             "vault-1",
             EventType::Withdrawal,
             serde_json::json!({"balance_delta": 200}),
-        )
-        .unwrap();
-        log
+        )?;
+        Ok(log)
     }
 
     #[test]
-    fn append_is_append_only_and_sequences_are_monotonic() {
-        let log = make_log_with_events();
-        let events = log.events_for_vault("vault-1").unwrap();
+    fn append_is_append_only_and_sequences_are_monotonic() -> TestResult {
+        let log = make_log_with_events()?;
+        let events = log.events_for_vault("vault-1")?;
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].sequence, 1);
         assert_eq!(events[1].sequence, 2);
         assert_eq!(events[2].sequence, 3);
+        Ok(())
     }
 
     #[test]
-    fn events_after_filters_correctly() {
-        let log = make_log_with_events();
-        let events = log.events_after("vault-1", 1).unwrap();
+    fn events_after_filters_correctly() -> TestResult {
+        let log = make_log_with_events()?;
+        let events = log.events_after("vault-1", 1)?;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].sequence, 2);
+        Ok(())
     }
 
     #[test]
-    fn replay_rebuilds_balance_from_scratch() {
-        let log = make_log_with_events();
+    fn replay_rebuilds_balance_from_scratch() -> TestResult {
+        let log = make_log_with_events()?;
         let snapshots = SnapshotStore::new();
         let replayer = EventReplayer::new(&log, &snapshots);
-        let result = replayer.replay("vault-1").unwrap();
+        let result = replayer.replay("vault-1")?;
         // 1000 deposit − 200 withdrawal = 800
         assert_eq!(result.state.balance, 800);
         assert_eq!(result.events_applied, 3);
+        Ok(())
     }
 
     #[test]
-    fn replay_uses_snapshot_as_baseline() {
-        let log = make_log_with_events();
+    fn replay_uses_snapshot_as_baseline() -> TestResult {
+        let log = make_log_with_events()?;
         let snapshots = SnapshotStore::new();
 
         // Simulate a snapshot taken after seq 2 with balance = 1000
@@ -719,25 +775,26 @@ mod tests {
                     last_check_in: Utc::now(),
                     ttl_remaining: Some(86400),
                 },
-            })
-            .unwrap();
+            })?;
 
         let replayer = EventReplayer::new(&log, &snapshots);
-        let result = replayer.replay("vault-1").unwrap();
+        let result = replayer.replay("vault-1")?;
         // Snapshot balance 1000 − 200 withdrawal (seq 3) = 800
         assert_eq!(result.state.balance, 800);
         assert_eq!(result.events_applied, 1);
+        Ok(())
     }
 
     #[test]
-    fn replay_to_target_sequence_stops_at_correct_point() {
-        let log = make_log_with_events();
+    fn replay_to_target_sequence_stops_at_correct_point() -> TestResult {
+        let log = make_log_with_events()?;
         let snapshots = SnapshotStore::new();
         let replayer = EventReplayer::new(&log, &snapshots);
         // Replay only deposit (seq 1) — balance should be 1000
-        let result = replayer.replay_to("vault-1", 1).unwrap();
+        let result = replayer.replay_to("vault-1", 1)?;
         assert_eq!(result.state.balance, 1000);
         assert_eq!(result.events_applied, 1);
+        Ok(())
     }
 
     #[test]
@@ -757,40 +814,38 @@ mod tests {
     }
 
     #[test]
-    fn separate_vaults_have_independent_sequences() {
+    fn separate_vaults_have_independent_sequences() -> TestResult {
         let log = EventLog::new();
-        log.append("vault-a", EventType::Deposit, serde_json::json!({}))
-            .unwrap();
-        log.append("vault-b", EventType::Deposit, serde_json::json!({}))
-            .unwrap();
-        log.append("vault-a", EventType::CheckIn, serde_json::json!({}))
-            .unwrap();
+        log.append("vault-a", EventType::Deposit, serde_json::json!({}))?;
+        log.append("vault-b", EventType::Deposit, serde_json::json!({}))?;
+        log.append("vault-a", EventType::CheckIn, serde_json::json!({}))?;
 
-        let a_events = log.events_for_vault("vault-a").unwrap();
-        let b_events = log.events_for_vault("vault-b").unwrap();
+        let a_events = log.events_for_vault("vault-a")?;
+        let b_events = log.events_for_vault("vault-b")?;
 
         assert_eq!(a_events[0].sequence, 1);
         assert_eq!(a_events[1].sequence, 2);
         assert_eq!(b_events[0].sequence, 1);
+        Ok(())
     }
 
     #[test]
-    fn status_change_event_updates_status() {
+    fn status_change_event_updates_status() -> TestResult {
         let log = EventLog::new();
         log.append(
             "vault-1",
             EventType::StatusChange,
             serde_json::json!({"status": "released"}),
-        )
-        .unwrap();
+        )?;
         let snapshots = SnapshotStore::new();
         let replayer = EventReplayer::new(&log, &snapshots);
-        let result = replayer.replay("vault-1").unwrap();
+        let result = replayer.replay("vault-1")?;
         assert_eq!(result.state.status, VaultStatus::Released);
+        Ok(())
     }
 
     #[test]
-    fn events_persist_to_database_and_survive_restart() {
+    fn events_persist_to_database_and_survive_restart() -> TestResult {
         // Create a database and log with persistence enabled.
         let db = Arc::new(
             crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
@@ -805,25 +860,24 @@ mod tests {
             "vault-1",
             EventType::Deposit,
             serde_json::json!({"balance_delta": 1000}),
-        )
-        .unwrap();
+        )?;
         log.append(
             "vault-1",
             EventType::CheckIn,
             serde_json::json!({"ttl_remaining": 86400}),
-        )
-        .unwrap();
+        )?;
 
         // Verify events are persisted (simulate restart by creating new log)
         let new_log = EventLog::with_db(db);
-        let events = new_log.events_for_vault("vault-1").unwrap();
+        let events = new_log.events_for_vault("vault-1")?;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, EventType::Deposit);
         assert_eq!(events[1].event_type, EventType::CheckIn);
+        Ok(())
     }
 
     #[test]
-    fn snapshots_persist_to_database_and_survive_restart() {
+    fn snapshots_persist_to_database_and_survive_restart() -> TestResult {
         let db = Arc::new(
             crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
                 .expect("failed to open db"),
@@ -844,103 +898,96 @@ mod tests {
                     last_check_in: Utc::now(),
                     ttl_remaining: Some(172800),
                 },
-            })
-            .unwrap();
+            })?;
 
         // Simulate restart by creating new snapshot store
         let new_snapshots = SnapshotStore::with_db(db);
-        let retrieved = new_snapshots.get("vault-1").unwrap();
+        let retrieved = new_snapshots.get("vault-1")?;
         assert!(retrieved.is_some());
-        let snap = retrieved.unwrap();
+        let snap = retrieved.ok_or("snapshot missing")?;
         assert_eq!(snap.snapshot_sequence, 100);
         assert_eq!(snap.state.balance, 5000);
+        Ok(())
     }
 
     /// Append `n` alternating deposit/withdrawal events (net +800 per full
     /// 3-event cycle: +1000, ttl check-in, −200) to `vault_id`.
-    fn append_many(log: &EventLog, vault_id: &str, n: u64) {
+    fn append_many(log: &EventLog, vault_id: &str, n: u64) -> Result<(), EventSourcingError> {
         for i in 0..n {
-            match i % 3 {
-                0 => log
-                    .append(
-                        vault_id.to_string(),
-                        EventType::Deposit,
-                        serde_json::json!({ "balance_delta": 1000 }),
-                    )
-                    .unwrap(),
-                1 => log
-                    .append(
-                        vault_id.to_string(),
-                        EventType::CheckIn,
-                        serde_json::json!({ "ttl_remaining": 86400 }),
-                    )
-                    .unwrap(),
-                _ => log
-                    .append(
-                        vault_id.to_string(),
-                        EventType::Withdrawal,
-                        serde_json::json!({ "balance_delta": 200 }),
-                    )
-                    .unwrap(),
+            let (event_type, data) = match i % 3 {
+                0 => (
+                    EventType::Deposit,
+                    serde_json::json!({ "balance_delta": 1000 }),
+                ),
+                1 => (
+                    EventType::CheckIn,
+                    serde_json::json!({ "ttl_remaining": 86400 }),
+                ),
+                _ => (
+                    EventType::Withdrawal,
+                    serde_json::json!({ "balance_delta": 200 }),
+                ),
             };
+            log.append(vault_id.to_string(), event_type, data)?;
         }
+        Ok(())
     }
 
     #[test]
-    fn snapshotting_replay_matches_full_replay() {
+    fn snapshotting_replay_matches_full_replay() -> TestResult {
         let log = EventLog::new();
-        append_many(&log, "vault-1", 250);
+        append_many(&log, "vault-1", 250)?;
 
         // Full replay from the beginning — the reference result.
         let full = {
             let snaps = SnapshotStore::new();
-            EventReplayer::new(&log, &snaps).replay("vault-1").unwrap()
+            EventReplayer::new(&log, &snaps).replay("vault-1")?
         };
         assert_eq!(full.events_applied, 250);
 
         // Snapshotting replay writes a snapshot as a side effect...
         let snaps = SnapshotStore::new();
         let replayer = EventReplayer::new(&log, &snaps);
-        let first = replayer.replay_with_snapshotting("vault-1").unwrap();
+        let first = replayer.replay_with_snapshotting("vault-1")?;
         assert_eq!(first.state.balance, full.state.balance);
         assert_eq!(first.state.status, full.state.status);
 
         // ...so a subsequent replay resumes from the snapshot and applies far
         // fewer events, yet reconstructs the identical state.
-        let snap = snaps.get("vault-1").unwrap().expect("snapshot persisted");
+        let snap = snaps.get("vault-1")?.expect("snapshot persisted");
         assert_eq!(snap.snapshot_sequence, 250);
 
-        let second = replayer.replay("vault-1").unwrap();
+        let second = replayer.replay("vault-1")?;
         assert_eq!(second.events_applied, 0);
         assert_eq!(second.state.balance, full.state.balance);
 
         // And new events after the snapshot still apply on top of it.
-        append_many(&log, "vault-1", 10);
-        let third = replayer.replay("vault-1").unwrap();
+        append_many(&log, "vault-1", 10)?;
+        let third = replayer.replay("vault-1")?;
         assert_eq!(third.events_applied, 10);
         let expected = EventReplayer::new(&log, &SnapshotStore::new())
-            .replay("vault-1")
-            .unwrap();
+            .replay("vault-1")?;
         assert_eq!(third.state.balance, expected.state.balance);
+        Ok(())
     }
 
     #[test]
-    fn snapshotting_is_skipped_below_the_interval() {
+    fn snapshotting_is_skipped_below_the_interval() -> TestResult {
         let log = EventLog::new();
-        append_many(&log, "vault-1", SNAPSHOT_INTERVAL - 1);
+        append_many(&log, "vault-1", SNAPSHOT_INTERVAL - 1)?;
         let snaps = SnapshotStore::new();
         EventReplayer::new(&log, &snaps)
-            .replay_with_snapshotting("vault-1")
-            .unwrap();
-        assert!(snaps.get("vault-1").unwrap().is_none());
+            .replay_with_snapshotting("vault-1")?;
+        assert!(snaps.get("vault-1")?.is_none());
+        Ok(())
     }
 
     #[test]
-    fn bench_replay_with_and_without_snapshots() {
+    fn bench_replay_with_and_without_snapshots() -> TestResult {
         use std::time::Instant;
 
         let log = EventLog::new();
-        append_many(&log, "vault-1", 5_000);
+        append_many(&log, "vault-1", 5_000)?;
 
         // Cold: full replay from sequence 0 every time.
         let cold_snaps = SnapshotStore::new();
@@ -948,20 +995,18 @@ mod tests {
         let cold_start = Instant::now();
         let mut cold_applied = 0usize;
         for _ in 0..20 {
-            cold_applied = cold_replayer.replay("vault-1").unwrap().events_applied;
+            cold_applied = cold_replayer.replay("vault-1")?.events_applied;
         }
         let cold = cold_start.elapsed();
 
         // Warm: take a snapshot once, then replay only the tail.
         let warm_snaps = SnapshotStore::new();
         let warm_replayer = EventReplayer::new(&log, &warm_snaps);
-        warm_replayer
-            .replay_with_snapshotting("vault-1")
-            .unwrap();
+        warm_replayer.replay_with_snapshotting("vault-1")?;
         let warm_start = Instant::now();
         let mut warm_applied = 0usize;
         for _ in 0..20 {
-            warm_applied = warm_replayer.replay("vault-1").unwrap().events_applied;
+            warm_applied = warm_replayer.replay("vault-1")?.events_applied;
         }
         let warm = warm_start.elapsed();
 
@@ -973,10 +1018,11 @@ mod tests {
         // The snapshot must eliminate essentially all replay work here.
         assert_eq!(cold_applied, 5_000);
         assert_eq!(warm_applied, 0);
+        Ok(())
     }
 
     #[test]
-    fn replay_from_persisted_snapshot_plus_new_events_is_correct() {
+    fn replay_from_persisted_snapshot_plus_new_events_is_correct() -> TestResult {
         let db = Arc::new(
             crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
                 .expect("failed to open db"),
@@ -991,14 +1037,12 @@ mod tests {
             "vault-1",
             EventType::Deposit,
             serde_json::json!({"balance_delta": 1000}),
-        )
-        .unwrap();
+        )?;
         log.append(
             "vault-1",
             EventType::CheckIn,
             serde_json::json!({"ttl_remaining": 86400}),
-        )
-        .unwrap();
+        )?;
 
         snapshots
             .save(VaultSnapshot {
@@ -1011,23 +1055,73 @@ mod tests {
                     last_check_in: Utc::now(),
                     ttl_remaining: Some(86400),
                 },
-            })
-            .unwrap();
+            })?;
 
         // Add one more event after snapshot
         log.append(
             "vault-1",
             EventType::Withdrawal,
             serde_json::json!({"balance_delta": 200}),
-        )
-        .unwrap();
+        )?;
 
         // Replay should use snapshot + new event
         let replayer = EventReplayer::new(&log, &snapshots);
-        let result = replayer.replay("vault-1").unwrap();
+        let result = replayer.replay("vault-1")?;
         // 1000 (snapshot) − 200 (withdrawal) = 800
         assert_eq!(result.state.balance, 800);
         assert_eq!(result.events_applied, 1);
         assert_eq!(result.last_sequence, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_returns_error_on_malformed_event() -> TestResult {
+        let log = EventLog::new();
+        log.append(
+            "vault-1",
+            EventType::Deposit,
+            serde_json::json!({"balance_delta": 1000}),
+        )?;
+        log.append(
+            "vault-1",
+            EventType::Withdrawal,
+            serde_json::json!({"balance_delta": "not-a-number"}),
+        )?;
+        let snapshots = SnapshotStore::new();
+        let replayer = EventReplayer::new(&log, &snapshots);
+
+        let err = replayer.replay("vault-1").err().ok_or("replay should fail")?;
+        match err {
+            EventSourcingError::MalformedEvent { sequence, .. } => assert_eq!(sequence, 2),
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+
+        // Replaying up to the last good event still works.
+        let ok = replayer.replay_to("vault-1", 1)?;
+        assert_eq!(ok.state.balance, 1000);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rejects_missing_fields_and_unknown_status() -> TestResult {
+        for (event_type, data) in [
+            (EventType::Deposit, serde_json::json!({})),
+            (
+                EventType::StatusChange,
+                serde_json::json!({"status": "bogus"}),
+            ),
+            (
+                EventType::TtlUpdate,
+                serde_json::json!({"ttl_remaining": -1}),
+            ),
+            (EventType::CheckIn, serde_json::json!("not-an-object")),
+        ] {
+            let log = EventLog::new();
+            log.append("vault-1", event_type, data)?;
+            let snapshots = SnapshotStore::new();
+            let result = EventReplayer::new(&log, &snapshots).replay("vault-1");
+            assert!(matches!(result, Err(EventSourcingError::MalformedEvent { .. })));
+        }
+        Ok(())
     }
 }

@@ -24,6 +24,13 @@
 //! Every update to a flag increments its `version` and writes the previous
 //! state to the `feature_flag_history` SQL table, so changes can be audited
 //! or rolled back across process restarts and load-balanced instances.
+//!
+//! # Fallback on error
+//!
+//! Flag evaluation never panics. If the flag store cannot be read, a flag
+//! evaluates to [`FALLBACK_ENABLED`] (disabled) with the reason
+//! [`FALLBACK_REASON`], so a storage failure turns a feature off instead of
+//! failing the request that checked it.
 
 use std::sync::Arc;
 
@@ -113,6 +120,42 @@ pub struct FlagState {
 impl FlagState {
     pub fn new(db: Arc<Db>) -> Self {
         Self { db }
+    }
+
+    /// Return whether `key` is enabled for `subject_id`.
+    ///
+    /// Unknown flags and store errors both resolve to [`FALLBACK_ENABLED`],
+    /// so callers can gate code on a flag without handling errors themselves.
+    pub fn is_enabled(&self, key: &str, subject_id: &str) -> bool {
+        match self.db.get_feature_flag(key) {
+            Ok(Some(flag)) => evaluate_flag(&flag, subject_id).enabled,
+            Ok(None) => FALLBACK_ENABLED,
+            Err(err) => {
+                tracing::warn!(
+                    flag = %key,
+                    error = %err,
+                    "feature flag lookup failed; using fallback"
+                );
+                FALLBACK_ENABLED
+            }
+        }
+    }
+}
+
+/// Value a flag evaluates to when the flag store cannot be read.
+pub const FALLBACK_ENABLED: bool = false;
+
+/// `reason` reported by an evaluation that used [`FALLBACK_ENABLED`].
+pub const FALLBACK_REASON: &str = "flag store unavailable; using fallback";
+
+/// Build the evaluation returned when the flag store cannot be read.
+pub fn fallback_evaluation(key: &str, subject_id: &str) -> FlagEvaluation {
+    FlagEvaluation {
+        key: key.to_string(),
+        subject_id: subject_id.to_string(),
+        enabled: FALLBACK_ENABLED,
+        reason: FALLBACK_REASON.to_string(),
+        flag_version: 0,
     }
 }
 
@@ -225,6 +268,9 @@ pub async fn get_flag(
 }
 
 /// `POST /admin/flags/:key/evaluate` — evaluate a flag for a subject.
+///
+/// If the flag store cannot be read the response is the documented fallback
+/// (see [`fallback_evaluation`]) rather than an error.
 pub async fn evaluate_flag_handler(
     State(state): State<Arc<FlagState>>,
     Path(key): Path<String>,
@@ -233,13 +279,18 @@ pub async fn evaluate_flag_handler(
     match state.db.get_feature_flag(&key) {
         Ok(Some(flag)) => Ok(Json(evaluate_flag(&flag, &body.subject_id))),
         Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(err) => {
+            tracing::warn!(flag = %key, error = %err, "feature flag lookup failed; using fallback");
+            Ok(Json(fallback_evaluation(&key, &body.subject_id)))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn sample_flag(rollout: u8) -> FeatureFlag {
         FeatureFlag {
@@ -279,6 +330,14 @@ mod tests {
     }
 
     #[test]
+    fn fallback_evaluation_is_disabled() {
+        let eval = fallback_evaluation("new-checkout", "user-1");
+        assert_eq!(eval.enabled, FALLBACK_ENABLED);
+        assert!(!eval.enabled);
+        assert_eq!(eval.reason, FALLBACK_REASON);
+    }
+
+    #[test]
     fn evaluation_is_deterministic() {
         let flag = sample_flag(50);
         let first = evaluate_flag(&flag, "user-42");
@@ -297,9 +356,8 @@ mod tests {
                 "ethos_flags_{tag}_{}.sqlite3",
                 uuid::Uuid::new_v4()
             ))
-            .to_str()
-            .unwrap()
-            .to_string()
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn upsert_req(key: &str, enabled: bool, rollout: u8) -> UpsertFlagRequest {
@@ -315,19 +373,18 @@ mod tests {
     /// Regression: create/update/list/fetch behave the same as the original
     /// in-memory store from a caller's perspective.
     #[test]
-    fn sql_store_matches_previous_single_instance_behavior() {
+    fn sql_store_matches_previous_single_instance_behavior() -> TestResult {
         let path = temp_db_path("regression");
-        let db = TestDb::open(&path).unwrap();
-        db.migrate().unwrap();
+        let db = TestDb::open(&path)?;
+        db.migrate()?;
 
         // Unknown key fetches as None (was: not found).
-        assert!(db.get_feature_flag("nope").unwrap().is_none());
-        assert!(db.list_feature_flags().unwrap().is_empty());
+        assert!(db.get_feature_flag("nope")?.is_none());
+        assert!(db.list_feature_flags()?.is_empty());
 
         // Create → version 1, empty history.
         let created = db
-            .upsert_feature_flag(&upsert_req("new-checkout", true, 25))
-            .unwrap();
+            .upsert_feature_flag(&upsert_req("new-checkout", true, 25))?;
         assert_eq!(created.version, 1);
         assert!(created.history.is_empty());
         assert_eq!(created.rollout_percentage, 25);
@@ -335,8 +392,7 @@ mod tests {
 
         // Update → version 2, previous state snapshotted into history.
         let updated = db
-            .upsert_feature_flag(&upsert_req("new-checkout", true, 50))
-            .unwrap();
+            .upsert_feature_flag(&upsert_req("new-checkout", true, 50))?;
         assert_eq!(updated.version, 2);
         assert_eq!(updated.created_at, created.created_at);
         assert!(updated.updated_at >= created.updated_at);
@@ -350,103 +406,89 @@ mod tests {
         // Description omitted on update keeps the previous one.
         let mut req = upsert_req("new-checkout", false, 0);
         req.description = None;
-        let kept = db.upsert_feature_flag(&req).unwrap();
+        let kept = db.upsert_feature_flag(&req)?;
         assert_eq!(kept.version, 3);
         assert_eq!(kept.description.as_deref(), Some("flag new-checkout"));
 
         // List returns every flag; get-by-key matches list contents.
-        db.upsert_feature_flag(&upsert_req("beta-ui", true, 100))
-            .unwrap();
-        let flags = db.list_feature_flags().unwrap();
+        db.upsert_feature_flag(&upsert_req("beta-ui", true, 100))?;
+        let flags = db.list_feature_flags()?;
         let keys: Vec<&str> = flags.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, vec!["beta-ui", "new-checkout"]);
         for flag in &flags {
-            assert_eq!(
-                db.get_feature_flag(&flag.key).unwrap().unwrap().version,
-                flag.version
-            );
+            let fetched = db.get_feature_flag(&flag.key)?.ok_or("flag missing")?;
+            assert_eq!(fetched.version, flag.version);
             // History is loaded on every read, oldest first.
-            assert_eq!(
-                db.get_feature_flag(&flag.key)
-                    .unwrap()
-                    .unwrap()
-                    .history
-                    .len(),
-                flag.history.len()
-            );
+            assert_eq!(fetched.history.len(), flag.history.len());
         }
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     /// Two independent `Db`/`FlagState` handles against the same backing
     /// store must both observe an update made through either handle.
     #[test]
-    fn update_visible_across_independent_handles() {
+    fn update_visible_across_independent_handles() -> TestResult {
         let path = temp_db_path("multi");
 
         // Simulate two instances behind a load balancer sharing one database.
-        let state_a = FlagState::new(TestArc::new(TestDb::open(&path).unwrap()));
-        state_a.db.migrate().unwrap();
-        let state_b = FlagState::new(TestArc::new(TestDb::open(&path).unwrap()));
-        state_b.db.migrate().unwrap();
+        let state_a = FlagState::new(TestArc::new(TestDb::open(&path)?));
+        state_a.db.migrate()?;
+        let state_b = FlagState::new(TestArc::new(TestDb::open(&path)?));
+        state_b.db.migrate()?;
 
         // Instance A creates the flag…
         state_a
             .db
-            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 10))
-            .unwrap();
+            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 10))?;
 
         // …and instance B immediately sees it, including via evaluation.
-        let seen_by_b = state_b.db.get_feature_flag("gradual-rollout").unwrap();
+        let seen_by_b = state_b.db.get_feature_flag("gradual-rollout")?;
         assert!(seen_by_b.is_some());
-        let eval_b = evaluate_flag(&seen_by_b.unwrap(), "user-7");
+        let eval_b = evaluate_flag(&seen_by_b.ok_or("flag missing")?, "user-7");
         assert_eq!(eval_b.flag_version, 1);
 
         // Instance B updates it…
         let updated = state_b
             .db
-            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 90))
-            .unwrap();
+            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 90))?;
         assert_eq!(updated.version, 2);
 
         // …and instance A observes B's new version and history.
         let seen_by_a = state_a
             .db
-            .get_feature_flag("gradual-rollout")
-            .unwrap()
-            .unwrap();
+            .get_feature_flag("gradual-rollout")?
+            .ok_or("flag missing")?;
         assert_eq!(seen_by_a.version, 2);
         assert_eq!(seen_by_a.rollout_percentage, 90);
         assert_eq!(seen_by_a.history.len(), 1);
-        assert_eq!(state_a.db.list_feature_flags().unwrap().len(), 1);
+        assert_eq!(state_a.db.list_feature_flags()?.len(), 1);
 
         // A subject's evaluation on either instance agrees at the same version.
         let eval_a = evaluate_flag(&seen_by_a, "user-7");
         assert_eq!(eval_a.flag_version, eval_b.flag_version + 1);
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     /// Flag state and version history must survive a process restart
     /// (drop every handle, then re-open the backing store).
     #[test]
-    fn flag_state_and_history_survive_restart() {
+    fn flag_state_and_history_survive_restart() -> TestResult {
         let path = temp_db_path("restart");
         {
-            let db = TestDb::open(&path).unwrap();
-            db.migrate().unwrap();
-            db.upsert_feature_flag(&upsert_req("durable-flag", true, 5))
-                .unwrap();
-            db.upsert_feature_flag(&upsert_req("durable-flag", true, 40))
-                .unwrap();
-            db.upsert_feature_flag(&upsert_req("durable-flag", true, 80))
-                .unwrap();
+            let db = TestDb::open(&path)?;
+            db.migrate()?;
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 5))?;
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 40))?;
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 80))?;
         }
 
         // Re-open against the same file, simulating a restart.
-        let db = TestDb::open(&path).unwrap();
-        db.migrate().unwrap();
+        let db = TestDb::open(&path)?;
+        db.migrate()?;
         let flag = db
             .get_feature_flag("durable-flag")
             .expect("read after restart")
@@ -462,5 +504,6 @@ mod tests {
         assert_eq!(evaluate_flag(&flag, "user-1").flag_version, 3);
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 }

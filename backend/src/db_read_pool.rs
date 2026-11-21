@@ -19,9 +19,10 @@
 //!   demand up to `max`. Readers set `query_only`, so a write routed here
 //!   fails with `SQLITE_READONLY` rather than changing data.
 //! - **Overload**: when the pool is full and no connection frees up within
-//!   `acquire_timeout`, or a new connection cannot be opened, the caller falls
-//!   back to the writer connection. Requests get slower under load but do not
-//!   fail.
+//!   `acquire_timeout`, or a new connection cannot be opened,
+//!   [`ReadPool::try_acquire`] returns a [`PoolError`] and
+//!   [`ReadPool::acquire`] lets the caller fall back to the writer connection.
+//!   Requests get slower under load but do not fail.
 
 use rusqlite::{Connection, OpenFlags};
 use std::ops::Deref;
@@ -85,6 +86,17 @@ impl ConnSource {
         }
         Ok(conn)
     }
+}
+
+/// Why a read connection could not be checked out of the pool.
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    /// Every connection is in use and none was returned within the timeout.
+    #[error("read pool exhausted: all {max} connections busy after {waited:?}")]
+    Exhausted { max: usize, waited: Duration },
+    /// The pool had room, but opening a new read connection failed.
+    #[error("failed to open read connection: {0}")]
+    Open(#[from] rusqlite::Error),
 }
 
 #[derive(Default)]
@@ -160,33 +172,45 @@ impl ReadPool {
 
     /// Check out a read connection, or `None` if the pool is exhausted past
     /// `acquire_timeout` or a new connection could not be opened.
+    ///
+    /// Callers that want the reason should use [`ReadPool::try_acquire`].
     pub fn acquire(&self) -> Option<Connection> {
+        match self.try_acquire() {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                tracing::warn!(error = %err, "read pool checkout failed; falling back to writer");
+                None
+            }
+        }
+    }
+
+    /// Check out a read connection.
+    ///
+    /// Returns [`PoolError::Exhausted`] if the pool is full and no connection
+    /// is released within `acquire_timeout`, or [`PoolError::Open`] if a new
+    /// connection could not be opened.
+    pub fn try_acquire(&self) -> Result<Connection, PoolError> {
         let deadline = Instant::now() + self.acquire_timeout;
         let mut state = self.lock_state();
         loop {
             if let Some(conn) = state.idle.pop() {
-                return Some(conn);
+                return Ok(conn);
             }
             if state.open < self.max {
                 state.open += 1;
                 drop(state);
-                return match self.source.open_reader() {
-                    Ok(conn) => Some(conn),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to open read connection; falling back to writer");
-                        self.lock_state().open -= 1;
-                        self.available.notify_one();
-                        None
-                    }
-                };
+                return self.source.open_reader().map_err(|err| {
+                    self.lock_state().open -= 1;
+                    self.available.notify_one();
+                    PoolError::Open(err)
+                });
             }
             let now = Instant::now();
             if now >= deadline {
-                tracing::warn!(
-                    max = self.max,
-                    "read pool exhausted; falling back to writer connection"
-                );
-                return None;
+                return Err(PoolError::Exhausted {
+                    max: self.max,
+                    waited: self.acquire_timeout,
+                });
             }
             let (guard, _) = self
                 .available
@@ -258,6 +282,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn temp_db_path(tag: &str) -> String {
@@ -277,25 +303,22 @@ mod tests {
         }
     }
 
-    fn seed(conn: &Connection, rows: usize) {
+    fn seed(conn: &Connection, rows: usize) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, label TEXT NOT NULL)",
-        )
-        .unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
+        )?;
+        let tx = conn.unchecked_transaction()?;
         for i in 0..rows {
             tx.execute(
                 "INSERT INTO items (label) VALUES (?1)",
                 [format!("row-{i}")],
-            )
-            .unwrap();
+            )?;
         }
-        tx.commit().unwrap();
+        tx.commit()
     }
 
-    fn count(conn: &Connection) -> i64 {
+    fn count(conn: &Connection) -> rusqlite::Result<i64> {
         conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
-            .unwrap()
     }
 
     #[test]
@@ -308,84 +331,86 @@ mod tests {
     }
 
     #[test]
-    fn memory_readers_see_the_writers_committed_data() {
+    fn memory_readers_see_the_writers_committed_data() -> TestResult {
         let target = resolve_target(":memory:");
-        let writer = open_writer(&target, TIMEOUT).unwrap();
-        seed(&writer, 2);
-        let pool = ReadPool::new(&target, 2, 4, TIMEOUT, TIMEOUT).unwrap();
+        let writer = open_writer(&target, TIMEOUT)?;
+        seed(&writer, 2)?;
+        let pool = ReadPool::new(&target, 2, 4, TIMEOUT, TIMEOUT)?;
         let reader = pool.acquire().expect("reader");
-        assert_eq!(count(&reader), 2);
+        assert_eq!(count(&reader)?, 2);
+        Ok(())
     }
 
     #[test]
-    fn pooled_readers_cannot_write() {
+    fn pooled_readers_cannot_write() -> TestResult {
         let target = resolve_target(":memory:");
-        let writer = open_writer(&target, TIMEOUT).unwrap();
-        seed(&writer, 1);
-        let pool = ReadPool::new(&target, 1, 1, TIMEOUT, TIMEOUT).unwrap();
+        let writer = open_writer(&target, TIMEOUT)?;
+        seed(&writer, 1)?;
+        let pool = ReadPool::new(&target, 1, 1, TIMEOUT, TIMEOUT)?;
         let reader = pool.acquire().expect("reader");
         let err = reader
             .execute("INSERT INTO items (label) VALUES ('x')", [])
             .unwrap_err();
         assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::ReadOnly));
-        assert_eq!(count(&writer), 1, "rejected write must not change data");
+        assert_eq!(count(&writer)?, 1, "rejected write must not change data");
+        Ok(())
     }
 
     #[test]
-    fn file_databases_use_wal_and_readers_see_committed_writes() {
+    fn file_databases_use_wal_and_readers_see_committed_writes() -> TestResult {
         let path = temp_db_path("wal");
-        let writer = open_writer(&path, TIMEOUT).unwrap();
-        let mode: String = writer
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
+        let writer = open_writer(&path, TIMEOUT)?;
+        let mode: String = writer.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         assert_eq!(mode.to_lowercase(), "wal");
 
-        seed(&writer, 2);
-        let pool = ReadPool::new(&path, 1, 3, TIMEOUT, TIMEOUT).unwrap();
-        let reader = pool.acquire().unwrap();
-        assert_eq!(count(&reader), 2);
+        seed(&writer, 2)?;
+        let pool = ReadPool::new(&path, 1, 3, TIMEOUT, TIMEOUT)?;
+        let reader = pool.try_acquire()?;
+        assert_eq!(count(&reader)?, 2);
         pool.release(reader);
 
         writer
-            .execute("INSERT INTO items (label) VALUES ('later')", [])
-            .unwrap();
-        let reader = pool.acquire().unwrap();
-        assert_eq!(count(&reader), 3, "a read after a committed write sees it");
+            .execute("INSERT INTO items (label) VALUES ('later')", [])?;
+        let reader = pool.try_acquire()?;
+        assert_eq!(count(&reader)?, 3, "a read after a committed write sees it");
         drop(reader);
         drop(writer);
         remove_db_files(&path);
+        Ok(())
     }
 
     #[test]
-    fn in_memory_pool_is_capped_at_one_read_connection() {
+    fn in_memory_pool_is_capped_at_one_read_connection() -> TestResult {
         let target = resolve_target(":memory:");
-        let _writer = open_writer(&target, TIMEOUT).unwrap();
-        let pool = ReadPool::new(&target, 4, 16, TIMEOUT, TIMEOUT).unwrap();
+        let _writer = open_writer(&target, TIMEOUT)?;
+        let pool = ReadPool::new(&target, 4, 16, TIMEOUT, TIMEOUT)?;
         assert_eq!(pool.max_size(), 1);
         assert_eq!(pool.open_connections(), 1);
+        Ok(())
     }
 
     #[test]
-    fn file_pool_opens_min_up_front_and_grows_on_demand_to_max() {
+    fn file_pool_opens_min_up_front_and_grows_on_demand_to_max() -> TestResult {
         let path = temp_db_path("grow");
-        let writer = open_writer(&path, TIMEOUT).unwrap();
-        let pool = ReadPool::new(&path, 1, 3, TIMEOUT, TIMEOUT).unwrap();
+        let writer = open_writer(&path, TIMEOUT)?;
+        let pool = ReadPool::new(&path, 1, 3, TIMEOUT, TIMEOUT)?;
         assert_eq!(pool.open_connections(), 1);
 
-        let a = pool.acquire().unwrap();
-        let b = pool.acquire().unwrap();
-        let c = pool.acquire().unwrap();
+        let a = pool.try_acquire()?;
+        let b = pool.try_acquire()?;
+        let c = pool.try_acquire()?;
         assert_eq!(pool.open_connections(), 3);
         drop((a, b, c));
         drop(writer);
         remove_db_files(&path);
+        Ok(())
     }
 
     #[test]
-    fn exhausted_pool_returns_none_after_the_acquire_timeout() {
+    fn exhausted_pool_returns_none_after_the_acquire_timeout() -> TestResult {
         let target = resolve_target(":memory:");
-        let _writer = open_writer(&target, TIMEOUT).unwrap();
-        let pool = ReadPool::new(&target, 0, 1, Duration::from_millis(50), TIMEOUT).unwrap();
+        let _writer = open_writer(&target, TIMEOUT)?;
+        let pool = ReadPool::new(&target, 0, 1, Duration::from_millis(50), TIMEOUT)?;
         let held = pool.acquire().expect("first connection");
         let started = Instant::now();
         assert!(
@@ -402,54 +427,74 @@ mod tests {
             "reuse must not open a new connection"
         );
         drop(again);
+        Ok(())
     }
 
     #[test]
-    fn min_is_capped_at_max_and_max_is_at_least_one() {
-        let path = temp_db_path("caps");
-        let writer = open_writer(&path, TIMEOUT).unwrap();
+    fn try_acquire_reports_pool_exhaustion() -> TestResult {
+        let target = resolve_target(":memory:");
+        let _writer = open_writer(&target, TIMEOUT)?;
+        let pool = ReadPool::new(&target, 0, 1, Duration::from_millis(20), TIMEOUT)?;
+        let held = pool.try_acquire()?;
+        match pool.try_acquire() {
+            Err(PoolError::Exhausted { max, .. }) => assert_eq!(max, 1),
+            Err(other) => return Err(format!("unexpected error: {other}").into()),
+            Ok(_) => return Err("pool is full, so try_acquire must fail".into()),
+        }
+        pool.release(held);
+        assert!(pool.try_acquire().is_ok(), "released connection is reusable");
+        Ok(())
+    }
 
-        let pool = ReadPool::new(&path, 5, 2, TIMEOUT, TIMEOUT).unwrap();
+    #[test]
+    fn min_is_capped_at_max_and_max_is_at_least_one() -> TestResult {
+        let path = temp_db_path("caps");
+        let writer = open_writer(&path, TIMEOUT)?;
+
+        let pool = ReadPool::new(&path, 5, 2, TIMEOUT, TIMEOUT)?;
         assert_eq!(pool.max_size(), 2);
         assert_eq!(pool.open_connections(), 2);
 
-        let pool = ReadPool::new(&path, 0, 0, TIMEOUT, TIMEOUT).unwrap();
+        let pool = ReadPool::new(&path, 0, 0, TIMEOUT, TIMEOUT)?;
         assert_eq!(pool.max_size(), 1);
         assert_eq!(pool.open_connections(), 0);
         drop(writer);
         remove_db_files(&path);
+        Ok(())
     }
 
     #[test]
-    fn concurrent_readers_use_one_connection_each_when_configured() {
+    fn concurrent_readers_use_one_connection_each_when_configured() -> TestResult {
         const READERS: usize = 4;
         let target = temp_db_path("concurrent");
-        let writer = open_writer(&target, TIMEOUT).unwrap();
-        seed(&writer, 2);
+        let writer = open_writer(&target, TIMEOUT)?;
+        seed(&writer, 2)?;
 
-        let pool = Arc::new(ReadPool::new(&target, 0, READERS, TIMEOUT, TIMEOUT).unwrap());
+        let pool = Arc::new(ReadPool::new(&target, 0, READERS, TIMEOUT, TIMEOUT)?);
         let barrier = Arc::new(Barrier::new(READERS));
         let handles: Vec<_> = (0..READERS)
             .map(|_| {
                 let pool = Arc::clone(&pool);
                 let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let conn = pool.acquire().expect("reader");
+                std::thread::spawn(move || -> Result<i64, String> {
+                    let conn = pool.try_acquire().map_err(|e| e.to_string())?;
                     // Every thread holds its own connection at this point.
                     barrier.wait();
-                    let n = count(&conn);
+                    let n = count(&conn).map_err(|e| e.to_string());
                     pool.release(conn);
                     n
                 })
             })
             .collect();
         for handle in handles {
-            assert_eq!(handle.join().unwrap(), 2);
+            let n = handle.join().map_err(|_| "reader thread panicked")??;
+            assert_eq!(n, 2);
         }
         assert_eq!(pool.open_connections(), READERS);
         drop(pool);
         drop(writer);
         remove_db_files(&target);
+        Ok(())
     }
 
     /// Benchmark for #697: p95 latency of short reads with 50 concurrent readers.
@@ -463,7 +508,7 @@ mod tests {
     /// `cargo test -p ethos-protocol-backend db_read_pool::tests::bench -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark: run manually with --ignored --nocapture"]
-    fn bench_p95_point_read_latency_with_50_concurrent_readers() {
+    fn bench_p95_point_read_latency_with_50_concurrent_readers() -> TestResult {
         const READERS: usize = 50;
         const SCANNERS: usize = 5;
         const POINT_READS: usize = 200;
@@ -483,54 +528,53 @@ mod tests {
                 } else {
                     resolve_target(":memory:")
                 };
-                let writer = open_writer(&path, TIMEOUT).unwrap();
-                seed(&writer, ROWS);
-                let pool = Arc::new(ReadPool::new(&path, max, max, TIMEOUT, TIMEOUT).unwrap());
+                let writer = open_writer(&path, TIMEOUT)?;
+                seed(&writer, ROWS)?;
+                let pool = Arc::new(ReadPool::new(&path, max, max, TIMEOUT, TIMEOUT)?);
                 let barrier = Arc::new(Barrier::new(READERS));
 
                 let handles: Vec<_> = (0..READERS)
                     .map(|reader| {
                         let pool = Arc::clone(&pool);
                         let barrier = Arc::clone(&barrier);
-                        std::thread::spawn(move || {
+                        std::thread::spawn(move || -> Result<Vec<Duration>, String> {
                             barrier.wait();
                             let scanner = reader < SCANNERS;
                             let mut latencies = Vec::new();
                             for n in 0..if scanner { SCANS } else { POINT_READS } {
                                 let started = Instant::now();
-                                let conn = pool.acquire().expect("reader");
-                                if scanner {
-                                    let _: i64 = conn
-                                        .query_row(
-                                            "SELECT SUM(length(label)) FROM items",
-                                            [],
-                                            |r| r.get(0),
-                                        )
-                                        .unwrap();
+                                let conn = pool.try_acquire().map_err(|e| e.to_string())?;
+                                let read = if scanner {
+                                    conn.query_row(
+                                        "SELECT SUM(length(label)) FROM items",
+                                        [],
+                                        |r| r.get::<_, i64>(0),
+                                    )
+                                    .map(drop)
                                 } else {
                                     let id = ((reader * 7 + n) % ROWS + 1) as i64;
-                                    let _: String = conn
-                                        .query_row(
-                                            "SELECT label FROM items WHERE id = ?1",
-                                            [id],
-                                            |r| r.get(0),
-                                        )
-                                        .unwrap();
-                                }
+                                    conn.query_row(
+                                        "SELECT label FROM items WHERE id = ?1",
+                                        [id],
+                                        |r| r.get::<_, String>(0),
+                                    )
+                                    .map(drop)
+                                };
                                 pool.release(conn);
+                                read.map_err(|e| e.to_string())?;
                                 if !scanner {
                                     latencies.push(started.elapsed());
                                 }
                             }
-                            latencies
+                            Ok(latencies)
                         })
                     })
                     .collect();
 
-                let mut point: Vec<Duration> = handles
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap())
-                    .collect();
+                let mut point: Vec<Duration> = Vec::new();
+                for handle in handles {
+                    point.extend(handle.join().map_err(|_| "reader thread panicked")??);
+                }
                 point.sort();
                 let p95 = point[(point.len() * 95 / 100).min(point.len() - 1)];
                 println!(
@@ -544,5 +588,6 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 }
