@@ -384,7 +384,13 @@ pub struct BackfillSummary {
     pub total_skipped: usize,
     pub total_failed: usize,
     pub failed: Vec<(String, String)>,
+    /// Cursor of the last batch whose re-encrypted fields were durably
+    /// persisted. A run that stopped on a persist error resumes from here.
     pub final_cursor: BackfillCursor,
+    /// Set when `persist` rejected a batch. The run stops at that point and
+    /// `final_cursor` is *not* advanced past the failed batch, so its records
+    /// are re-encrypted and written again on the next run.
+    pub persist_error: Option<String>,
 }
 
 /// Run the backfill to completion, applying `persist` after each batch and
@@ -393,9 +399,14 @@ pub struct BackfillSummary {
 ///
 /// `persist` is called once per batch with that batch's updated fields; the
 /// caller is expected to write them and durably record `next_cursor` (e.g.
-/// in its own table) so a crash mid-run resumes rather than restarting from
-/// the beginning.
-pub async fn run_backfill<F>(
+/// in its own table, in the same transaction) so a crash mid-run resumes
+/// rather than restarting from the beginning.
+///
+/// The encrypt step and the write are kept atomic per batch: the cursor only
+/// advances once `persist` returns `Ok`. If it returns `Err`, the run stops,
+/// the error is recorded in [`BackfillSummary::persist_error`], and the
+/// counters exclude the batch that was not written.
+pub async fn run_backfill<F, E>(
     engine: &FieldEncryptionEngine,
     records: &[BackfillRecord],
     start_cursor: BackfillCursor,
@@ -404,7 +415,8 @@ pub async fn run_backfill<F>(
     mut persist: F,
 ) -> BackfillSummary
 where
-    F: FnMut(&BackfillBatchResult),
+    F: FnMut(&BackfillBatchResult) -> Result<(), E>,
+    E: std::fmt::Display,
 {
     let mut cursor = start_cursor;
     let mut summary = BackfillSummary {
@@ -415,13 +427,16 @@ where
     loop {
         let batch = run_backfill_batch(engine, records, cursor, batch_size);
 
+        if let Err(e) = persist(&batch) {
+            summary.persist_error = Some(e.to_string());
+            break;
+        }
+
         summary.total_updated += batch.updated.len();
         summary.total_skipped += batch.skipped_already_current;
         summary.total_failed += batch.failed.len();
         summary.failed.extend(batch.failed.iter().cloned());
         summary.final_cursor = batch.next_cursor;
-
-        persist(&batch);
 
         cursor = batch.next_cursor;
         if batch.done {
@@ -445,20 +460,93 @@ pub const SENSITIVE_FIELDS: &[(&str, &str)] = &[
     ("unsubscribe_tokens", "owner"),        // email/phone owner identifier
 ];
 
-/// Encrypt a string field value, returning `None` if the input is `None`.
+/// Encrypt a string field value, returning `Ok(None)` if the input is `None`.
+///
+/// An encryption failure is returned as `Err` rather than collapsed into
+/// `None`, so callers cannot accidentally persist a row with the sensitive
+/// column silently blanked out.
 pub fn encrypt_optional(
     engine: &FieldEncryptionEngine,
     value: Option<&str>,
-) -> Option<EncryptedField> {
-    value.and_then(|v| engine.encrypt(v).ok())
+) -> Result<Option<EncryptedField>, EncryptionError> {
+    value.map(|v| engine.encrypt(v)).transpose()
 }
 
-/// Decrypt an optional `EncryptedField`, returning `None` if absent.
+/// Decrypt an optional `EncryptedField`, returning `Ok(None)` if absent.
+///
+/// A decryption failure (wrong key, tampered ciphertext, …) is returned as
+/// `Err` rather than being indistinguishable from an absent value.
 pub fn decrypt_optional(
     engine: &FieldEncryptionEngine,
     field: Option<&EncryptedField>,
-) -> Option<String> {
-    field.and_then(|f| engine.decrypt(f).ok())
+) -> Result<Option<String>, EncryptionError> {
+    field.map(|f| engine.decrypt(f)).transpose()
+}
+
+/// Error from [`encrypt_then_write`].
+#[derive(Debug)]
+pub enum EncryptedWriteError<E> {
+    /// A field failed to encrypt. Nothing was written.
+    Encrypt {
+        field: String,
+        source: EncryptionError,
+    },
+    /// Every field encrypted, but the caller's write failed.
+    Write(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for EncryptedWriteError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encrypt { field, source } => {
+                write!(f, "failed to encrypt field `{field}`: {source}; nothing was written")
+            }
+            Self::Write(e) => write!(f, "write failed after encrypting fields: {e}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for EncryptedWriteError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encrypt { source, .. } => Some(source),
+            Self::Write(e) => Some(e),
+        }
+    }
+}
+
+/// Encrypt every sensitive field of a row *before* any of it is written, then
+/// hand the complete set of ciphertexts to `write`.
+///
+/// This keeps the encrypt step and the write atomic: if any field fails to
+/// encrypt, `write` is never called, so a row can never be left partly
+/// written with some sensitive columns missing or still in plaintext.
+/// `write` should persist all fields in a single statement or transaction.
+///
+/// `fields` is a list of `(column_name, plaintext)` pairs; `None` plaintexts
+/// stay `None` (e.g. an optional phone number that was not provided).
+pub fn encrypt_then_write<T, E, F>(
+    engine: &FieldEncryptionEngine,
+    fields: &[(&str, Option<&str>)],
+    write: F,
+) -> Result<T, EncryptedWriteError<E>>
+where
+    F: FnOnce(Vec<(String, Option<EncryptedField>)>) -> Result<T, E>,
+{
+    let mut encrypted = Vec::with_capacity(fields.len());
+    for (name, value) in fields {
+        let field = encrypt_optional(engine, *value).map_err(|source| {
+            EncryptedWriteError::Encrypt {
+                field: (*name).to_string(),
+                source,
+            }
+        })?;
+        encrypted.push(((*name).to_string(), field));
+    }
+    write(encrypted).map_err(EncryptedWriteError::Write)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -466,6 +554,8 @@ pub fn decrypt_optional(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn test_engine() -> FieldEncryptionEngine {
         let mut keys = std::collections::HashMap::new();
@@ -475,47 +565,50 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_roundtrip() {
+    fn test_encrypt_decrypt_roundtrip() -> TestResult {
         let engine = test_engine();
         let plaintext = "user@example.com";
-        let encrypted = engine.encrypt(plaintext).unwrap();
+        let encrypted = engine.encrypt(plaintext)?;
         assert_eq!(encrypted.key_version, 1);
-        let decrypted = engine.decrypt(&encrypted).unwrap();
+        let decrypted = engine.decrypt(&encrypted)?;
         assert_eq!(decrypted, plaintext);
+        Ok(())
     }
 
     #[test]
-    fn test_different_nonces_for_same_plaintext() {
+    fn test_different_nonces_for_same_plaintext() -> TestResult {
         let engine = test_engine();
-        let a = engine.encrypt("hello").unwrap();
-        let b = engine.encrypt("hello").unwrap();
+        let a = engine.encrypt("hello")?;
+        let b = engine.encrypt("hello")?;
         // Nonces should differ (probabilistically true with random nonces).
         // Ciphertexts should differ as a result.
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
+        Ok(())
     }
 
     #[test]
-    fn test_tampered_ciphertext_fails() {
+    fn test_tampered_ciphertext_fails() -> TestResult {
         let engine = test_engine();
-        let mut encrypted = engine.encrypt("sensitive-data").unwrap();
+        let mut encrypted = engine.encrypt("sensitive-data")?;
         // Flip a byte in the ciphertext.
-        let mut bytes = B64.decode(&encrypted.ciphertext).unwrap();
+        let mut bytes = B64.decode(&encrypted.ciphertext)?;
         bytes[0] ^= 0xFF;
         encrypted.ciphertext = B64.encode(&bytes);
         let result = engine.decrypt(&encrypted);
         assert!(matches!(result, Err(EncryptionError::AuthenticationFailed)));
+        Ok(())
     }
 
     #[test]
-    fn test_key_rotation() {
+    fn test_key_rotation() -> TestResult {
         let mut engine = test_engine();
         engine.active_version = 1;
-        let field = engine.encrypt("rotate me").unwrap();
+        let field = engine.encrypt("rotate me")?;
         assert_eq!(field.key_version, 1);
 
         // Rotate to version 2.
-        let (new_field, rotation_result) = engine.rotate_field(&field, 2).unwrap();
+        let (new_field, rotation_result) = engine.rotate_field(&field, 2)?;
         assert_eq!(new_field.key_version, 2);
         assert_eq!(rotation_result.previous_version, 1);
         assert_eq!(rotation_result.new_version, 2);
@@ -526,32 +619,103 @@ mod tests {
             keys.insert(2, [99u8; KEY_LEN]);
             FieldEncryptionEngine::from_keys(keys, 2)
         };
-        let decrypted = new_engine.decrypt(&new_field).unwrap();
+        let decrypted = new_engine.decrypt(&new_field)?;
         assert_eq!(decrypted, "rotate me");
+        Ok(())
     }
 
     #[test]
-    fn test_wrong_key_version_fails() {
+    fn test_wrong_key_version_fails() -> TestResult {
         let engine = test_engine();
-        let mut field = engine.encrypt("secret").unwrap();
+        let mut field = engine.encrypt("secret")?;
         // Claim a version that doesn't exist.
         field.key_version = 99;
         let result = engine.decrypt(&field);
         assert!(matches!(result, Err(EncryptionError::KeyNotFound(99))));
+        Ok(())
     }
 
     #[test]
-    fn test_encrypt_optional_none() {
+    fn test_encrypt_optional_none() -> TestResult {
         let engine = test_engine();
-        assert!(encrypt_optional(&engine, None).is_none());
+        assert!(encrypt_optional(&engine, None)?.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_encrypt_decrypt_optional() {
+    fn test_encrypt_decrypt_optional() -> TestResult {
         let engine = test_engine();
-        let field = encrypt_optional(&engine, Some("test")).unwrap();
-        let plain = decrypt_optional(&engine, Some(&field)).unwrap();
+        let field =
+            encrypt_optional(&engine, Some("test"))?.ok_or("expected an encrypted field")?;
+        let plain =
+            decrypt_optional(&engine, Some(&field))?.ok_or("expected a plaintext value")?;
         assert_eq!(plain, "test");
+        Ok(())
+    }
+
+    #[test]
+    fn test_encrypt_optional_surfaces_errors_instead_of_none() {
+        // No key for the active version: encryption must fail loudly rather
+        // than returning `None`, which a caller could persist as a blank column.
+        let engine = FieldEncryptionEngine::from_keys(std::collections::HashMap::new(), 1);
+        assert!(matches!(
+            encrypt_optional(&engine, Some("user@example.com")),
+            Err(EncryptionError::KeyNotFound(1))
+        ));
+    }
+
+    #[test]
+    fn test_decrypt_optional_surfaces_errors_instead_of_none() -> TestResult {
+        let engine = test_engine();
+        let mut field = engine.encrypt("secret")?;
+        field.key_version = 99;
+        assert!(matches!(
+            decrypt_optional(&engine, Some(&field)),
+            Err(EncryptionError::KeyNotFound(99))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypt_then_write_passes_every_ciphertext_to_one_write() -> TestResult {
+        let engine = test_engine();
+        let written = encrypt_then_write(
+            &engine,
+            &[("email", Some("user@example.com")), ("phone", None)],
+            |fields| Ok::<_, std::convert::Infallible>(fields),
+        )?;
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].0, "email");
+        let email = written[0].1.as_ref().ok_or("email should be encrypted")?;
+        assert_eq!(engine.decrypt(email)?, "user@example.com");
+        assert_eq!(written[1].0, "phone");
+        assert!(written[1].1.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn encrypt_then_write_never_writes_when_encryption_fails() {
+        let engine = FieldEncryptionEngine::from_keys(std::collections::HashMap::new(), 1);
+        let mut write_called = false;
+
+        let result = encrypt_then_write(
+            &engine,
+            &[("email", Some("user@example.com"))],
+            |_fields| {
+                write_called = true;
+                Ok::<(), std::convert::Infallible>(())
+            },
+        );
+
+        assert!(!write_called, "a row must not be written if any field failed to encrypt");
+        match result {
+            Err(EncryptedWriteError::Encrypt { field, source }) => {
+                assert_eq!(field, "email");
+                assert!(matches!(source, EncryptionError::KeyNotFound(1)));
+            }
+            other => panic!("expected an encryption error, got {other:?}"),
+        }
     }
 
     // ── Backfill job ─────────────────────────────────────────────────────────
@@ -567,23 +731,28 @@ mod tests {
 
     /// Build `count` records encrypted under the old (v1) key, as if written
     /// before a rotation to v2.
-    fn backfill_records(_engine: &FieldEncryptionEngine, count: usize) -> Vec<BackfillRecord> {
+    fn backfill_records(
+        _engine: &FieldEncryptionEngine,
+        count: usize,
+    ) -> Result<Vec<BackfillRecord>, EncryptionError> {
         let mut keys = std::collections::HashMap::new();
         keys.insert(1, [7u8; KEY_LEN]);
         let old_engine = FieldEncryptionEngine::from_keys(keys, 1);
 
         (0..count)
-            .map(|i| BackfillRecord {
-                id: format!("record-{i}"),
-                field: old_engine.encrypt(&format!("secret-{i}")).unwrap(),
+            .map(|i| {
+                Ok(BackfillRecord {
+                    id: format!("record-{i}"),
+                    field: old_engine.encrypt(&format!("secret-{i}"))?,
+                })
             })
             .collect()
     }
 
     #[test]
-    fn run_backfill_batch_re_encrypts_to_active_version() {
+    fn run_backfill_batch_re_encrypts_to_active_version() -> TestResult {
         let engine = rotating_engine();
-        let records = backfill_records(&engine, 3);
+        let records = backfill_records(&engine, 3)?;
 
         let result = run_backfill_batch(&engine, &records, BackfillCursor::default(), 10);
 
@@ -593,30 +762,35 @@ mod tests {
         assert!(result.failed.is_empty());
         for (id, field) in &result.updated {
             assert_eq!(field.key_version, 2);
-            let index: usize = id.strip_prefix("record-").unwrap().parse().unwrap();
-            assert_eq!(engine.decrypt(field).unwrap(), format!("secret-{index}"));
+            let index: usize = id
+                .strip_prefix("record-")
+                .ok_or("record id missing `record-` prefix")?
+                .parse()?;
+            assert_eq!(engine.decrypt(field)?, format!("secret-{index}"));
         }
+        Ok(())
     }
 
     #[test]
-    fn run_backfill_batch_skips_records_already_on_active_version() {
+    fn run_backfill_batch_skips_records_already_on_active_version() -> TestResult {
         let engine = rotating_engine();
-        let mut records = backfill_records(&engine, 2);
+        let mut records = backfill_records(&engine, 2)?;
         records.push(BackfillRecord {
             id: "already-current".to_string(),
-            field: engine.encrypt("current").unwrap(),
+            field: engine.encrypt("current")?,
         });
 
         let result = run_backfill_batch(&engine, &records, BackfillCursor::default(), 10);
 
         assert_eq!(result.skipped_already_current, 1);
         assert_eq!(result.updated.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn run_backfill_batch_is_resumable_across_interruptions() {
+    fn run_backfill_batch_is_resumable_across_interruptions() -> TestResult {
         let engine = rotating_engine();
-        let records = backfill_records(&engine, 5);
+        let records = backfill_records(&engine, 5)?;
 
         // First batch processes only 2 records and reports where to resume.
         let first = run_backfill_batch(&engine, &records, BackfillCursor::default(), 2);
@@ -641,12 +815,13 @@ mod tests {
             .flat_map(|r| r.updated.iter().map(|(id, _)| id.clone()))
             .collect();
         assert_eq!(all_ids.len(), 5);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_backfill_drives_every_batch_to_completion() {
+    async fn run_backfill_drives_every_batch_to_completion() -> TestResult {
         let engine = rotating_engine();
-        let records = backfill_records(&engine, 7);
+        let records = backfill_records(&engine, 7)?;
 
         let mut persisted_batches = 0;
         let summary = run_backfill(
@@ -655,7 +830,10 @@ mod tests {
             BackfillCursor::default(),
             3,
             std::time::Duration::from_millis(0),
-            |_batch| persisted_batches += 1,
+            |_batch| {
+                persisted_batches += 1;
+                Ok::<(), std::convert::Infallible>(())
+            },
         )
         .await;
 
@@ -664,5 +842,38 @@ mod tests {
         assert_eq!(summary.final_cursor, BackfillCursor { offset: 7 });
         // 7 records at batch size 3 takes 3 batches (3 + 3 + 1).
         assert_eq!(persisted_batches, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_backfill_does_not_advance_cursor_past_a_failed_persist() -> TestResult {
+        let engine = rotating_engine();
+        let records = backfill_records(&engine, 7)?;
+
+        let mut calls = 0;
+        let summary = run_backfill(
+            &engine,
+            &records,
+            BackfillCursor::default(),
+            3,
+            std::time::Duration::from_millis(0),
+            |_batch| {
+                calls += 1;
+                if calls == 2 {
+                    Err("disk full")
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        // Only the first batch was durably written; the second must be
+        // retried on the next run, so the cursor stays at its start.
+        assert_eq!(calls, 2);
+        assert_eq!(summary.total_updated, 3);
+        assert_eq!(summary.final_cursor, BackfillCursor { offset: 3 });
+        assert_eq!(summary.persist_error.as_deref(), Some("disk full"));
+        Ok(())
     }
 }

@@ -288,9 +288,26 @@ async fn attempt_delivery(
         Ok(b) => b,
         Err(e) => {
             tracing::error!(webhook_id = %registration.id, "Failed to serialize webhook payload: {e}");
+            // Nothing was sent, but the event must not vanish silently: record
+            // enough to identify it, plus the reason, in the DLQ.
+            dead_letter(
+                state,
+                registration,
+                serde_json::json!({
+                    "id": payload.id,
+                    "vault_id": payload.vault_id,
+                    "event_type": format!("{:?}", payload.event_type),
+                }),
+                format!("failed to serialize webhook payload: {e}"),
+                0,
+            );
             return;
         }
     };
+
+    // Most recent failure, carried into the DLQ entry so operators can see
+    // *why* delivery failed rather than just that it did.
+    let mut last_error = String::from("no delivery attempt was made");
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -348,6 +365,7 @@ async fn attempt_delivery(
                     attempt,
                     "Webhook delivery failed — will retry"
                 );
+                last_error = format!("receiver responded with HTTP {}", resp.status());
                 crate::health_routing::record_outcome(
                     &state.health_routing_state,
                     &registration.url,
@@ -360,6 +378,7 @@ async fn attempt_delivery(
                     attempt,
                     "Webhook delivery error: {e} — will retry"
                 );
+                last_error = format!("request error: {e}");
                 crate::health_routing::record_outcome(
                     &state.health_routing_state,
                     &registration.url,
@@ -371,18 +390,42 @@ async fn attempt_delivery(
 
     tracing::error!(
         webhook_id = %registration.id,
-        "Webhook delivery exhausted all retries — dropping"
+        last_error = %last_error,
+        "Webhook delivery exhausted all retries — dead-lettering"
     );
 
     // Dead-letter the payload (#2) instead of discarding it so it can be
-    // inspected and replayed once the endpoint recovers.
+    // inspected and replayed once the endpoint recovers. The exact body that
+    // was sent is stored; if it somehow fails to re-parse, the raw string is
+    // kept rather than replacing it with `null`.
+    let payload_value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+    dead_letter(
+        state,
+        registration,
+        payload_value,
+        format!(
+            "exhausted all {} delivery attempts; last error: {last_error}",
+            MAX_RETRIES + 1
+        ),
+        MAX_RETRIES + 1,
+    );
+}
+
+/// Record a failed delivery in the dead-letter queue with its error reason.
+fn dead_letter(
+    state: &WebhookState,
+    registration: &WebhookRegistration,
+    payload: serde_json::Value,
+    error: String,
+    attempts: u32,
+) {
     crate::dlq::route_to_dlq(
         &state.dlq_state,
         format!("webhook:{}", registration.id),
         Some(registration.url.clone()),
-        serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
-        "exhausted all delivery retries",
-        MAX_RETRIES + 1,
+        payload,
+        error,
+        attempts,
     );
 }
 
@@ -752,8 +795,16 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Convert a handler's non-`std::error::Error` rejection (a status code or
+    /// a `(StatusCode, Json)` pair) into a test failure.
+    fn handler_err<E: std::fmt::Debug>(e: E) -> Box<dyn std::error::Error> {
+        format!("handler returned an error: {e:?}").into()
+    }
+
     fn test_now() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+        DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(1_700_000_000)
     }
 
     fn ts_now() -> String {
@@ -782,7 +833,7 @@ mod tests {
     // ── #351: outbound signing guarantees ────────────────────────────────────
 
     #[tokio::test]
-    async fn test_every_registration_is_assigned_a_signing_secret() {
+    async fn test_every_registration_is_assigned_a_signing_secret() -> TestResult {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
             url: "https://example.test/hook".to_string(),
@@ -792,12 +843,15 @@ mod tests {
             algorithm: SignatureAlgorithm::Sha256,
         };
 
-        let (status, Json(reg)) = register_webhook(State(state), Json(req)).await.unwrap();
+        let (status, Json(reg)) = register_webhook(State(state), Json(req))
+            .await
+            .map_err(handler_err)?;
 
         assert_eq!(status, StatusCode::CREATED);
         let secret = reg.secret.expect("registration must carry a signing secret");
         assert!(secret.starts_with("whsec_"), "unexpected secret: {secret}");
         assert!(secret.len() > 16);
+        Ok(())
     }
 
     #[test]
@@ -820,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secret_rotation_invalidates_old_signatures() {
+    async fn test_secret_rotation_invalidates_old_signatures() -> TestResult {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
             url: "https://example.test/hook".to_string(),
@@ -829,17 +883,28 @@ mod tests {
             secret: Some("original-secret".to_string()),
             algorithm: SignatureAlgorithm::Sha256,
         };
-        let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req)).await.unwrap();
+        let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
+            .await
+            .map_err(handler_err)?;
         let body = r#"{"event":"vault_created"}"#;
-        let old_sig = standard_signature_256(body, reg.secret.as_deref().unwrap());
+        let old_sig = standard_signature_256(body, reg.secret.as_deref().ok_or("missing secret")?);
 
         let Json(rot) = rotate_webhook_secret(State(state.clone()), Path(reg.id.clone()))
             .await
-            .unwrap();
-        let new_secret = rot["secret"].as_str().unwrap().to_string();
+            .map_err(handler_err)?;
+        let new_secret = rot["secret"]
+            .as_str()
+            .ok_or("rotation response missing `secret`")?
+            .to_string();
         assert_ne!(new_secret, "original-secret");
 
-        let stored = state.store.lock().unwrap_or_else(|p| p.into_inner()).get(&reg.id).unwrap().clone();
+        let stored = state
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&reg.id)
+            .ok_or("registration missing from store")?
+            .clone();
         assert_eq!(stored.secret.as_deref(), Some(new_secret.as_str()));
 
         let new_sig = standard_signature_256(body, &new_secret);
@@ -851,6 +916,7 @@ mod tests {
             "signature under the retired secret must no longer verify"
         );
         assert!(verify_webhook_signature(body, &new_secret, Some(&new_sig), Some(&ts)).valid);
+        Ok(())
     }
 
     #[tokio::test]
@@ -893,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_receiver_rejecting_unsigned_retry_fails_delivery() {
+    async fn test_receiver_rejecting_unsigned_retry_fails_delivery() -> TestResult {
         let mut server = mockito::Server::new_async().await;
         // Signed requests are accepted…
         let signed = server
@@ -933,11 +999,22 @@ mod tests {
 
         signed.assert_async().await; // never hit
         unsigned.assert_async().await; // hit on every retry
+        let dlq = state.dlq_state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(
-            state.dlq_state.store.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            dlq.len(),
             1,
             "an unsigned delivery the receiver rejects must be dead-lettered"
         );
+        let entry = dlq.values().next().ok_or("expected a DLQ entry")?;
+        // The DLQ records why delivery failed, not just that it did.
+        assert!(
+            entry.error.contains("HTTP 401"),
+            "DLQ entry should carry the last delivery error, got: {}",
+            entry.error
+        );
+        assert_eq!(entry.attempts, MAX_RETRIES + 1);
+        assert_eq!(entry.payload["id"], "d2");
+        Ok(())
     }
 
     #[test]
@@ -1007,7 +1084,11 @@ mod tests {
 
         let result = verify_webhook_signature(body, secret, Some(&sig), None);
         assert!(!result.valid);
-        assert!(result.reason.unwrap().contains("missing"));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("missing")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1020,7 +1101,11 @@ mod tests {
 
         let result = verify_webhook_signature(body, secret, Some(&sig), Some(&old_ts));
         assert!(!result.valid);
-        assert!(result.reason.unwrap().contains("out of tolerance"));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("out of tolerance")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1028,7 +1113,11 @@ mod tests {
         let ts = ts_now();
         let result = verify_webhook_signature("body", "secret", None, Some(&ts));
         assert!(!result.valid);
-        assert!(result.reason.unwrap().contains("missing X-Ethos-Signature"));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("missing X-Ethos-Signature")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1036,7 +1125,11 @@ mod tests {
         let ts = ts_now();
         let result = verify_webhook_signature("body", "secret", Some("md5=deadbeef"), Some(&ts));
         assert!(!result.valid);
-        assert!(result.reason.unwrap().contains("unsupported algorithm"));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("unsupported algorithm")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1044,7 +1137,11 @@ mod tests {
         let ts = ts_now();
         let result = verify_webhook_signature("body", "secret", Some("nodivider"), Some(&ts));
         assert!(!result.valid);
-        assert!(result.reason.unwrap().contains("malformed"));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("malformed")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1097,7 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_webhook_creates_registration() {
+    async fn test_register_webhook_creates_registration() -> TestResult {
         let now = test_now();
         let state = Arc::new(WebhookState::with_clock(Arc::new(ManualClock::new(now))));
         let req = RegisterWebhookRequest {
@@ -1110,7 +1207,7 @@ mod tests {
 
         let (status, Json(reg)) = register_webhook(State(state.clone()), Json(req))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(reg.created_at, now);
@@ -1119,7 +1216,11 @@ mod tests {
 
         let stored = state.store.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored.get(&reg.id).unwrap().url, "https://example.test/hook");
+        assert_eq!(
+            stored.get(&reg.id).ok_or("registration missing from store")?.url,
+            "https://example.test/hook"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1138,7 +1239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_webhooks_returns_all_registrations() {
+    async fn test_list_webhooks_returns_all_registrations() -> TestResult {
         let state = Arc::new(WebhookState::new());
 
         for i in 0..3 {
@@ -1151,15 +1252,16 @@ mod tests {
             };
             let _ = register_webhook(State(state.clone()), Json(req))
                 .await
-                .unwrap();
+                .map_err(handler_err)?;
         }
 
         let Json(webhooks) = list_webhooks(State(state)).await;
         assert_eq!(webhooks.len(), 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_delete_webhook_deactivates_registration() {
+    async fn test_delete_webhook_deactivates_registration() -> TestResult {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
             url: "https://example.test/hook".to_string(),
@@ -1171,13 +1273,14 @@ mod tests {
 
         let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         let status = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let stored = state.store.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(!stored.get(&reg.id).unwrap().active);
+        assert!(!stored.get(&reg.id).ok_or("registration missing from store")?.active);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1188,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deliver_event_filters_by_vault_id() {
+    async fn test_deliver_event_filters_by_vault_id() -> TestResult {
         let state = Arc::new(WebhookState::new());
 
         // Register webhook for vault-1
@@ -1201,7 +1304,7 @@ mod tests {
         };
         let _ = register_webhook(State(state.clone()), Json(req1))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         // Register webhook for vault-2
         let req2 = RegisterWebhookRequest {
@@ -1213,7 +1316,7 @@ mod tests {
         };
         let _ = register_webhook(State(state.clone()), Json(req2))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         // Event for vault-1 should match the first webhook
         let registrations: Vec<WebhookRegistration> = {
@@ -1237,10 +1340,11 @@ mod tests {
 
         assert_eq!(registrations.len(), 1);
         assert_eq!(registrations[0].vault_id, Some("vault-1".to_string()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_deliver_event_filters_by_event_type() {
+    async fn test_deliver_event_filters_by_event_type() -> TestResult {
         let state = Arc::new(WebhookState::new());
 
         // Register webhook for specific event types
@@ -1253,7 +1357,7 @@ mod tests {
         };
         let _ = register_webhook(State(state.clone()), Json(req))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         // Check that VaultCreated events are included
         let matching: Vec<WebhookRegistration> = {
@@ -1276,6 +1380,7 @@ mod tests {
         };
 
         assert_eq!(matching.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1292,7 +1397,8 @@ mod tests {
             timestamp: Some(ts),
         };
 
-        let (status, Json(result)) = verify_webhook(Json(req)).await;
+        let state = Arc::new(WebhookState::new());
+        let (status, Json(result)) = verify_webhook(State(state), Json(req)).await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(result.valid);
@@ -1312,14 +1418,15 @@ mod tests {
             timestamp: Some(ts),
         };
 
-        let (status, Json(result)) = verify_webhook(Json(req)).await;
+        let state = Arc::new(WebhookState::new());
+        let (status, Json(result)) = verify_webhook(State(state), Json(req)).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(!result.valid);
     }
 
     #[tokio::test]
-    async fn test_webhook_event_filtering_respects_active_flag() {
+    async fn test_webhook_event_filtering_respects_active_flag() -> TestResult {
         let state = Arc::new(WebhookState::new());
 
         // Register and then deactivate a webhook
@@ -1332,7 +1439,7 @@ mod tests {
         };
         let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
             .await
-            .unwrap();
+            .map_err(handler_err)?;
 
         let _ = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
 
@@ -1347,6 +1454,7 @@ mod tests {
         };
 
         assert_eq!(matching.len(), 0);
+        Ok(())
     }
 
     #[test]
@@ -1384,7 +1492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webhook_secret_generation() {
+    async fn test_webhook_secret_generation() -> TestResult {
         let state = Arc::new(WebhookState::new());
 
         for _ in 0..5 {
@@ -1398,11 +1506,12 @@ mod tests {
 
             let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req))
                 .await
-                .unwrap();
+                .map_err(handler_err)?;
 
-            let secret = reg.secret.unwrap();
+            let secret = reg.secret.ok_or("registration must carry a signing secret")?;
             assert!(secret.starts_with("whsec_"), "secret should have whsec_ prefix");
             assert!(secret.len() > 30, "secret should be long enough");
         }
+        Ok(())
     }
 }

@@ -338,24 +338,75 @@ impl MaterializedViewManager {
     }
 
     /// Refresh any view that is currently due according to its schedule.
-    pub fn refresh_due_views(&self) -> Result<(), rusqlite::Error> {
+    ///
+    /// Every due view is attempted even if an earlier one fails, so one broken
+    /// view cannot starve the others. Failures are returned to the caller
+    /// (the background scheduler) instead of being swallowed; a view that
+    /// failed keeps its old `next_refresh_at`, so it is retried on the next
+    /// tick.
+    pub fn refresh_due_views(&self) -> Result<(), RefreshDueViewsError> {
         let due: Vec<&'static str> = {
             let sched = self.schedules.lock().unwrap_or_else(|p| p.into_inner());
+            let now = std::time::Instant::now();
             sched
                 .iter()
-                .filter(|(_, s)| std::time::Instant::now() >= s.next_refresh_at)
+                .filter(|(_, s)| now >= s.next_refresh_at)
                 .map(|(name, _)| *name)
                 .collect()
         };
+
+        let mut failures = Vec::new();
         for view in due {
-            match view {
-                Self::SUMMARY_VIEW => self.refresh_vault_summary()?,
-                Self::OWNER_VIEW => self.refresh_owner_counts()?,
-                _ => {}
+            let outcome = match view {
+                Self::SUMMARY_VIEW => self.refresh_vault_summary(),
+                Self::OWNER_VIEW => self.refresh_owner_counts(),
+                _ => Ok(()),
+            };
+            if let Err(source) = outcome {
+                failures.push(ViewRefreshError { view, source });
             }
         }
-        Ok(())
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RefreshDueViewsError { failures })
+        }
     }
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// A single materialized view that failed to refresh.
+#[derive(Debug, thiserror::Error)]
+#[error("materialized view `{view}` failed to refresh: {source}")]
+pub struct ViewRefreshError {
+    /// Name of the view that failed (e.g. [`MaterializedViewManager::SUMMARY_VIEW`]).
+    pub view: &'static str,
+    /// The underlying database error.
+    #[source]
+    pub source: rusqlite::Error,
+}
+
+/// Returned by [`MaterializedViewManager::refresh_due_views`] when one or more
+/// due views failed to refresh.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} materialized view refresh(es) failed: {}",
+    .failures.len(),
+    describe_failures(.failures)
+)]
+pub struct RefreshDueViewsError {
+    /// One entry per view that failed, in the order they were attempted.
+    pub failures: Vec<ViewRefreshError>,
+}
+
+fn describe_failures(failures: &[ViewRefreshError]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // ── Helper ───────────────────────────────────────────────────────────────────
@@ -377,9 +428,11 @@ fn status_delta(status: &str, old: Option<&str>, new: Option<&str>) -> i64 {
 mod tests {
     use super::*;
 
-    fn make_db_with_vault() -> Arc<Db> {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn make_db_with_vault() -> Result<Arc<Db>, Box<dyn std::error::Error>> {
+        let db = Arc::new(Db::open(":memory:")?);
+        db.migrate()?;
 
         // Insert a sample vault so the views have something to aggregate.
         db.conn
@@ -393,107 +446,109 @@ mod tests {
                     ('v1','alice','bob','1000',3600,
                      '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','active')",
                 [],
-            )
-            .unwrap();
+            )?;
 
-        db
+        Ok(db)
     }
 
     #[test]
-    fn full_refresh_populates_summary_view() {
-        let db = make_db_with_vault();
+    fn full_refresh_populates_summary_view() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
+        mgr.refresh_all()?;
 
-        let summary = mgr.get_vault_summary().unwrap();
+        let summary = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert_eq!(summary.total_vaults, 1);
         assert_eq!(summary.active_vaults, 1);
         assert_eq!(summary.released_vaults, 0);
+        Ok(())
     }
 
     #[test]
-    fn full_refresh_is_idempotent() {
-        let db = make_db_with_vault();
+    fn full_refresh_is_idempotent() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let first = mgr.get_vault_summary().unwrap();
-        mgr.refresh_all().unwrap();
-        let second = mgr.get_vault_summary().unwrap();
+        mgr.refresh_all()?;
+        let first = mgr.get_vault_summary().ok_or("summary view not populated")?;
+        mgr.refresh_all()?;
+        let second = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert_eq!(first.total_vaults, second.total_vaults);
         assert_eq!(first.active_vaults, second.active_vaults);
+        Ok(())
     }
 
     #[test]
-    fn incremental_update_tracks_status_change() {
-        let db = make_db_with_vault();
+    fn incremental_update_tracks_status_change() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
+        mgr.refresh_all()?;
 
         // active → released
-        mgr.apply_incremental_vault_update(Some("active"), Some("released"))
-            .unwrap();
+        mgr.apply_incremental_vault_update(Some("active"), Some("released"))?;
 
-        let after = mgr.get_vault_summary().unwrap();
+        let after = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert_eq!(after.active_vaults, 0);
         assert_eq!(after.released_vaults, 1);
+        Ok(())
     }
 
     #[test]
-    fn incremental_insert_increments_total() {
-        let db = make_db_with_vault();
+    fn incremental_insert_increments_total() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let before = mgr.get_vault_summary().unwrap();
+        mgr.refresh_all()?;
+        let before = mgr.get_vault_summary().ok_or("summary view not populated")?;
 
-        mgr.apply_incremental_vault_update(None, Some("active"))
-            .unwrap();
+        mgr.apply_incremental_vault_update(None, Some("active"))?;
 
-        let after = mgr.get_vault_summary().unwrap();
+        let after = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert_eq!(after.total_vaults, before.total_vaults + 1);
         assert_eq!(after.active_vaults, before.active_vaults + 1);
+        Ok(())
     }
 
     #[test]
-    fn incremental_delete_decrements_total() {
-        let db = make_db_with_vault();
+    fn incremental_delete_decrements_total() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
-        let before = mgr.get_vault_summary().unwrap();
+        mgr.refresh_all()?;
+        let before = mgr.get_vault_summary().ok_or("summary view not populated")?;
 
-        mgr.apply_incremental_vault_update(Some("active"), None)
-            .unwrap();
+        mgr.apply_incremental_vault_update(Some("active"), None)?;
 
-        let after = mgr.get_vault_summary().unwrap();
+        let after = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert_eq!(after.total_vaults, (before.total_vaults - 1).max(0));
+        Ok(())
     }
 
     #[test]
-    fn owner_counts_populated_after_refresh() {
-        let db = make_db_with_vault();
+    fn owner_counts_populated_after_refresh() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
+        mgr.refresh_all()?;
 
         let counts = mgr.get_owner_counts();
         assert_eq!(counts.len(), 1);
         assert_eq!(counts[0].owner, "alice");
         assert_eq!(counts[0].vault_count, 1);
         assert_eq!(counts[0].active_count, 1);
+        Ok(())
     }
 
     #[test]
-    fn summary_counters_floor_at_zero() {
-        let db = make_db_with_vault();
+    fn summary_counters_floor_at_zero() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
-        mgr.refresh_all().unwrap();
+        mgr.refresh_all()?;
 
         // Apply more deletes than real vaults — counters must floor at 0.
         for _ in 0..5 {
-            mgr.apply_incremental_vault_update(Some("active"), None)
-                .unwrap();
+            mgr.apply_incremental_vault_update(Some("active"), None)?;
         }
-        let summary = mgr.get_vault_summary().unwrap();
+        let summary = mgr.get_vault_summary().ok_or("summary view not populated")?;
         assert!(summary.total_vaults >= 0);
         assert!(summary.active_vaults >= 0);
+        Ok(())
     }
 
     #[test]
@@ -506,12 +561,38 @@ mod tests {
     }
 
     #[test]
-    fn set_refresh_interval_does_not_panic() {
-        let db = make_db_with_vault();
+    fn refresh_due_views_returns_failures_and_still_refreshes_other_views() -> TestResult {
+        let db = make_db_with_vault()?;
+        let mgr = MaterializedViewManager::new(Arc::clone(&db));
+
+        // Break only the summary view so its refresh fails.
+        db.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute_batch("DROP TABLE vault_summary_view")?;
+
+        let Err(err) = mgr.refresh_due_views() else {
+            return Err("expected refresh_due_views to report the broken view".into());
+        };
+        assert_eq!(err.failures.len(), 1);
+        assert_eq!(err.failures[0].view, MaterializedViewManager::SUMMARY_VIEW);
+
+        // The healthy view was still refreshed and rescheduled; the failed one
+        // stays due so the scheduler retries it next tick.
+        assert_eq!(mgr.get_owner_counts().len(), 1);
+        assert!(!mgr.is_due(MaterializedViewManager::OWNER_VIEW));
+        assert!(mgr.is_due(MaterializedViewManager::SUMMARY_VIEW));
+        Ok(())
+    }
+
+    #[test]
+    fn set_refresh_interval_does_not_panic() -> TestResult {
+        let db = make_db_with_vault()?;
         let mgr = MaterializedViewManager::new(Arc::clone(&db));
         mgr.set_refresh_interval(
             MaterializedViewManager::SUMMARY_VIEW,
             std::time::Duration::from_secs(60),
         );
+        Ok(())
     }
 }

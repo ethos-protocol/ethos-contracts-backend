@@ -178,6 +178,11 @@ impl Default for ErrorContext {
 
 /// An `AppError` enriched with request/user/correlation context, ready to
 /// be returned directly from a handler.
+///
+/// The original `AppError` is kept intact (not just its `Display` string) so
+/// the underlying failure — e.g. the `rusqlite::Error` inside `AppError::Db`
+/// — stays reachable through [`std::error::Error::source`], [`Self::inner`]
+/// and [`Self::into_inner`], and is logged when a 5xx response is rendered.
 #[derive(Debug, Serialize)]
 pub struct EnrichedError {
     pub code: String,
@@ -185,6 +190,10 @@ pub struct EnrichedError {
     pub context: ErrorContext,
     #[serde(skip)]
     status: StatusCode,
+    /// The wrapped error. Not serialized: internal details (SQL errors etc.)
+    /// must not leak into client-facing JSON.
+    #[serde(skip)]
+    source: AppError,
 }
 
 impl EnrichedError {
@@ -195,7 +204,39 @@ impl EnrichedError {
             message: error.to_string(),
             context,
             status,
+            source: error,
         }
+    }
+
+    /// HTTP status this error renders as.
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The original, unmodified error this context wraps.
+    pub fn inner(&self) -> &AppError {
+        &self.source
+    }
+
+    /// Unwrap back into the original error, discarding the context.
+    pub fn into_inner(self) -> AppError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for EnrichedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (code={}, correlation_id={})",
+            self.message, self.code, self.context.correlation_id
+        )
+    }
+}
+
+impl std::error::Error for EnrichedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -229,6 +270,16 @@ fn classify(error: &AppError) -> (StatusCode, String) {
 impl IntoResponse for EnrichedError {
     fn into_response(self) -> Response {
         let status = self.status;
+        if status.is_server_error() {
+            // The JSON body deliberately omits internal details, so record the
+            // full wrapped error here; otherwise the root cause would be lost.
+            tracing::error!(
+                correlation_id = %self.context.correlation_id,
+                code = %self.code,
+                error = ?self.source,
+                "request failed"
+            );
+        }
         (status, Json(self)).into_response()
     }
 }
@@ -258,10 +309,21 @@ impl EnrichExt for AppError {
 /// - Echoes the id on `X-Request-Id` (and `X-Correlation-Id`) of the response,
 ///   including error responses, which flow through this same layer.
 pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Response {
-    let request_id = resolve_request_id(request.headers());
+    let resolved = resolve_request_id(request.headers());
 
-    let header_value =
-        HeaderValue::from_str(&request_id).unwrap_or_else(|_| HeaderValue::from_static("invalid"));
+    // A client-supplied id that is not a valid header value is replaced with
+    // a fresh UUID, so the id in the extension, the tracing span and the
+    // response headers always agree (previously the extension kept the bad
+    // value while the headers said "invalid").
+    let (request_id, header_value) = match HeaderValue::from_str(&resolved) {
+        Ok(value) => (resolved, value),
+        Err(_) => {
+            let generated = Uuid::new_v4().to_string();
+            let value = HeaderValue::from_str(&generated)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid"));
+            (generated, value)
+        }
+    };
     request
         .headers_mut()
         .insert(REQUEST_ID_HEADER, header_value.clone());
@@ -292,12 +354,15 @@ pub type SharedNothing = Arc<()>;
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn user_context_parses_roles_header() {
+    fn user_context_parses_roles_header() -> TestResult {
         let mut headers = HeaderMap::new();
-        headers.insert("x-user-roles", "admin, operator".parse().unwrap());
+        headers.insert("x-user-roles", "admin, operator".parse()?);
         let ctx = UserContext::from_headers(&headers);
         assert_eq!(ctx.roles, vec!["admin".to_string(), "operator".to_string()]);
+        Ok(())
     }
 
     #[test]
@@ -309,15 +374,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_request_id_prefers_request_id_then_correlation_id() {
+    fn enriched_error_keeps_wrapped_error_intact() {
+        use std::error::Error as _;
+
+        let db_err = rusqlite::Error::InvalidQuery;
+        let expected = db_err.to_string();
+        let err = EnrichedError::new(AppError::Db(db_err), ErrorContext::new());
+
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The original AppError is reachable, not just its message…
+        assert!(matches!(err.inner(), AppError::Db(rusqlite::Error::InvalidQuery)));
+        // …and the full source chain down to the root cause is preserved.
+        let root = err.source().and_then(|e| e.source()).map(ToString::to_string);
+        assert_eq!(root.as_deref(), Some(expected.as_str()));
+        assert!(matches!(err.into_inner(), AppError::Db(_)));
+    }
+
+    #[test]
+    fn enriched_error_does_not_serialize_wrapped_error() -> TestResult {
+        let err = EnrichedError::new(
+            AppError::Db(rusqlite::Error::InvalidQuery),
+            ErrorContext::new(),
+        );
+        let json = serde_json::to_value(&err)?;
+        assert!(json.get("source").is_none());
+        assert_eq!(json["code"], "internal_error");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_request_id_prefers_request_id_then_correlation_id() -> TestResult {
         let mut headers = HeaderMap::new();
         assert_ne!(resolve_request_id(&headers), resolve_request_id(&headers)); // generated
 
-        headers.insert(CORRELATION_ID_HEADER, "corr-1".parse().unwrap());
+        headers.insert(CORRELATION_ID_HEADER, "corr-1".parse()?);
         assert_eq!(resolve_request_id(&headers), "corr-1");
 
-        headers.insert(REQUEST_ID_HEADER, "req-1".parse().unwrap());
+        headers.insert(REQUEST_ID_HEADER, "req-1".parse()?);
         assert_eq!(resolve_request_id(&headers), "req-1");
+        Ok(())
     }
 
     // ── End-to-end middleware tests (issue #349) ────────────────────────────
@@ -344,86 +439,68 @@ mod tests {
             .layer(axum::middleware::from_fn(correlation_id_middleware))
     }
 
-    #[tokio::test]
-    async fn generates_request_id_at_ingress_when_absent() {
-        let resp = test_app()
-            .oneshot(Request::builder().uri("/echo").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        let header_id = resp
+    /// Read a response header as a string, failing the test if it is absent.
+    fn header<'a>(
+        resp: &'a Response,
+        name: &str,
+    ) -> Result<&'a str, Box<dyn std::error::Error>> {
+        Ok(resp
             .headers()
-            .get(REQUEST_ID_HEADER)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(!header_id.is_empty());
-        // Legacy alias is echoed too.
-        assert_eq!(
-            resp.headers()
-                .get(CORRELATION_ID_HEADER)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            header_id
-        );
+            .get(name)
+            .ok_or_else(|| format!("missing {name} response header"))?
+            .to_str()?)
+    }
 
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
-            .await
-            .unwrap();
-        // Handler saw the same id the response advertises: propagated end to end.
-        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), header_id);
+    async fn body_string(resp: Response) -> Result<String, Box<dyn std::error::Error>> {
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await?;
+        Ok(String::from_utf8(body.to_vec())?)
     }
 
     #[tokio::test]
-    async fn preserves_client_supplied_request_id() {
+    async fn generates_request_id_at_ingress_when_absent() -> TestResult {
+        let resp = test_app()
+            .oneshot(Request::builder().uri("/echo").body(Body::empty())?)
+            .await?;
+
+        let header_id = header(&resp, REQUEST_ID_HEADER)?.to_string();
+        assert!(!header_id.is_empty());
+        // Legacy alias is echoed too.
+        assert_eq!(header(&resp, CORRELATION_ID_HEADER)?, header_id);
+
+        // Handler saw the same id the response advertises: propagated end to end.
+        assert_eq!(body_string(resp).await?, header_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_client_supplied_request_id() -> TestResult {
         let resp = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/echo")
                     .header(REQUEST_ID_HEADER, "client-abc-123")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
-            .await
-            .unwrap();
+            .await?;
 
-        assert_eq!(
-            resp.headers()
-                .get(REQUEST_ID_HEADER)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "client-abc-123"
-        );
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "client-abc-123");
+        assert_eq!(header(&resp, REQUEST_ID_HEADER)?, "client-abc-123");
+        assert_eq!(body_string(resp).await?, "client-abc-123");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn error_responses_also_carry_the_request_id() {
+    async fn error_responses_also_carry_the_request_id() -> TestResult {
         let resp = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/boom")
                     .header(REQUEST_ID_HEADER, "trace-err-9")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.headers()
-                .get(REQUEST_ID_HEADER)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "trace-err-9"
-        );
+        assert_eq!(header(&resp, REQUEST_ID_HEADER)?, "trace-err-9");
+        Ok(())
     }
 }
