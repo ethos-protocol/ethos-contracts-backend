@@ -121,19 +121,15 @@ pub struct CircuitBreakerSnapshot {
 
 const MAX_EVENT_HISTORY: usize = 200;
 
-/// RAII guard ensuring active half-open request count is decremented on completion (#363).
-struct HalfOpenGuard<'a>(&'a CircuitBreaker);
+/// RAII permit released when a call completes; half-open probes hold a slot (#363).
+struct CallPermit<'a>(Option<&'a CircuitBreaker>);
 
-impl<'a> Drop for HalfOpenGuard<'a> {
+impl Drop for CallPermit<'_> {
     fn drop(&mut self) {
-        self.0.half_open_active.fetch_sub(1, Ordering::Release);
+        if let Some(breaker) = self.0 {
+            breaker.half_open_active.fetch_sub(1, Ordering::Release);
+        }
     }
-}
-
-#[allow(dead_code)]
-enum CallPermit<'a> {
-    Closed,
-    HalfOpen(HalfOpenGuard<'a>),
 }
 
 /// A single named circuit breaker with built-in observability.
@@ -293,7 +289,7 @@ impl CircuitBreaker {
 
     fn acquire_call_permit(&self) -> Option<CallPermit<'_>> {
         match self.state() {
-            CircuitState::Closed => Some(CallPermit::Closed),
+            CircuitState::Closed => Some(CallPermit(None)),
             CircuitState::Open => {
                 let elapsed = self
                     .opened_at
@@ -324,7 +320,7 @@ impl CircuitBreaker {
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(CallPermit::HalfOpen(HalfOpenGuard(self)));
+                return Some(CallPermit(Some(self)));
             }
         }
     }
