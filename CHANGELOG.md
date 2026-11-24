@@ -178,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implemented Backend Cache for Frequent Vault Queries
 
 ### Fixed
+- Align backend crate metadata with the existing 1.0.0 changelog release (#959)
 - Return 400 (malformed) or 413 (too large) `DecompressionError`s from request body decompression instead of string errors (#930)
 - Return a typed `MetricError` for invalid or conflicting custom metric registrations; kind conflicts now respond 409 (#929)
 - Return a `MetadataLoadError` from lazy vault metadata loads instead of hiding DB errors and corrupt rows (#928)
