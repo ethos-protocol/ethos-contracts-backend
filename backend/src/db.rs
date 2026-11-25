@@ -789,8 +789,6 @@ pub struct Db {
     pub(crate) conn: std::sync::Mutex<Connection>,
     read_pool: ReadPool,
     read_router: Option<crate::read_replica::ReadReplicaRouter>,
-    #[allow(dead_code)]
-    pool_config: PoolConfig,
     /// In-memory read cache mirroring the `vaults` table, kept in sync by
     /// `insert_vault`. The `vaults` table (via `conn`) is the durable source
     /// of truth read by `get_vault`; this cache exists only for call sites
@@ -896,11 +894,6 @@ impl Db {
             conn: std::sync::Mutex::new(conn),
             read_pool,
             read_router,
-            pool_config: PoolConfig {
-                min: config.min,
-                max: config.max,
-                timeout_secs: config.timeout_secs,
-            },
             vault_store: create_vault_store(),
         })
     }
