@@ -492,6 +492,8 @@ pub fn build_router(state: AppState) -> Router {
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
+        // ── Development-only Playground UI (backend/simulator.html) ──────────
+        .merge(build_playground_router(routes::is_playground_enabled()))
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
@@ -1078,4 +1080,47 @@ async fn main() {
     )
     .await
     .unwrap();
+}
+
+#[cfg(test)]
+mod playground_route_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn playground_route_served_when_enabled() {
+        let app: Router = build_playground_router(true);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/playground")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Ethos-Protocol"));
+        assert!(html.contains("Release Simulator"));
+    }
+
+    #[tokio::test]
+    async fn playground_route_not_found_when_disabled() {
+        let app: Router = build_playground_router(false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/playground")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

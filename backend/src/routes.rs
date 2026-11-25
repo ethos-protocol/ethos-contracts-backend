@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::Html,
     Json,
 };
 use serde::Deserialize;
@@ -23,6 +24,22 @@ use crate::{
         SimulateReleaseResponse, Subscription,
     },
 };
+
+pub const PLAYGROUND_HTML: &str = include_str!("../simulator.html");
+
+/// Returns `true` when the development-only `/playground` route should be mounted.
+/// Controlled by the `ENABLE_PLAYGROUND` environment variable (`true` or `1`).
+pub fn is_playground_enabled() -> bool {
+    std::env::var("ENABLE_PLAYGROUND")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+/// `GET /playground` — serve the self-contained Release Simulator / Playground UI.
+/// Only mounted when `ENABLE_PLAYGROUND=true` (development-only).
+pub async fn playground_handler() -> Html<&'static str> {
+    Html(PLAYGROUND_HTML)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
