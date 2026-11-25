@@ -1,0 +1,39 @@
+name: TTL Vault Performance
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmarks-and-fuzz:
+    name: Benchmarks and fuzzing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@3f2778ee6a28c53e512b95bbcf7b2120993da70d # 1.96.1
+
+      - name: Run Cargo benchmarks
+        run: cargo bench --package ttl-vault
+
+      - name: Compare Soroban CPU benchmarks with baseline
+        run: python3 scripts/compare_bench_baseline.py
+
+      - name: Install nightly toolchain for fuzzing
+        uses: dtolnay/rust-toolchain@3f2778ee6a28c53e512b95bbcf7b2120993da70d
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz vesting for 60 seconds
+        working-directory: contracts/ttl_vault/fuzz
+        run: cargo +nightly fuzz run fuzz_vesting -- -max_total_time=60

@@ -89,28 +89,20 @@ Measures the cost of triggering fund release after TTL expiry.
 
 ### CI Integration
 
-Benchmarks run on every PR to detect regressions:
-
-```yaml
-# .github/workflows/ci.yml
-- name: Run benchmarks
-  run: cargo bench --package ttl-vault -- --output-format bencher | tee output.txt
-
-- name: Store benchmark result
-  uses: benchmark-action/github-action@v1
-  with:
-    tool: 'cargo'
-    output-file-path: output.txt
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-    auto-push: true
-```
+The [TTL Vault Performance workflow](../.github/workflows/ttl-vault-performance.yml)
+runs weekly and can also be started manually. It runs `cargo bench --package
+ttl-vault`, compares the Soroban CPU-cost benchmarks against
+`contracts/ttl_vault/benches/baseline.json`, and fuzzes the vesting target for
+60 seconds.
 
 ### Regression Thresholds
 
-- **Warning**: 10% performance degradation
-- **Failure**: 20% performance degradation
+- **Failure**: CPU cost exceeds the tracked baseline by more than the
+  `tolerance_percent` configured in `contracts/ttl_vault/benches/baseline.json`
+  (currently 15%).
 
-If a PR introduces a regression, the CI will fail and require investigation.
+The scheduled job fails on a regression beyond this tolerance and requires
+investigation.
 
 ## Interpreting Results
 
@@ -222,13 +214,13 @@ diff before.txt after.txt
 - Use statistical analysis in HTML report to identify true regressions
 - Focus on relative changes, not absolute values
 
-## Baseline Regression Detection (CI)
+## Baseline Regression Detection
 
 `contracts/ttl_vault/benches/baseline.json` tracks the last known-good CPU/memory
 costs for each `bench_trigger_release_*` case in
-`trigger_release_bench_tests.rs`. The CI workflow (`.github/workflows/ci.yml`)
-runs `scripts/compare_bench_baseline.py` immediately after `cargo test
---package ttl-vault`, which:
+`trigger_release_bench_tests.rs`. The scheduled performance workflow
+(`.github/workflows/ttl-vault-performance.yml`) runs
+`scripts/compare_bench_baseline.py`, which:
 
 1. Runs `cargo test --package ttl-vault bench_trigger_release -- --nocapture`.
 2. Parses each `trigger_release(n=N) → cpu=... mem=...` line.
